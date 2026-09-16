@@ -69,6 +69,14 @@ interface ForwardingDecisionDao {
     """)
     suspend fun getPendingUpdates(): List<ForwardingDecisionEntity>
 
+    /**
+     * Mark decisions as consumed by a Q-update so they aren't re-applied every cycle.
+     * MUST be called after [DoubleQLearningEngine.update] for a batch — otherwise
+     * getPendingUpdates keeps returning the same rows and the engine over-trains on them.
+     */
+    @Query("UPDATE forwarding_decisions SET update_applied = 1 WHERE id IN (:ids)")
+    suspend fun markApplied(ids: List<Long>)
+
     /** Research export: all decisions in a time range. */
     @Query("""
         SELECT * FROM forwarding_decisions 

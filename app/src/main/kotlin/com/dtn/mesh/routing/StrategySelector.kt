@@ -17,10 +17,13 @@ import com.dtn.mesh.model.NodeId
 class StrategySelector(
     private val prophet: ProphetStrategy = ProphetStrategy(),
     private val maxProp: MaxPropStrategy = MaxPropStrategy(),
+    private val epidemic: EpidemicStrategy = EpidemicStrategy(),
+    private val stableProphet: ProphetStrategy = ProphetStrategy(ProphetConfig(stabilityAware = true)),
+    private val qLearning: QLearningStrategy = QLearningStrategy(),
     initialStrategy: StrategyType = StrategyType.PROPHET,
 ) : RoutingStrategy {
 
-    enum class StrategyType { PROPHET, MAXPROP }
+    enum class StrategyType { PROPHET, MAXPROP, EPIDEMIC, STABLE, QLEARNING }
 
     var activeType: StrategyType = initialStrategy
         private set
@@ -29,6 +32,9 @@ class StrategySelector(
         get() = when (activeType) {
             StrategyType.PROPHET -> prophet
             StrategyType.MAXPROP -> maxProp
+            StrategyType.EPIDEMIC -> epidemic
+            StrategyType.STABLE -> stableProphet
+            StrategyType.QLEARNING -> qLearning
         }
 
     override val name: String get() = active.name
@@ -48,13 +54,19 @@ class StrategySelector(
     override fun onEncounter(peerId: NodeId, contactRecord: ContactRecord) {
         prophet.onEncounter(peerId, contactRecord)
         maxProp.onEncounter(peerId, contactRecord)
+        epidemic.onEncounter(peerId, contactRecord)
+        stableProphet.onEncounter(peerId, contactRecord)
     }
 
     override fun onRoutingSummaryReceived(peerId: NodeId, summary: RoutingSummary) {
-        // Route to the matching strategy based on tag
+        // Route to the matching strategy based on tag. A summary tagged for a strategy this
+        // node isn't running (e.g. a PROPHET peer talking to a MaxProp/Epidemic node) simply
+        // doesn't match any case and is ignored — see the cross-algorithm notes.
         when (summary.strategyTag) {
             "PROPHET" -> prophet.onRoutingSummaryReceived(peerId, summary)
+            "STABLE-PROPHET" -> stableProphet.onRoutingSummaryReceived(peerId, summary)
             "MAXPROP" -> maxProp.onRoutingSummaryReceived(peerId, summary)
+            // EPIDEMIC carries no routing state — nothing to integrate.
         }
     }
 
@@ -69,6 +81,8 @@ class StrategySelector(
     override fun onPeriodicAge() {
         prophet.onPeriodicAge()
         maxProp.onPeriodicAge()
+        epidemic.onPeriodicAge()
+        stableProphet.onPeriodicAge()
     }
 
     override fun getDeliveryProbability(peerId: NodeId): Double =

@@ -105,8 +105,10 @@ Frame = `[1B type][2B length BE][payload]`
 Repo: `D:\PROJECTS\DTN CN CAPSTONE` · Android module `com.dtn.mesh` ("DtnMeshRelay").
 `docs/meshtastic-ref/` is a read-only Meshtastic clone kept only as AIDL reference.
 
-**Build/test status:** unit tests pass — DoubleQLearningEngine 13/13, DtnWireCodec 9/9, ProphetStrategy
-6/6, AirtimeBudgetTracker 5/5. (Full Gradle assemble not yet run in this environment.)
+**Build/test status:** `:app:assembleDebug` builds successfully and the debug APK installs/runs on device.
+Unit tests pass — DoubleQLearningEngine 13/13, DtnWireCodec 9/9, ProphetStrategy 15/15, AirtimeBudgetTracker
+5/5, RadioDistanceEstimator 5/5 (the ProphetStrategy suite was rewritten to the RFC-6693 math in B.9; the
+research-grounded routing + concurrency work is B.9–B.12).
 
 ## B.1 DONE — Self-contained wire header
 
@@ -144,7 +146,9 @@ Repo: `D:\PROJECTS\DTN CN CAPSTONE` · Android module `com.dtn.mesh` ("DtnMeshRe
 - **`receiver/MeshtasticTransportAdapter.kt`** — reduced to a retirement note (no code).
 - **`AndroidManifest.xml`** — removed the Meshtastic `<queries>`; added `CHANGE_NETWORK_STATE`, BLE
   permissions (`BLUETOOTH_ADVERTISE/SCAN/CONNECT` + legacy), and `uses-feature bluetooth_le`.
-- `ui/MainScreen.kt` — unchanged (only uses `connect()`).
+- `ui/MainScreen.kt` — at the time of B.3 this only used `connect()`. It has since grown into the full
+  analytics UI described in **B.8** (chats / network / lifecycle / log tabs, strategy switch, route detail,
+  routing-math breakdown).
 
 ## B.4 DONE — Hub firmware
 
@@ -163,6 +167,270 @@ Repo: `D:\PROJECTS\DTN CN CAPSTONE` · Android module `com.dtn.mesh` ("DtnMeshRe
 - **`docs/dtn-hub-architecture.md`** — the original architecture proposal. NOTE: its firmware snippet
   predates the `HELLO` frame and the broadcast fan-out; the authoritative firmware is in `firmware/`.
 
+## B.7 DONE — Foreground service, permissions, end-to-end receipts, routing & BLE fixes
+
+Later sessions closed several Part C items and fixed real multi-hop / device bugs found on hardware.
+
+- **Foreground service (was C.3).** `service/DtnForegroundService.kt` exists and is registered in the
+  manifest with `foregroundServiceType="connectedDevice"` (+ `FOREGROUND_SERVICE` /
+  `FOREGROUND_SERVICE_CONNECTED_DEVICE` permissions). It hosts the orchestrator and is started from
+  `DtnViewModel.connect()`. `connect()` also calls `orchestrator.start()` directly (idempotent) so encounter
+  → `contacts` persistence runs even if the service's async start is delayed — this fixed the "peers show in
+  the raw NODE log but never appear in the chat/peer list" bug.
+- **Runtime permissions (was C.3).** `MainActivity` requests BLE / location / nearby-devices at launch via
+  `registerForActivityResult(RequestMultiplePermissions)`.
+- **End-to-end delivery receipts (was C.3).** Hop-level transport status is now explicitly treated as
+  informational only and NEVER clears the buffer. Real end-to-end confirmation uses `ROUTING_ACK` receipt
+  bundles: the destination records delivery, receipts propagate back through mules, and a carrier clears its
+  custody copy only on a receipt (`BUFFER_CLEARED`) / direct delivery / expiry.
+- **Dead Meshtastic files (was C.1).** `app/src/main/aidl/org/meshtastic/**` and
+  `app/src/main/kotlin/org/meshtastic/**` are deleted; `MeshtasticTransportAdapter` is gone; `build.gradle.kts`
+  no longer enables the `aidl` build feature.
+- **PROPHET multi-hop fixes** (`routing/ProphetStrategy.kt`, `ProphetConfig`):
+  - `findNextHopToward` edge threshold moved off the hard-coded `0.5` to a configurable `pFloorPath` (0.1)
+    so transitive predictability (~0.14 for a solid 2-hop link) forms an edge.
+  - Stage-2 zero-gradient veto fixed: when neither this node nor the peer has any belief for the destination
+    (`P ≈ 0` both sides) a small `relayBaseFloor` (0.02) exploratory relay is allowed instead of a hard
+    `null`, so bundles no longer dead-end in sparse test nets.
+  - NOTE (still true): the path finder is bounded to a 2-hop horizon because we only cache DIRECT peers'
+    P-vectors. Genuine deeper routing needs 2nd-degree summary propagation (distance-vector) — see C.3.
+- **Reverse-echo fix** (`DtnOrchestrator`, `BleTransportAdapter`, `InboundPacket`): the wire header only
+  carries the ORIGIN, so an A→B→C→D chain had C echo the bundle straight back to B. `InboundPacket.viaPeer`
+  now carries the immediate previous hop and the orchestrator refuses to send a bundle back to it.
+- **BLE "online from inbound traffic" fix.** Peers were only marked online from `scanCallback` (needs the
+  scan-response service data). On radios that suspend active scanning during a GATT link (Qualcomm/OnePlus),
+  that data never arrives, so a peer stayed "offline" while actively exchanging data. `accumulateInbound` now
+  learns the address→node mapping from handshake bundles (`ROUTING_SUMMARY`/`ROUTING_ACK`, whose origin IS
+  the neighbour) and emits an online encounter for any inbound write via a shared debounced
+  `emitOnlineEncounter`. This also lets the phone send back (bidirectional). WiFi Direct and the LoRa hub
+  already marked peers online from inbound traffic.
+- **Lifecycle-log thread safety.** `MessageLifecycleLog` route/entry updates were an unsynchronized
+  read-modify-write on a `StateFlow`; concurrent RX/TX for the same message could insert two records with the
+  same id and crash the Compose `LazyColumn` ("Key … already used"). The mutations are now `synchronized`,
+  and the UI lists use `distinctBy`/indexed keys as defence in depth.
+
+## B.8 DONE — Analytics UI (`ui/MainScreen.kt`, `ui/DtnViewModel.kt`)
+
+`MainScreen` is now the full app UI, not just a Connect button:
+
+- **Tabs:** Chats (broadcast + per-peer conversations), Network, Lifecycle, Log.
+- **Network tab:** connection/overview summary (active peers, buffer, DELIVERED vs RECEIVED split), a
+  **routing protocol switch** (PROPHET / MaxProp, backed by `DtnViewModel.setStrategy`), peer rows with
+  signal bars + last-active, local route observations (tap a route for a detail dialog), and the live buffer.
+- **Route detail dialog:** message content, node-id → nickname mapping, prev/this/next hop (local node shown
+  as **YOU**), timestamps, the routing algorithm used (`RouteRecord.strategy`), and an expandable
+  **routing-math breakdown** (`DtnViewModel.explainRoute`) with per-carrier scores and per-strategy formulas
+  for both PROPHET and MaxProp.
+- **Lifecycle tab:** a buffer-history section (how each buffered message left the buffer) plus a filterable,
+  expandable event log. New `LifecycleEvent.DROPPED` covers housekeeping drops; `EXPIRED`/`DROPPED` are now
+  actually emitted from `ForwardingWorker`.
+
+## B.9 DONE — PRoPHET brought to RFC 6693 (fixes the P-saturation instability)
+
+The classic variant added an `ε^d` distance term on every encounter, which let a single close ping drive
+`P → 1.0` and strand messages in Stage-2 (a peer at `P = 1.0` looks unbeatable forever). Replaced with the
+**RFC 6693 / PRoPHETv2** formulation (`routing/ProphetStrategy.kt`, `ProphetConfig`). Citations:
+Lindgren, Doria, Davies, Grasic — *Probabilistic Routing Protocol for Intermittently Connected Networks*,
+**RFC 6693** (IRTF DTNRG, 2014); original Lindgren et al., *SIGMOBILE MC2R* 7(3), 2003.
+
+- **Delta-capped encounter update.** `P(a,b) = P_old + (1 − δ − P_old) · P_enc`, so predictability
+  asymptotes to `1 − δ` and can never reach exactly 1.0. `ProphetConfig.pDelta = 0.01` (cap `0.99`);
+  `pEncounter` (`P_init`) `= 0.75`.
+- **Adaptive encounter weight (`adaptiveEncounter`).** First contact or a gap `≥ I_typ` uses the full
+  `P_enc`; a re-encounter faster than `I_typ` is scaled by `interval / I_typ`, so a BLE peer that stays in
+  range and re-triggers every second stops over-inflating `P`. `typicalEncounterIntervalMs (I_typ) = 30 000`;
+  set to `0` to disable (the unit tests use `0` for deterministic assertions).
+- **Aging** unchanged in spirit: `P · γ^k` over `k` elapsed `agingIntervalMs` windows; `γ = 0.98`.
+- **Transitivity** unchanged: `P(a,c) = P(a,c) + (1 − P(a,c)) · P(a,b) · P(b,c) · β`; `β = 0.25`.
+- **Removed:** `epsilonDistance` and `distanceBoost()` / the `ε^d` additive term (root cause of the
+  saturation). The distance-aware idea now lives only in the opt-in **STABLE-PROPHET** variant
+  (`stabilityAware = true`), which multiplies `P_enc` by a smoothed-RSSI + contact-recurrence link-quality
+  weight instead of adding an unbounded term.
+- **Tests rewritten** (`test/.../ProphetStrategyTest.kt`, 15 tests) to assert the RFC behaviour: delta cap,
+  never-reaches-1.0, adaptive damping of rapid re-encounters, stability-aware non-saturation, plus the
+  existing aging/transitivity/stage-1-2/hop-limit/broadcast/export cases.
+- **Orchestrator ENCOUNTER console log** updated — no more `ε` reference; it now prints the δ cap and the
+  adaptive `I_typ` (or "link-quality modulated" in stability-aware mode).
+
+## B.10 DONE — MaxProp upgraded to true cost-based (Dijkstra) routing
+
+The old MaxProp was a single-hop proxy (rank by the peer's own `f`). Replaced with the graph cost-routing
+from Burgess, Gallagher, Jensen, Levine — *MaxProp: Routing for Vehicle-Based Disruption-Tolerant Networks*,
+**IEEE INFOCOM 2006** (`routing/MaxPropStrategy.kt`).
+
+- **Delivery-likelihood edges.** Each node's `f`-vector (encounters(peer) / Σ encounters, normalised to 1)
+  is the per-edge delivery likelihood. We cache neighbours' vectors in `peerFTables` (populated from the
+  `ROUTING_SUMMARY` handshake), giving a small multi-hop cost graph.
+- **`findMinCostNextHop(dest, onlinePeers)`** runs **Dijkstra** over edge cost `(1 − f)` from a synthetic
+  source node `ME = "__self__"`. A directly-online destination short-circuits to cost `1 − f(dest)`.
+  Returns `(nextHop, totalPathCost)`; unreachable destinations yield `Double.MAX_VALUE`.
+- **`rankForForwardingWithTopology(candidates, peerId, onlinePeers)`** — forwards to a peer only when it is
+  the **min-cost next hop** toward the destination, with priority falling as path cost rises. Direct
+  delivery = priority 1.0; broadcast = 0.9; a hard `maxHops = 10` guard drops runaway bundles.
+- **Head-start for new packets** (Burgess §III-C): bundles at `hopCount ≤ newPacketHopThreshold (1)` get a
+  `headStartBoost (1.5)` priority multiplier so freshly-injected messages spread before older ones.
+- **Orchestrator** (`DtnOrchestrator.sendToSingle`) has a MaxProp branch that calls
+  `rankForForwardingWithTopology(...)` for the relay-approval set (direct delivery + broadcast still bypass
+  any strategy veto).
+
+## B.11 DONE — Multi-phone robustness + latency (concurrent send path)
+
+Audit finding: the orchestrator ran a **single serial event loop** that *awaited* blocking BLE sends
+(`ensureReady` ~8 s connect, ~2 s/chunk). One slow or unreachable peer stalled the entire mesh for tens of
+seconds, and the 4 s periodic flush re-sent the full receipt set to every peer each tick. Reworked the send
+path in `service/DtnOrchestrator.kt`. The design borrows *flood-with-suppression* / dedup ideas from
+Meshtastic managed flooding and Briar/Bramble pairwise sync (offer only what the peer lacks).
+
+- **Coalesced flush.** `flushToOnlinePeers()` takes `flushMutex.tryLock()`; if a flush is already running it
+  just sets `flushPending = true` and returns, and the running flush re-runs one final pass. Bursty triggers
+  (RX + encounter + periodic tick) collapse into a single follow-up instead of stacking up.
+- **Parallel per-peer fan-out.** `flushOnce()` launches each peer in a `coroutineScope`, bounded by
+  `sendSemaphore = Semaphore(MAX_CONCURRENT_SENDS = 4)`, so a slow peer no longer blocks the others. Each
+  peer's writes are serialised by a **per-peer `Mutex` (`peerLock`)** so concurrent flushes can never
+  interleave writes to the same GATT link (the chunk-ACK path assumes one outstanding write per address).
+- **Connect backoff.** A failed send marks `connectBackoffUntil[peer] = now + CONNECT_BACKOFF_MS (10 s)`;
+  backed-off peers are skipped so we don't pay the ~8 s connect timeout again every flush. Any successful
+  send clears it, and a fresh online encounter clears it immediately.
+- **Receipt dedup + short-circuit.** `sendDeliveryReceipts` tracks per-peer already-sent UIDs
+  (`receiptsSentTo`) and sends only *new* receipts; if a bundle send fails it stops and keeps the rest for
+  next time. This kills the per-tick receipt storm that grew with delivery count.
+- **Broadcast fan-out correctness.** A broadcast is cleared from the buffer only after it has been confirmed
+  sent to **every** currently-online peer (`broadcastsSentTo.containsAll(onlineIds)`), fixing a gap where a
+  mid-loop failure could clear a broadcast a peer never received.
+- **Event loop stays hot.** All flush triggers (`FlushBuffer`, the 3 RX paths, encounter) now call the
+  non-blocking `requestFlush()` (`scope.launch { flushToOnlinePeers() }`); the per-encounter routing summary
+  is launched off-loop under the peer's lock. The external `triggerFlush()` API (ViewModel) is unchanged.
+- Offline handling clears `connectBackoffUntil` / `receiptsSentTo` / `peerLocks` for the departed peer.
+
+## B.12 DONE — UI visual polish (no logic/log/math changes)
+
+Purely presentational refinements to `ui/MainScreen.kt`; all log text, formulas, data bindings, and control
+flow are byte-for-byte unchanged (verified by compile + the full unit suite).
+
+- Enriched the `Palette`: added `PrimaryLight`, soft status tints (`AccentSoft`/`WarningSoft`/`ErrorSoft`/
+  `PrimarySoft`/`BroadcastSoft`), a `TopBarGradient` (blue horizontal gradient) and a `BroadcastGradient`;
+  softened the app background.
+- Gradient app bars on both the home screen and the chat-detail header.
+- `ConnectionCard`: the status dot now sits in a soft-tinted badge; slightly stronger elevation + rounder
+  corners. Same status text and `Node · strategy · Buffer` line.
+- `BroadcastCard` / `PeerCard`: elevation `1→2 dp`, radius `14→16 dp`; broadcast avatar uses the gradient.
+- `NetworkSummaryCard`: now a gradient "hero" card. `StrategyChip`: unselected chips get a hairline border.
+- `LogTab` / `LifecycleTab` left visually as-is to preserve the log color-coding and readability (the
+  functional research-export control later added to `LogTab` is **B.13.2**, not a visual change).
+
+## B.13 DONE — Background-worker DI crash, research-export UI, routing-math display fix
+
+A correctness pass turned up one critical background crash, one fully-built-but-unreachable feature, and one
+stale on-screen formula. All three fixed; `:app:compileDebugKotlin` is clean, 47/47 unit tests pass, and
+`:app:assembleDebug` produces the debug APK.
+
+### B.13.1 CRITICAL — `ForwardingWorker` could not be constructed in the background (Hilt × WorkManager)
+
+- **Root cause.** `scheduler/ForwardingWorker.kt` is a `@HiltWorker` with an `@AssistedInject` constructor
+  (injects `MessageQueueManager`, `StrategySelector`, `ForwardingDecisionDao`, `DtnOrchestrator`,
+  `MessageLifecycleLog` alongside the assisted `Context` / `WorkerParameters`). But `DtnMeshApplication` did
+  **not** implement `Configuration.Provider` / inject `HiltWorkerFactory`, and `AndroidManifest.xml` did not
+  remove WorkManager's default `WorkManagerInitializer`. So the default worker factory tried to reflect on a
+  `(Context, WorkerParameters)` constructor that doesn't exist and threw
+  `NoSuchMethodException: com.dtn.mesh.scheduler.ForwardingWorker.<init> [Context, WorkerParameters]` the
+  moment the periodic cycle fired. The worker **is** scheduled (`DtnForegroundService` →
+  `WorkManagerSetup.enqueueForwardingWorker`, a 15-min `PeriodicWorkRequest`), so all background housekeeping
+  — TTL expiry, forward-timeout revert, old-message purge, routing aging, Q-update draining, buffer-pressure
+  enforcement, and P-threshold drops — silently failed once the app was backgrounded or the screen was off.
+- **Fix.**
+  - `DtnMeshApplication` now implements `androidx.work.Configuration.Provider`, `@Inject`s a
+    `HiltWorkerFactory`, and exposes `override val workManagerConfiguration` (the **property** form — correct
+    for WorkManager 2.10.0, where `getWorkManagerConfiguration()` is deprecated).
+  - `AndroidManifest.xml` adds the standard removal block: a `<provider>` for
+    `androidx.startup.InitializationProvider` (`tools:node="merge"`) whose `WorkManagerInitializer` meta-data
+    is `tools:node="remove"`d, so WorkManager uses our Hilt-aware on-demand configuration instead of the
+    default initializer.
+  - No Gradle change needed — `androidx.hilt:hilt-work` (+ its `hilt-compiler` kapt) and `work-runtime-ktx`
+    were already declared.
+- **Note.** The original report's dependency list (`DtnRepository`/`BundleStore`/`ForwardingEngine`/
+  `BleTransportAdapter`) was inaccurate; the diagnosis was right but the actual injected types are the five
+  listed above.
+
+### B.13.2 Research-data export was implemented but had no UI entry point
+
+- **Root cause.** `export/ResearchExporter.kt`, `export/FileExportHelper.kt`, and
+  `DtnViewModel.exportData()` (+ the `exportPath` StateFlow) were complete, but nothing in
+  `ui/MainScreen.kt` ever called `exportData()` — no button, icon, or menu — so the archive could never be
+  produced from the app.
+- **Fix.** Added a `ResearchExportCard` at the top of the **Log tab**: it collects `viewModel.exportPath`
+  and shows an "Export telemetry" button wired to `viewModel.exportData()`, then displays the written path.
+  The archive is `encounters.csv`, `contacts.csv`, `decisions.csv`, `messages.csv`, `q_tables.json`,
+  `metadata.json`.
+
+### B.13.3 Stale PRoPHET formula in the route-explanation card
+
+- **Root cause.** `DtnViewModel.explainRoute()` still displayed the pre-RFC-6693 direct-encounter formula
+  `P + (1−P)·P_init + ε^d`. The `ε^d` term was removed from the engine in **B.9**, so the on-screen math no
+  longer matched the implementation.
+- **Fix.** Updated the displayed formula to the delta-capped RFC form `P + (1−δ−P)·P_enc` (and the
+  stability-aware `·q` link-quality variant when `stabilityAware = true`); the constants line now also shows
+  `δ` and `I_typ`.
+- **Verified NOT a bug.** The reported "Epidemic route card does nothing on tap" does **not** reproduce.
+  `explainRoute()` has a full `EpidemicStrategy` branch that returns a non-null explanation; the
+  routing-math card renders only `if (explanation != null)` and expands **inline** (it is not a dialog). The
+  `else -> null` branch applies to Q-Learning, which then correctly hides the card (no dead header).
+
+## B.14 DONE — Restored routing-math visibility for delivered/relayed messages
+
+- **Symptom.** The message-detail dialog's expandable routing-math breakdown (path map, stat tiles,
+  candidate carriers, formulas) had disappeared for most messages.
+- **Root cause.** An earlier gate in `NetworkTab` was `if (!isForUs && !route.delivered)`. The
+  `!route.delivered` half hid the breakdown for any message that had reached its destination — which, in a
+  small test net, is nearly everything the user sends/relays (delivery is fast). The committed baseline
+  showed the math for every route (`explanation = fullDest?.let { explainRoute(it) }`); the gate was added
+  when addressing the "why is there a path map for a RECEIVED message?" request, but it over-reached.
+- **Fix.** Gate relaxed to `if (!isForUs)` — the breakdown now shows for every message we route onward
+  (in-transit *or* delivered/relayed, the delivered case shown retrospectively), and is hidden ONLY for
+  messages addressed to this node (received), honouring the original request. `RoutingMathSection`'s
+  subtitle switches to "Retrospective — how the path … was scored" when `route.delivered`.
+- Default strategy is `StrategyType.PROPHET`, so the breakdown is populated out of the box; only Q-Learning
+  and broadcast/blank destinations legitimately yield no breakdown.
+
+## B.15 DONE — Network-tab crash (duplicate LazyColumn key), buffered-message details, received-message logic
+
+Three linked Network-tab issues. Compiles clean, 47/47 unit tests pass, debug APK rebuilt.
+
+### B.15.1 CRITICAL — Network tab crashed on open (duplicate `LazyColumn` key)
+
+- **Root cause (latent, pre-existing — present in committed HEAD, not introduced this session).** The
+  Network tab is one `LazyColumn` with both `items(routes, key = { it.msgId })` and
+  `items(buffered, key = { it.msgId })`. Both keys are the **same 8-char prefix** —
+  `RouteRecord.msgId = msgId.take(8)` and `BufferedMsgInfo.msgId = e.id.take(8)`. Any message that is
+  simultaneously buffered **and** has a route observation (the normal case for anything you send that
+  hasn't been delivered yet) produced the *same key in two different `items` blocks of one list* →
+  Compose throws `IllegalArgumentException: Key "xxxxxxxx" was already used` the instant the tab composes.
+- **Fix.** Namespaced the keys per section — `"peer-${nodeId}"`, `"route-${msgId}"`, `"buf-${msgId}"` — so
+  the route and buffer sections can never collide. (Keys must be globally unique within a single
+  `LazyColumn`, not just within one `items` block.)
+
+### B.15.2 Buffered-message rows now open a detail view
+
+- **Symptom.** Tapping a buffered message in the Network tab did nothing.
+- **Fix.** `BufferRow` is now `clickable`; a `selectedBuffer` state drives a new `BufferDetailDialog`
+  showing From/To/Status, TTL-left / time-in-buffer / hops / forwards tiles, a "why it's here"
+  (store-carry-forward) explanation, and — because a buffered message is precisely one **awaiting an
+  onward forwarding decision** — the routing-math breakdown (candidate carriers / best next hop toward its
+  destination). The full destination id is resolved from the peer list (the row only carries the 8-char
+  suffix); broadcast/unknown destinations show the fan-out note instead.
+
+### B.15.3 Sensible routing logic for received (addressed-to-us) messages
+
+- **Clarification from the user:** they never asked to *hide* routing info for received messages — they
+  said the info shown (a forward-candidate "best next hop" map) *didn't make sense* for a message that had
+  already arrived at its destination.
+- **Fix.** `RouteDetailDialog` now branches: a message whose destination is this node shows a
+  `ReceivedDeliverySection` (ORIGIN + ARRIVED-VIA tiles, the observed delivery path, and the delivering
+  strategy — i.e. *how it reached us*, with an explicit "terminated here, no next-hop decision" note);
+  messages we route onward still show the forward-scoring `RoutingMathSection`; anything else shows a short
+  explanatory note. `RoutingMathSection` was refactored from taking a `RouteRecord` to explicit params
+  (`exp`, `destLabel`, `retrospective`, `prevHop`, `nextHop`) so both the route dialog and the new buffer
+  dialog reuse it without duplication.
+
 ---
 
 # PART C — What Still Needs to Change (to fully realize the architecture)
@@ -170,14 +438,18 @@ Repo: `D:\PROJECTS\DTN CN CAPSTONE` · Android module `com.dtn.mesh` ("DtnMeshRe
 Ordered roughly by priority.
 
 ### C.1 Cleanup / correctness
-- **Delete dead Meshtastic files** (shell was unavailable, so left in place as compiling dead code):
-  `app/src/main/aidl/org/meshtastic/**`, `app/src/main/kotlin/org/meshtastic/core/model/*.kt`,
-  `app/src/main/kotlin/.../MeshtasticTransportAdapter.kt`. After deleting the AIDL, remove `aidl = true`
-  from `app/build.gradle.kts` `buildFeatures`.
-- **Run a full Gradle build** (`:app:assembleDebug`) — only unit tests have been run here.
-- **Update `docs/dtn-hub-architecture.md`** firmware section to match `firmware/src/main.cpp`.
+- ~~Delete dead Meshtastic files~~ — **DONE** (see B.7): AIDL + `org.meshtastic` sources removed, `aidl`
+  build feature dropped.
+- ~~Run a full Gradle build~~ — **DONE**: `:app:assembleDebug` builds and installs on device.
+- **Update `docs/dtn-hub-architecture.md`** — §7 protocol table and §9.2 firmware snippet still predate the
+  `HELLO` frame + broadcast fan-out; `firmware/` is authoritative.
+- Doc comments across `database/`, `queue/`, `MeshTransport.kt` still say "Meshtastic" (port_num 256,
+  `mesh_packet_id`) — harmless legacy naming, worth a cleanup pass.
 
 ### C.2 Real-device validation (transports need hardware testing)
+> Note: the **orchestrator-side** multi-phone concurrency (parallel bounded fan-out, per-peer locking,
+> connect backoff, receipt dedup, flush coalescing) is now handled — see **B.11**. What remains here is
+> **hardware** validation of the transport adapters themselves.
 - **BLE** (`BleTransportAdapter`): validate MTU negotiation, chunk pacing/back-pressure (current writes are
   fire-and-forget — likely need `onCharacteristicWrite`-driven sequential pacing), reconnection, and the
   `writeCharacteristic` deprecation path on Android 13+ (new API overload).
@@ -188,16 +460,16 @@ Ordered roughly by priority.
   client-to-owner) delivery works within a legacy P2P group.
 
 ### C.3 Features still missing for the full architecture
-- **Foreground service** — the manifest has a commented-out placeholder. Store-carry-forward while the app
-  is backgrounded/screen-off requires a real `foregroundServiceType="connectedDevice"` service hosting the
-  orchestrator + transports. Currently everything is tied to the ViewModel/UI lifecycle.
-- **Fragmentation** for payloads > 223 bytes (flagged as future in `queue/`; header already has
-  fragmentIndex/Total fields, but no reassembly logic exists).
-- **Runtime permission requests** — BLE + location + nearby-devices permissions are declared but there is no
-  in-app runtime request flow (needed on Android 12+).
-- **End-to-end delivery semantics** — BLE, WiFi Direct, and the LoRa hub all emit a synthetic `DELIVERED`
-  on successful *handoff* (hop-level ack, not end-to-end). If true end-to-end confirmation is required, add
-  an ack bundle that routes back to the origin.
+- ~~Foreground service~~ — **DONE** (see B.7): real `foregroundServiceType="connectedDevice"` service hosts
+  the orchestrator.
+- ~~Runtime permission requests~~ — **DONE** (see B.7): `MainActivity` requests them at launch.
+- ~~End-to-end delivery semantics~~ — **DONE** (see B.7): `ROUTING_ACK` receipt bundles; hop-level status is
+  informational only.
+- **Deeper multi-hop routing (distance-vector).** The live-path finder is capped at a 2-hop horizon because
+  peers only exchange their DIRECT P-vectors. To route past 2 hops, propagate 2nd-degree summaries (each peer
+  includes a bounded digest of its own reachable nodes) and turn `findNextHopToward` into a max-product
+  path search. This is the main routing item left.
+- **Fragmentation** for payloads > 223 bytes (header has fragmentIndex/Total fields, but no reassembly logic).
 - **Hub → phone id learning for routing** — the hub is treated as a single peer; it does not advertise which
   destination phones are reachable through it. Fine for flooding, but a "route hint" would reduce airtime.
 

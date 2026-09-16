@@ -56,6 +56,9 @@ class ForwardingWorker @AssistedInject constructor(
                     lifecycle.log(LifecycleEvent.EXPIRED, m.id,
                         origin = m.originNodeId.value, dest = m.destinationNodeId.value,
                         hopCount = m.hopCount, extra = "TTL reached")
+                    // Q-learning credit: decisions on a message that expired undelivered get a
+                    // negative reward so the engine learns to avoid whatever led here.
+                    runCatching { decisionDao.setRewardByMessageId(m.id, DtnOrchestrator.REWARD_EXPIRED) }
                 }
         }
         val expired = queueManager.expireMessages()
@@ -101,6 +104,7 @@ class ForwardingWorker @AssistedInject constructor(
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = msg.hopCount,
                         extra = "low reachability P=${"%.3f".format(p)} < ${prophet.config.pMinThreshold}")
+                    runCatching { decisionDao.setRewardByMessageId(msg.id, DtnOrchestrator.REWARD_EXPIRED) }
                 }
             }
             if (dropIds.isNotEmpty()) {

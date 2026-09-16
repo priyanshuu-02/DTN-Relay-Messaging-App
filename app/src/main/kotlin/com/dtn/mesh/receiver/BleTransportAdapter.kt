@@ -586,17 +586,17 @@ class BleTransportAdapter @Inject constructor(
                 // pending chunk ACKs both need to unblock so the send path returns null.
                 connectWaiters.remove(gatt.device.address)?.complete(false)
                 chunkAckWaiters.remove(gatt.device.address)?.complete(false)
-                // Emit offline event so orchestrator + UI know this peer is gone
+                // IMPORTANT: do NOT mark the peer offline here. This callback fires for a
+                // transient connect failure (status=133 is common under BLE load) and after
+                // every normal connect→send→disconnect cycle — neither means the peer left.
+                // Driving offline state from our own outbound GATT churn made peers flap
+                // offline mid-session. Peer liveness comes from scan advertisements; the
+                // scan-silence staleness sweeper (startStalenessSweeper) is the sole authority
+                // on marking a peer offline.
                 val peer = nodeFor(gatt.device.address)
                 if (peer != null) {
-                    _nodeEvents.tryEmit(NodeEncounterEvent(
-                        nodeId = peer,
-                        rssi = 0,
-                        snr = 0f,
-                        timestampMs = System.currentTimeMillis(),
-                        isOnline = false,
-                    ))
-                    Log.d(TAG, "Peer disconnected: ${peer.value}")
+                    Log.d(TAG, "GATT client disconnected from ${peer.value} " +
+                        "(status=$status) — liveness unaffected, scan sweeper owns offline")
                 }
             }
         }

@@ -39,6 +39,7 @@ class DtnViewModel @Inject constructor(
     private val contactDao: ContactDao,
     private val messageDao: MessageDao,
     private val lifecycleLog: com.dtn.mesh.service.MessageLifecycleLog,
+    private val benchmarkTracker: com.dtn.mesh.learning.BenchmarkTracker,
 ) : AndroidViewModel(application) {
 
     companion object {
@@ -68,6 +69,15 @@ class DtnViewModel @Inject constructor(
 
     /** Message lifecycle events for the dedicated Lifecycle page. */
     val lifecycleEntries: StateFlow<List<com.dtn.mesh.service.LifecycleEntry>> = lifecycleLog.entries
+
+    /** Engine console (encounter history + per-strategy probability calc) for the Log tab. */
+    val engineLog: StateFlow<List<String>> = lifecycleLog.console
+
+    /** Per-strategy benchmark metrics for the Network tab comparison card. */
+    val benchmarks: StateFlow<List<com.dtn.mesh.learning.BenchmarkStat>> = benchmarkTracker.flow
+
+    /** Clear accumulated benchmark counters (start a fresh comparison run). */
+    fun resetBenchmarks() = benchmarkTracker.reset()
 
     /** Per-message hop routes for the Network tab. */
     val messageRoutes: StateFlow<List<com.dtn.mesh.service.MessageLifecycleLog.RouteRecord>> = lifecycleLog.routes
@@ -467,7 +477,7 @@ class DtnViewModel @Inject constructor(
                 val best = beliefs.firstOrNull { it.score > 0.0 }
                 RoutingExplanation(
                     dest = destNodeId,
-                    strategy = "PROPHET",
+                    strategy = active.name,
                     myScore = myP,
                     myScoreLabel = "P(me → dest)",
                     beliefs = beliefs,
@@ -476,13 +486,18 @@ class DtnViewModel @Inject constructor(
                     bestScore = best?.score ?: 0.0,
                     bestScoreLabel = "P_path",
                     formulas = listOf(
-                        FormulaItem("Direct encounter", "P(a,b) = P + (1−P)·P_init + ε^d"),
+                        FormulaItem(
+                            "Direct encounter",
+                            if (cfg.stabilityAware) "P(a,b) = P + (1−δ−P)·P_enc·q   (q = link quality)"
+                            else "P(a,b) = P + (1−δ−P)·P_enc   (P_enc adaptive; caps at 1−δ)",
+                        ),
                         FormulaItem("Transitivity", "P(a,c) += (1−P(a,c))·P(a,b)·P(b,c)·β"),
                         FormulaItem("Aging", "P(a,b) = P(a,b)·γ^k"),
                         FormulaItem("2-hop path", "P_path(via j) = P(me,j)·P(j,dest)"),
                     ),
-                    constantsLine = "P_init=${fmt2(cfg.pEncounter)} · β=${fmt2(cfg.betaTransitivity)} · " +
-                        "γ=${fmt2(cfg.gammaAging)} · path floor=${fmt2(cfg.pFloorPath)}",
+                    constantsLine = "P_init=${fmt2(cfg.pEncounter)} · δ=${fmt2(cfg.pDelta)} · " +
+                        "β=${fmt2(cfg.betaTransitivity)} · γ=${fmt2(cfg.gammaAging)} · " +
+                        "I_typ=${cfg.typicalEncounterIntervalMs / 1000}s · path floor=${fmt2(cfg.pFloorPath)}",
                 )
             }
             is com.dtn.mesh.routing.MaxPropStrategy -> {
@@ -517,6 +532,35 @@ class DtnViewModel @Inject constructor(
                     ),
                     constantsLine = "discount=${fmt2(cfg.transitivityDiscount)} · " +
                         "recency decay=${fmt2(cfg.recencyDecayFactor)}",
+                )
+            }
+            is com.dtn.mesh.routing.EpidemicStrategy -> {
+                val beliefs = candidates.map { peer ->
+                    RoutingNodeBelief(
+                        nodeId = peer.nodeId,
+                        displayName = peer.displayName(),
+                        isOnline = peer.isOnline,
+                        score = 1.0,
+                        detail = "epidemic — every peer receives a copy",
+                    )
+                }
+                val firstOnline = beliefs.firstOrNull { it.isOnline }
+                RoutingExplanation(
+                    dest = destNodeId,
+                    strategy = "EPIDEMIC",
+                    myScore = 1.0,
+                    myScoreLabel = "flood (all peers)",
+                    beliefs = beliefs,
+                    bestNextHop = firstOnline?.nodeId,
+                    bestNextHopName = firstOnline?.displayName,
+                    bestScore = 1.0,
+                    bestScoreLabel = "flood",
+                    formulas = listOf(
+                        FormulaItem("Rule", "forward every bundle to every encountered peer"),
+                        FormulaItem("Dedup", "duplicates dropped by message-id at ingest"),
+                        FormulaItem("Bound", "hop limit stops infinite re-flooding"),
+                    ),
+                    constantsLine = "no probability model — maximises delivery at maximum bandwidth",
                 )
             }
             else -> null

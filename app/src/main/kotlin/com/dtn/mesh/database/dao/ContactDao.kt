@@ -129,6 +129,14 @@ interface ContactDao {
     // Queries
     // ──────────────────────────────────────────────────────────────────────
 
+    /**
+     * Accumulate a finished contact window's duration onto the peer. [recordEncounter] opens a
+     * window with duration 0 (the length isn't known until the window closes), so without this
+     * the `total_encounter_duration_ms` stat — a Q-learning state feature — stayed zero forever.
+     */
+    @Query("UPDATE contacts SET total_encounter_duration_ms = total_encounter_duration_ms + :durationMs WHERE node_id = :nodeId")
+    suspend fun addEncounterDuration(nodeId: String, durationMs: Long)
+
     /** Get a single contact by node ID. */
     @Query("SELECT * FROM contacts WHERE node_id = :nodeId")
     suspend fun getByNodeId(nodeId: String): ContactEntity?

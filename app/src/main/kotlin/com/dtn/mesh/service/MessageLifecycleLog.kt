@@ -29,10 +29,31 @@ class MessageLifecycleLog @Inject constructor() {
         private const val TAG = "MsgLifecycle"
         private const val MAX_ENTRIES = 200
         private const val MAX_ROUTES = 64
+        private const val MAX_CONSOLE = 300
     }
 
     private val _entries = MutableStateFlow<List<LifecycleEntry>>(emptyList())
     val entries: StateFlow<List<LifecycleEntry>> = _entries.asStateFlow()
+
+    /**
+     * Free-form engine console — encounter history, per-strategy probability calculations, and
+     * other routing diagnostics that aren't tied to a single message's lifecycle. Surfaced in
+     * the in-app Log tab so the reasoning is visible on-device, not only in logcat.
+     * Newest-first, capped at [MAX_CONSOLE].
+     */
+    private val _console = MutableStateFlow<List<String>>(emptyList())
+    val console: StateFlow<List<String>> = _console.asStateFlow()
+
+    private val consoleFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+    /** Append a diagnostic line to the engine console (thread-safe, timestamped). */
+    fun console(line: String) {
+        val stamped = "[${consoleFmt.format(Date())}] $line"
+        synchronized(lock) {
+            _console.value = (listOf(stamped) + _console.value).take(MAX_CONSOLE)
+        }
+        Log.d(TAG, line)
+    }
 
     /**
      * Per-message route as seen from THIS node's perspective:
@@ -163,13 +184,25 @@ class MessageLifecycleLog @Inject constructor() {
     ) {
         upsertRoute(msgId) { existing ->
             val base = existing ?: newRecord(msgId, source, dest, me)
+            // Keep the observed path STABLE. Once a route is delivered its next hop is final and
+            // must never change. Before delivery, the FIRST forward we recorded wins — periodic
+            // re-sends and strategy re-ranking must not keep rewriting the displayed path (that
+            // was the "observed path keeps changing" bug). A call that flips the route to
+            // delivered records the delivering hop as the authoritative next hop.
+            val stableNext = when {
+                base.delivered -> base.nextHop
+                delivered -> nextHop.takeLast(8)
+                base.nextHop != null -> base.nextHop
+                else -> nextHop.takeLast(8)
+            }
             base.copy(
                 source = source.takeLast(8),
                 destination = normaliseDest(dest),
                 me = me.takeLast(8),
-                nextHop = nextHop.takeLast(8),
+                nextHop = stableNext,
                 delivered = base.delivered || delivered,
-                strategy = strategy.ifBlank { base.strategy },
+                // Freeze the strategy label once delivered so it can't flip on later re-sends.
+                strategy = if (base.delivered) base.strategy else strategy.ifBlank { base.strategy },
             )
         }
     }

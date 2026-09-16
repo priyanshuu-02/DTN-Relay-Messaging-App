@@ -63,6 +63,22 @@
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
 
+        <!-- Disable WorkManager's default on-startup initializer. We provide our own
+             Hilt-aware Configuration via DtnMeshApplication (Configuration.Provider) so
+             @HiltWorker workers like ForwardingWorker can be constructed with their injected
+             dependencies. Without this removal the default initializer wins and the default
+             worker factory throws NoSuchMethodException for the assisted constructor. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
     </application>
 
 </manifest>

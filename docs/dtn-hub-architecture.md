@@ -130,16 +130,25 @@ StrategySelector), `learning/` (Double Q-Learning), `scheduler/`, `database/`, `
 
 ## 7. Phone ⇄ Hub protocol (framed TCP, port 9740)
 
+> **Authoritative implementation:** this section (and the firmware snippet in §9) is the original proposal.
+> The shipped protocol/firmware live in **`firmware/src/main.cpp`** + **`firmware/README.md`** and the
+> Android **`LoRaHubTransportAdapter.kt`** — refer to those if anything below drifts. The one addition since
+> this proposal is the `HELLO` frame, included in the table below.
+
 Frame: `[1B type][2B length BE][payload...]`
 
 | Type | Value | Payload | Meaning |
 |---|---|---|---|
+| `HELLO` | 0x03 | 4B hubId | Hub → phone on connect, so the phone treats the hub as an encountered peer |
 | `REGISTER` | 0x01 | 4B nodeId | Phone announces its id so the hub can map nodeId → socket for direct delivery |
 | `BUNDLE` | 0x02 | DTN bundle (32B header + payload) | A DTN message in either direction |
 
-- Phone sends `REGISTER` immediately after connecting, then `BUNDLE`s for anything it wants to inject.
-- Hub sends `BUNDLE`s to a phone when a buffered bundle's destination matches that phone's registered id.
-- Delivery over this reliable TCP link is treated as success (mirrors the WiFi Direct adapter's model).
+- On connect the hub sends `HELLO` (its id); the phone sends `REGISTER` (its id), then `BUNDLE`s for
+  anything it wants to inject.
+- Hub sends `BUNDLE`s to a phone when a buffered bundle's destination matches that phone's registered id, and
+  fans out broadcast bundles (dest `0xFFFFFFFF`) to every connected phone.
+- Delivery over this reliable TCP link is a hop-level handoff, not end-to-end proof (the phone layer uses
+  `ROUTING_ACK` receipts for true delivery confirmation).
 
 ---
 
@@ -289,6 +298,8 @@ void loop(){ acceptAndPoll(); pumpLoRaRx(); pumpLoRaTx(); delay(2); }
 ```
 
 ### 9.3 Firmware caveats before relying on it
+- **This snippet is out of date** — it predates the `HELLO` frame (§7) and the broadcast fan-out. Use
+  `firmware/src/main.cpp` as the source of truth; the snippet is kept only to show the original shape.
 - Set `LORA_FREQ` to your **legally allowed band** and respect regional **duty-cycle** limits. The current
   flooding has no duty-cycle pacer — fine for 2–4 hubs, add pacing before scaling.
 - Header offsets **must** match the finalized `DtnWireCodec` (§5).
@@ -319,3 +330,71 @@ Steps 1–4 reuse patterns already in `WifiDirectTransportAdapter`; the DTN engi
 - **Security**: WiFi WPA2 on the SoftAP and BLE pairing cover the local links; add payload/LoRa encryption
   if end-to-end confidentiality is required.
 ```
+
+---
+
+## 12. Addendum — routing math & multi-phone concurrency (as shipped)
+
+> Added after the original proposal. §1–§11 describe the *transport* pivot; this section records the
+> **routing engine** and **concurrency** work that shipped on the phone side. The engine remains fully
+> transport-agnostic (§6). Authoritative code: `routing/ProphetStrategy.kt`, `routing/MaxPropStrategy.kt`,
+> `service/DtnOrchestrator.kt`. See `PROJECT_MEMORY.md` §B.9–B.12 for the change log.
+
+### 12.1 PRoPHET (RFC 6693)
+
+Delivery predictability `P(a, b) ∈ [0, 1]` per destination. Research basis: Lindgren, Doria, Davies,
+Grasic, *Probabilistic Routing Protocol for Intermittently Connected Networks*, **RFC 6693** (2014).
+
+- **Encounter (delta-capped):** `P = P_old + (1 − δ − P_old) · P_enc`. The cap `1 − δ` (`δ = 0.01`)
+  keeps `P` below `1.0`, which removes the saturation bug where a close peer looked permanently optimal.
+- **Adaptive `P_enc`:** full `P_init = 0.75` on a first contact / gap `≥ I_typ`; scaled by `interval / I_typ`
+  for faster re-encounters (`I_typ = 30 s`) so a stationary in-range peer does not inflate `P`.
+- **Aging:** `P = P · γ^k`, `γ = 0.98`, over `k` elapsed windows.
+- **Transitivity:** `P(a,c) += (1 − P(a,c)) · P(a,b) · P(b,c) · β`, `β = 0.25`, from exchanged summaries.
+- The earlier additive `ε^d` distance term was **removed** (it was the saturation cause); the distance-aware
+  idea survives only as the opt-in **STABLE-PROPHET** link-quality variant.
+
+### 12.2 MaxProp (cost-based, Dijkstra)
+
+Research basis: Burgess, Gallagher, Jensen, Levine, *MaxProp: Routing for Vehicle-Based Disruption-Tolerant
+Networks*, **IEEE INFOCOM 2006**.
+
+- Each node's likelihood vector `f` (`Σf = 1`) gives per-edge cost `(1 − f)`; neighbours' vectors are cached
+  from `ROUTING_SUMMARY` handshakes to build a small multi-hop graph.
+- `findMinCostNextHop` runs **Dijkstra** from a synthetic source `ME` over `(1 − f)` costs; a bundle is
+  forwarded to a peer only when that peer is the **min-cost next hop** toward the destination.
+- New bundles (`hopCount ≤ 1`) get a `1.5×` **head-start** (Burgess §III-C); a hard `maxHops = 10` bounds
+  runaway spread. Direct delivery and broadcast bypass the cost check.
+
+### 12.3 Multi-phone concurrency (send path)
+
+The orchestrator's single event loop no longer *awaits* blocking BLE sends. Instead:
+
+- **Coalesced flush** — one flush at a time (`flushMutex.tryLock`), re-running once if more work arrived,
+  so bursty triggers don't stack.
+- **Parallel per-peer fan-out** bounded by a `Semaphore(4)`, with a **per-peer `Mutex`** so writes to one
+  GATT link never interleave. A slow/unreachable phone can't stall the others.
+- **Connect backoff (10 s)** skips a peer that just failed instead of re-paying the ~8 s connect timeout.
+- **Receipt de-duplication** sends only new `ROUTING_ACK` UIDs per peer (Briar/Bramble-style "offer only
+  what's missing"), short-circuiting on failure.
+- **Broadcast** is cleared from the buffer only after a confirmed fan-out to every online peer.
+
+These ideas are informed by Meshtastic's managed-flooding (listen-before-transmit / suppression) and
+Briar/Bramble pairwise sync; only the concurrency + dedup lessons were adopted (the LoRa backbone keeps its
+own simpler flood-with-dedup in firmware).
+
+### 12.4 Background housekeeping worker & research export
+
+- **Periodic worker.** `scheduler/ForwardingWorker` is a `@HiltWorker` run by WorkManager every 15 min
+  (`DtnForegroundService` enqueues it). It does *housekeeping only* — TTL expiry, reverting timed-out
+  forwards, purging terminal messages, routing aging, draining pending Q-updates to the orchestrator,
+  buffer-pressure enforcement, and low-reachability (`P < pMinThreshold`) drops. Real-time forwarding stays
+  on the orchestrator's encounter path; the worker never transmits directly.
+- **DI wiring (required for the worker to run).** Because the worker uses `@AssistedInject`,
+  `DtnMeshApplication` implements `Configuration.Provider` and supplies a `HiltWorkerFactory`, and the
+  manifest removes WorkManager's default `WorkManagerInitializer`. Without this the default factory throws
+  `NoSuchMethodException` on the assisted constructor when the cycle fires in the background.
+- **Research export.** `export/ResearchExporter` + `export/FileExportHelper` write a benchmark archive
+  (`encounters.csv`, `contacts.csv`, `decisions.csv`, `messages.csv`, `q_tables.json`, `metadata.json`),
+  triggered from the app's **Log tab** ("Export telemetry"). Useful for offline analysis of the routing /
+  RL behaviour described above.

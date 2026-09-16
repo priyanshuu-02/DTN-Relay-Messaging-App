@@ -9,7 +9,6 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
-import kotlin.math.pow
 
 class ProphetStrategyTest {
 
@@ -21,8 +20,9 @@ class ProphetStrategyTest {
             pEncounter = 0.75,
             gammaAging = 0.98,
             betaTransitivity = 0.25,
-            epsilonDistance = 0.5,
-            agingIntervalMs = 1000L,      // 1s for fast test aging
+            pDelta = 0.01,                 // RFC 6693 cap: P asymptotes to 1 − δ
+            typicalEncounterIntervalMs = 0L, // disable adaptive scaling for deterministic tests
+            agingIntervalMs = 1000L,       // 1s for fast test aging
             pMinThreshold = 0.01,
             maxForwards = 2,               // Small values so tests can drive the stage flip
             maxHops = 3,
@@ -52,39 +52,52 @@ class ProphetStrategyTest {
     )
 
     // ══════════════════════════════════════════════════════════════════════
-    // Formula 1 — Direct encounter update (with and without distance boost)
+    // Formula 1 — RFC 6693 direct-encounter update (δ cap + adaptive P_enc)
     // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    fun `encounter without distance falls back to classic PROPHET`() {
+    fun `first encounter applies P_encounter with the delta cap`() {
         val peer = NodeId("!aabb0001")
-        prophet.onEncounter(peer, contact(peer.value))       // distanceM = -1 (unknown)
-        assertEquals(0.75, prophet.getDeliveryProbability(peer), 0.001)
+        prophet.onEncounter(peer, contact(peer.value))
+        // P = 0 + (1 − δ − 0)·P_enc = (1 − 0.01)·0.75 = 0.7425
+        assertEquals((1.0 - 0.01) * 0.75, prophet.getDeliveryProbability(peer), 0.001)
     }
 
     @Test
-    fun `encounter with known distance adds epsilon-to-d boost`() {
-        val peer = NodeId("!aabb0002")
-        // ε = 0.5, d = 2 m → boost = 0.5^2 = 0.25
-        prophet.onEncounter(peer, contact(peer.value, distanceM = 2.0))
-        val expected = (0.0 + (1.0 - 0.0) * 0.75 + 0.5.pow(2.0)).coerceAtMost(1.0)
-        assertEquals(expected, prophet.getDeliveryProbability(peer), 0.001)
-    }
-
-    @Test
-    fun `close encounter clamps P to 1 without overflowing`() {
-        val peer = NodeId("!aabb0003")
-        prophet.onEncounter(peer, contact(peer.value, distanceM = 0.5))
-        assertTrue(prophet.getDeliveryProbability(peer) <= 1.0)
-        assertTrue(prophet.getDeliveryProbability(peer) >= 0.0)
-    }
-
-    @Test
-    fun `repeated encounters increase P but never exceed 1`() {
+    fun `P never reaches 1 - it asymptotes to 1 minus delta`() {
         val peer = NodeId("!aabb0004")
-        repeat(20) { prophet.onEncounter(peer, contact(peer.value)) }
-        assertTrue(prophet.getDeliveryProbability(peer) <= 1.0)
-        assertTrue(prophet.getDeliveryProbability(peer) > 0.99)
+        repeat(50) { prophet.onEncounter(peer, contact(peer.value)) }
+        val p = prophet.getDeliveryProbability(peer)
+        // Structurally capped at 1 − δ = 0.99; must be close but strictly below 1.0.
+        assertTrue("P must stay below 1.0 (RFC delta cap)", p < 1.0)
+        assertTrue("P should approach the 1 − δ cap after many encounters", p > 0.95)
+    }
+
+    @Test
+    fun `adaptive scaling damps rapid re-encounters`() {
+        // I_typ = 10s: a re-encounter 1s later gets only 10% of the boost.
+        val fast = ProphetStrategy(ProphetConfig(
+            pEncounter = 0.75, pDelta = 0.01, typicalEncounterIntervalMs = 10_000L,
+        ))
+        val peer = NodeId("!aabb00a1")
+        val t0 = 1_000_000L
+        fast.onEncounter(peer, ContactRecord(peer, startTimeMs = t0, rssi = -60, snr = 10f, distanceMeters = -1.0))
+        val pAfterFirst = fast.getDeliveryProbability(peer)
+        // Re-encounter 1s later: interval/I_typ = 0.1 → boost scaled to 10%.
+        fast.onEncounter(peer, ContactRecord(peer, startTimeMs = t0 + 1_000L, rssi = -60, snr = 10f, distanceMeters = -1.0))
+        val delta = fast.getDeliveryProbability(peer) - pAfterFirst
+        // Full boost would add (0.99 − 0.7425)·0.75 ≈ 0.185; scaled boost is ~10% of that.
+        assertTrue("rapid re-encounter boost must be small", delta in 0.0..0.05)
+    }
+
+    @Test
+    fun `stability-aware variant never saturates from a single close ping`() {
+        val stable = ProphetStrategy(ProphetConfig(stabilityAware = true, pDelta = 0.01))
+        val peer = NodeId("!aabb00b1")
+        stable.onEncounter(peer, ContactRecord(peer, startTimeMs = 1L, rssi = -40, snr = 20f, distanceMeters = 0.5))
+        val p = stable.getDeliveryProbability(peer)
+        assertTrue(p in 0.0..(1.0 - 0.01))
+        assertTrue("one strong ping should give a modest, not maxed, boost", p < 0.75)
     }
 
     // ══════════════════════════════════════════════════════════════════════

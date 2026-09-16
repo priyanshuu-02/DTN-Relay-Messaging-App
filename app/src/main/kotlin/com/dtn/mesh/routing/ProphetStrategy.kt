@@ -42,13 +42,26 @@ class ProphetStrategy(
     val config: ProphetConfig = ProphetConfig(),
 ) : RoutingStrategy {
 
-    override val name: String = "PROPHET"
+    override val name: String get() = if (config.stabilityAware) "STABLE-PROPHET" else "PROPHET"
 
     /**
      * P(local, peer) — our own delivery predictability vector.
      * Key is peer NodeId string. Values are always in [0, 1].
      */
     private val pTable: MutableMap<String, Double> = mutableMapOf()
+
+    /**
+     * Stability-Aware state (only used when [ProphetConfig.stabilityAware] is true):
+     * an exponentially-weighted moving average of RSSI per peer and a running encounter
+     * count. Together these give a *link-quality / contact-persistence* weight that
+     * modulates the encounter boost — rewarding durable, reliable contacts instead of a
+     * single lucky close ping, and never saturating P to 1.0 from one encounter.
+     */
+    private val emaRssi: MutableMap<String, Double> = mutableMapOf()
+    private val encounterCounts: MutableMap<String, Int> = mutableMapOf()
+
+    /** Last encounter time per peer (epoch ms) — drives the RFC 6693 adaptive encounter weight. */
+    private val lastEncounterMs: MutableMap<String, Long> = mutableMapOf()
 
     /**
      * Cached P-vectors reported *by* each peer during routing-summary exchange.
@@ -66,36 +79,80 @@ class ProphetStrategy(
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Direct-encounter update — Eq. 2 from Page 1 of the notes.
+     * Direct-encounter delivery-predictability update.
      *
-     * Adds `ε^d` on top of the classic PROPHET boost when the contact record carries a
-     * valid distance estimate. Missing distance (`distanceMeters < 0`) skips the boost
-     * so a noisy or unavailable RSSI reading never poisons the P-table.
+     * The default (`stabilityAware = false`) is the **RFC 6693** formulation, which fixes the
+     * saturation instability of the earlier additive-`ε^d` variant with two mechanisms:
+     *
+     *  1. **δ cap** — `P = P + (1 − δ − P)·P_enc`, so P asymptotes to `1 − δ` and can never
+     *     reach exactly 1.0 (RFC 6693 §2.1.2, the `P_encounter`/`delta` cap).
+     *  2. **Adaptive `P_enc`** — for peers we re-encounter faster than the typical inter-contact
+     *     interval `I_typ`, the boost is scaled down by `interval / I_typ` (RFC 6693 §2.1.2.1),
+     *     so two phones sitting in constant BLE range no longer peg P to the max every few
+     *     seconds. This is the root-cause fix for the "P jumps to 1.0 / unstable" behaviour.
+     *
+     * `stabilityAware = true` is our novel variant: it replaces the adaptive scalar with a
+     * smoothed-RSSI + contact-recurrence link-quality weight `q` (see [linkQuality]).
      */
     override fun onEncounter(peerId: NodeId, contactRecord: ContactRecord) {
         val key = peerId.value
+        val now = if (contactRecord.startTimeMs > 0) contactRecord.startTimeMs else System.currentTimeMillis()
         val oldP = pTable.getOrDefault(key, 0.0)
-        val classic = oldP + (1.0 - oldP) * config.pEncounter
-        val distanceBoost = distanceBoost(contactRecord.distanceMeters)
-        val newP = (classic + distanceBoost).coerceIn(0.0, 1.0)
-        pTable[key] = newP
+        val cap = 1.0 - config.pDelta
+        val pEnc = if (config.stabilityAware) {
+            config.pEncounter * linkQuality(key, contactRecord)
+        } else {
+            adaptiveEncounter(key, now)
+        }
+        pTable[key] = (oldP + (cap - oldP) * pEnc).coerceIn(0.0, cap)
+        lastEncounterMs[key] = now
     }
 
     /**
-     * Compute the `ε^d` distance term. Returns 0 if `d` is unknown (sentinel < 0) so
-     * the formula gracefully degrades to standard PROPHET.
+     * RFC 6693 adaptive encounter weight: full [ProphetConfig.pEncounter] on a first contact or
+     * after a gap ≥ `I_typ`, linearly reduced for rapid re-encounters (interval &lt; `I_typ`) so
+     * frequent contacts don't over-inflate predictability.
      */
-    private fun distanceBoost(distanceMeters: Double): Double {
-        if (distanceMeters < 0.0) return 0.0
-        val eps = config.epsilonDistance.coerceIn(0.0, 0.9999)
-        // eps^0 = 1 (infinite boost for zero distance) — guard against that with a floor.
-        val d = distanceMeters.coerceAtLeast(0.5)
-        val term = eps.pow(d)
-        return if (term.isFinite()) term else 0.0
+    private fun adaptiveEncounter(key: String, now: Long): Double {
+        val last = lastEncounterMs[key] ?: return config.pEncounter
+        val interval = (now - last).coerceAtLeast(0L)
+        val iTyp = config.typicalEncounterIntervalMs
+        return if (iTyp > 0 && interval < iTyp) {
+            config.pEncounter * (interval.toDouble() / iTyp)
+        } else {
+            config.pEncounter
+        }
+    }
+
+    /**
+     * Link-quality/persistence weight q ∈ [0,1] for the Stability-Aware variant.
+     * Blends a smoothed RSSI (EWMA, so momentary fades don't jerk the score) with a saturating
+     * contact-recurrence term (peers we meet repeatedly are more trustworthy carriers).
+     */
+    private fun linkQuality(key: String, contact: ContactRecord): Double {
+        // 1) Smooth the RSSI. Unknown/zero RSSI contributes a neutral mid value rather than noise.
+        val prev = emaRssi[key]
+        val ema = if (contact.rssi == 0 || contact.rssi == -200) {
+            prev ?: -85.0
+        } else {
+            val a = config.rssiEmaAlpha
+            if (prev == null) contact.rssi.toDouble() else a * contact.rssi + (1 - a) * prev
+        }
+        emaRssi[key] = ema
+        // Map EWMA RSSI (dBm) to [0,1] over a plausible BLE window [-100, -50].
+        val rssiNorm = ((ema - (-100.0)) / ((-50.0) - (-100.0))).coerceIn(0.0, 1.0)
+
+        // 2) Recurrence: more repeat encounters → more confidence, saturating at RECURRENCE_FULL.
+        val count = (encounterCounts.getOrDefault(key, 0) + 1)
+        encounterCounts[key] = count
+        val recNorm = (count.toDouble() / config.recurrenceFull).coerceIn(0.0, 1.0)
+
+        return (config.qRssiWeight * rssiNorm + config.qRecurrenceWeight * recNorm)
+            .coerceIn(0.0, 1.0)
     }
 
     override fun onRoutingSummaryReceived(peerId: NodeId, summary: RoutingSummary) {
-        if (summary.strategyTag != TAG) return
+        if (summary.strategyTag != name) return
 
         // Decode peer's P-vector once, use it for BOTH transitivity and for the peer-P cache.
         val peerVector = decodePVector(summary.payload)
@@ -119,7 +176,7 @@ class ProphetStrategy(
     }
 
     override fun buildRoutingSummary(): RoutingSummary =
-        RoutingSummary(strategyTag = TAG, payload = encodePVector(pTable))
+        RoutingSummary(strategyTag = name, payload = encodePVector(pTable))
 
     // ══════════════════════════════════════════════════════════════════════
     // Aging
@@ -272,16 +329,21 @@ class ProphetStrategy(
                             when {
                                 // Peer is a strictly better carrier — the normal Stage 2 rule.
                                 peerP > myP -> ForwardCandidate(msg, priority = peerP * ttlFraction)
-                                // Zero-gradient fallback: neither of us has ANY route belief for
-                                // the destination (common in a sparse test net, or before any
-                                // routing summary has propagated). The strict `>` rule would veto
-                                // this outright and strand the bundle forever. Instead allow a
-                                // low-priority exploratory relay so it keeps moving; the
-                                // orchestrator's rate-limit, previous-hop suppression, and hop
-                                // limit bound how far it spreads.
+                                // Destination is NOT currently reachable (offline / not a direct
+                                // neighbour). Holding the only copy because "we're the best
+                                // carrier" (e.g. our self-P saturated to ~1.0 after meeting the
+                                // dest once) strands the message while the dest is away — this is
+                                // exactly the "buffer won't send even though P=1" bug. Spray a
+                                // bounded exploratory copy to online mules instead (spray-and-wait
+                                // insurance). Bounded by maxHops, the 30s per-peer rate limit, and
+                                // previous-hop suppression, so it can't storm the network.
+                                onlinePeers.isNotEmpty() && destKey !in onlinePeers ->
+                                    ForwardCandidate(msg, priority = config.relayBaseFloor * ttlFraction)
+                                // Zero-gradient fallback: dest is a neighbour but neither of us has
+                                // any belief yet — still allow a low-priority exploratory relay.
                                 peerP < config.pMinThreshold && myP < config.pMinThreshold ->
                                     ForwardCandidate(msg, priority = config.relayBaseFloor * ttlFraction)
-                                // Peer is no better and we DO have a belief — hold for a better carrier.
+                                // Peer is no better and the dest is reachable — hold for direct delivery.
                                 else -> null
                             }
                         }
@@ -376,8 +438,17 @@ data class ProphetConfig(
     val gammaAging: Double = 0.98,
     /** Transitivity scaling factor (`β`). RFC 6693 default: 0.25. */
     val betaTransitivity: Double = 0.25,
-    /** Distance-boost base (`ε`). Must be in [0, 1). Smaller ε → shorter reach of the boost. */
-    val epsilonDistance: Double = 0.5,
+    /**
+     * `δ` — the RFC 6693 predictability cap. The encounter update asymptotes to `1 − δ`, so P
+     * can never reach exactly 1.0 (which previously stranded messages in Stage-2). Default 0.01.
+     */
+    val pDelta: Double = 0.01,
+    /**
+     * Typical inter-contact interval `I_typ` (ms). Re-encounters faster than this get a boost
+     * scaled by `interval / I_typ` (RFC 6693 §2.1.2.1), preventing constantly-in-range peers
+     * from over-inflating predictability. Set to 0 to disable adaptive scaling.
+     */
+    val typicalEncounterIntervalMs: Long = 30_000L,
     /** Aging cadence in ms. Below this elapsed time, [onPeriodicAge] is a no-op. */
     val agingIntervalMs: Long = 60_000L,
     /** Minimum P-value before an entry is pruned from the table. */
@@ -386,6 +457,22 @@ data class ProphetConfig(
     val maxForwards: Int = 6,
     /** `H_m` — hard hop limit; a message with `hopCount ≥ maxHops` is never forwarded again. */
     val maxHops: Int = 10,
+
+    // ── Stability-Aware variant (our novel contribution) ────────────────────────────────
+    /**
+     * When true, the encounter update uses a smoothed-RSSI + contact-recurrence link-quality
+     * weight to MODULATE the P_init boost, instead of the classic additive ε^d distance term.
+     * This fixes the single-close-ping saturation-to-1.0 instability and rewards durable links.
+     */
+    val stabilityAware: Boolean = false,
+    /** EWMA smoothing factor for RSSI (higher = more responsive, lower = smoother). */
+    val rssiEmaAlpha: Double = 0.4,
+    /** Encounter count at which the recurrence term reaches its max (1.0). */
+    val recurrenceFull: Double = 5.0,
+    /** Weight of the smoothed-RSSI term in the link-quality blend. */
+    val qRssiWeight: Double = 0.6,
+    /** Weight of the recurrence term in the link-quality blend. */
+    val qRecurrenceWeight: Double = 0.4,
     /**
      * Minimum edge probability for the live-path finder ([findNextHopToward]) to treat a peer
      * as able to reach a target. The old hard-coded `0.5` cutoff discarded all *transitive*
