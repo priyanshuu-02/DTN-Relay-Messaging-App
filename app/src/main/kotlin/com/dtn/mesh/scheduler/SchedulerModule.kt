@@ -52,7 +52,9 @@ object SchedulerModule {
             initialStrategy = StrategySelector.StrategyType.PROPHET,
         )
 
-    @Provides
-    @Singleton
-    fun provideAirtimeBudgetTracker(): AirtimeBudgetTracker = AirtimeBudgetTracker()
+    // NOTE: AirtimeBudgetTracker is intentionally NOT provided here. It's a LoRa duty-cycle /
+    // airtime rate limiter, but on the phone the LoRa link lives on the ESP32 hub (the phone
+    // reaches it over WiFi TCP), so there is no phone-side LoRa airtime to gate. The class is
+    // kept (with its unit tests) as a ready building block for a future direct-LoRa phone
+    // transport; wiring an unused singleton into the DI graph was just dead weight.
 }

@@ -431,6 +431,64 @@ Three linked Network-tab issues. Compiles clean, 47/47 unit tests pass, debug AP
   (`exp`, `destLabel`, `retrospective`, `prevHop`, `nextHop`) so both the route dialog and the new buffer
   dialog reuse it without duplication.
 
+## B.16 DONE — Deep audit fixes: buffer lifecycle, routing correctness, Q-learning, signal metrics
+
+A 12-item audit turned up real contradictions/dead-ends. Fixed in five groups; compiles clean, 47/47 unit
+tests pass, debug APK rebuilt. Each was verified against this checkout before editing.
+
+### B.16.1 Buffer / message lifecycle
+- **2-minute message drop (blocker).** `ForwardingWorker` Phase 7 dropped any buffered message whose
+  destination `P < pMinThreshold` after a 120 s grace. In a DTN, `P = 0` for a not-yet-encountered
+  destination, so store-carry-forward bundles (and anything a mule carried) were deleted after ~2 min
+  despite a 4 h TTL. **Phase 7 removed entirely** — lifetime is now governed only by TTL (Phase 1) and
+  buffer-pressure eviction (Phase 6).
+- **Clear/expiry UI desync.** `clearBuffer()` / `expireMessages()` / `dropMessages()` changed DB status
+  but notified no one, so chat bubbles stayed "buffered"/"sending…". Added
+  `MessageQueueManager.terminalEvents: SharedFlow<TerminalEvent(msgId, reason)>` (reasons
+  `expired`/`dropped`/`cleared`), emitted from those three methods (new `MessageDao.getActiveMessageIds` /
+  `getExpiringMessageIds` capture the affected ids before the bulk UPDATE). `DtnViewModel` flips the bubble
+  to expired/dropped (never overriding "✓ delivered") and logs a DROPPED lifecycle event for a manual
+  Clear; `DtnOrchestrator` prunes `sentTo` on each terminal event.
+
+### B.16.2 Routing correctness
+- **PROPHET summary overflow.** The full P-table exceeded the 223-byte single-frame budget past ~8 nodes,
+  so the orchestrator silently dropped every summary → transitivity/peer-P exchange stopped forever.
+  `buildRoutingSummary()` now sends only the top entries by predictability that fit a `SUMMARY_BYTE_BUDGET`
+  (200 B, capped at `maxSummaryEntries = 12`); `exportState()` still serialises the full table.
+- **MaxProp bootstrap dead-end.** The Dijkstra "no known path" branch returned `null`, refusing to hand a
+  bundle to any exploratory mule until a full cost-path already existed. Now falls back to a bounded
+  low-priority forward (`MaxPropConfig.exploratoryFloor = 0.02`, parity with PROPHET `relayBaseFloor`).
+- **PROPHET P not persisted.** `contacts.delivery_probability` was never written (always 0.0; lost on
+  restart). The orchestrator now writes the canonical PROPHET P
+  (`StrategySelector.prophetDeliveryProbability`, active-independent) after every encounter and re-seeds
+  both PROPHET variants from the DB at startup (`seedRoutingProbabilitiesFromDb`, run on the single
+  consumer coroutine to avoid racing the in-memory pTable).
+
+### B.16.3 Q-learning
+- **Zombie features.** `historicalSuccessRate` was always 0.0 (the attempt/success counters were never
+  incremented) and `deliveryProbability` was the constant 0.5 stub under Q-learning. Now
+  `incrementDeliveryAttempt` fires on each direct/relay forward, `incrementDeliverySuccess` on confirmed
+  delivery, and the Q-state's `deliveryProbability` reads the canonical PROPHET P.
+- **No real-time training.** `qEngine.update` only ran via the 15-min `PeriodicWorkRequest`. Added
+  `OrchestratorEvent.DrainQUpdates`; `resolveRewardDelivered` enqueues it so freshly-assigned rewards are
+  applied immediately — still on the single consumer coroutine (thread-safe), with `markApplied` dedup.
+
+### B.16.4 Signal metrics
+- **Hardcoded BLE link quality.** Inbound GATT writes stamped `rssi = -60, snr = 10`. Now the scan path
+  caches each peer's real RSSI (`lastRssiByNode`) and inbound messages/encounters use it (BLE has no SNR →
+  reported as 0 rather than a fabricated 10). Feeds true link quality to Stability-Aware PROPHET, the
+  Q-learning `rssiNorm`, and the RSSI bars.
+
+### B.16.5 Dead-ends assessed
+- **RadioDistanceEstimator** — kept: it's live diagnostic logging (the `dist≈Xm` encounter line) with unit
+  tests, intentionally not in the RFC-6693 math. Not dead.
+- **AirtimeBudgetTracker** — removed the orphaned Hilt provider (nothing injected it). The class + tests
+  stay as a building block for a future direct-LoRa transport; phone-side LoRa airtime doesn't exist today
+  (the ESP32 hub owns the LoRa link).
+- **WiFi-Direct `connectedPeers` deadlock** — does NOT reproduce in this checkout: `handleGroupInfo` has the
+  client send a HELLO to the group owner on group formation, and the owner replies with its own HELLO, so
+  both sides populate `connectedPeers`. The audit item was from an older revision.
+
 ---
 
 # PART C — What Still Needs to Change (to fully realize the architecture)

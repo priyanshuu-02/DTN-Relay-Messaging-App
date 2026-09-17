@@ -207,6 +207,30 @@ class MessageLifecycleLog @Inject constructor() {
         }
     }
 
+    /**
+     * Mark an already-tracked route as delivered (RESOLVED in the UI).
+     *
+     * This is the fix for the "route shows IN TRANSIT while the chat bubble shows ✓ delivered"
+     * contradiction: end-to-end delivery is confirmed in several places (broadcast fan-out
+     * completion, an inbound delivery receipt, or a cached-receipt clear) that update the message
+     * queue but historically never touched the route record. Callers invoke this alongside
+     * `queueManager.markDelivered(...)` so both state systems agree.
+     *
+     * No-op if we don't have a route record for [msgId] — it never fabricates one (a route with
+     * no observed source/dest/hops would be meaningless), it only upgrades an existing one.
+     */
+    fun markRouteDelivered(msgId: String) {
+        val key = msgId.take(8)
+        synchronized(lock) {
+            val current = _routes.value.toMutableList()
+            val idx = current.indexOfFirst { it.msgId == key }
+            if (idx >= 0 && !current[idx].delivered) {
+                current[idx] = current[idx].copy(delivered = true)
+                _routes.value = current
+            }
+        }
+    }
+
     private fun upsertRoute(msgId: String, mutate: (RouteRecord?) -> RouteRecord) {
         val key = msgId.take(8)
         // Entire read-modify-write must be atomic: concurrent RX (recordIncoming) and TX

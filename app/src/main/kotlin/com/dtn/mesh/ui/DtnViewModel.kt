@@ -218,6 +218,24 @@ class DtnViewModel @Inject constructor(
             queueManager.deliveredIds.collect { msgId -> markChatDeliveredById(msgId) }
         }
 
+        // A message left the buffer WITHOUT delivery (TTL expiry, housekeeping drop, or manual
+        // Clear). Flip the stuck chat bubble so it no longer shows "buffered"/"sending…", and for
+        // a manual Clear also emit a DROPPED lifecycle event (expiry/housekeeping drops are
+        // already logged by ForwardingWorker, so we don't double-log those).
+        viewModelScope.launch {
+            queueManager.terminalEvents.collect { ev ->
+                val label = when (ev.reason) {
+                    MessageQueueManager.REASON_EXPIRED -> "expired"
+                    else -> "dropped"
+                }
+                markChatTerminalById(ev.msgId, label)
+                if (ev.reason == MessageQueueManager.REASON_CLEARED) {
+                    lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.DROPPED, ev.msgId,
+                        extra = "buffer cleared by user")
+                }
+            }
+        }
+
         // Load past chat history from DB. We do this once at construction — as soon as we
         // know our own node id — so previously-exchanged messages survive app restarts.
         viewModelScope.launch { loadChatHistoryIfPossible() }
@@ -397,6 +415,16 @@ class DtnViewModel @Inject constructor(
             if (stored) {
                 val isBroadcast = dest == NodeId.BROADCAST
                 val target = if (isBroadcast) "ALL" else dest.value.takeLast(8)
+                // Label the bubble by whether the destination is reachable RIGHT NOW: a unicast
+                // dest that's a directly-online peer (or, for broadcast, any online peer) will be
+                // delivered within a moment, so it shows "sending…" and then "✓ delivered" — not
+                // the misleading "buffered", which we reserve for messages genuinely held for a
+                // data mule (dest offline). The bundle is still persisted first either way; this
+                // is purely the chat label, not a change to store-carry-forward behaviour.
+                val knownPeers = peerList.value
+                val destReachable = if (isBroadcast) knownPeers.any { it.isOnline }
+                    else knownPeers.any { it.nodeId == dest.value && it.isOnline }
+                val initialStatus = if (destReachable) "sending…" else "buffered"
                 addLog("QUEUED: \"$text\" → $target (${msg.id.take(8)})")
                 lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.CREATED, msg.id,
                     origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
@@ -414,7 +442,7 @@ class DtnViewModel @Inject constructor(
                     // Broadcast → toNodeId=null (lives only in the broadcast chat).
                     toNodeId = if (isBroadcast) null else dest.value,
                     isOutgoing = true,
-                    status = "buffered",
+                    status = initialStatus,
                     time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date()),
                 )
                 // Trigger immediate forwarding. Wrapped defensively so a stopped-and-restarted
@@ -634,6 +662,20 @@ class DtnViewModel @Inject constructor(
         val idx = list.indexOfFirst { it.msgId == msgId && it.isOutgoing }
         if (idx >= 0 && list[idx].status != "✓ delivered") {
             list[idx] = list[idx].copy(status = "✓ delivered")
+            _receivedMessages.value = list
+        }
+    }
+
+    /**
+     * Flip an outgoing chat bubble to a terminal non-delivery status ("expired"/"dropped").
+     * Never overrides a "✓ delivered" bubble — a late terminal event for an already-delivered
+     * message must not undo the delivered state.
+     */
+    private fun markChatTerminalById(msgId: String, label: String) {
+        val list = _receivedMessages.value.toMutableList()
+        val idx = list.indexOfFirst { it.msgId == msgId && it.isOutgoing }
+        if (idx >= 0 && list[idx].status != "✓ delivered" && list[idx].status != label) {
+            list[idx] = list[idx].copy(status = label)
             _receivedMessages.value = list
         }
     }

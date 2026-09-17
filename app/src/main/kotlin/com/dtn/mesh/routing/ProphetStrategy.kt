@@ -176,7 +176,33 @@ class ProphetStrategy(
     }
 
     override fun buildRoutingSummary(): RoutingSummary =
-        RoutingSummary(strategyTag = name, payload = encodePVector(pTable))
+        RoutingSummary(strategyTag = name, payload = encodePVector(topEntriesForSummary()))
+
+    /**
+     * The highest-value slice of the P-table that fits in a single-frame routing summary.
+     *
+     * Sending the whole table overflowed the 223-byte payload budget once we knew ~8+ nodes, so
+     * the orchestrator silently dropped the summary every flush and no routing state was ever
+     * exchanged again. We keep the top entries by predictability (most useful for a peer's
+     * next-hop decision) and stop before the byte budget — so a summary always fits and always
+     * carries our best information. NOTE: this pruning is ONLY for the over-the-air summary;
+     * [exportState] still serialises the full table for local checkpointing.
+     */
+    private fun topEntriesForSummary(): Map<String, Double> {
+        if (pTable.isEmpty()) return emptyMap()
+        val sorted = pTable.entries.sortedByDescending { it.value }
+        val out = LinkedHashMap<String, Double>()
+        var bytes = 4 // DataOutputStream.writeInt(count) header
+        for (e in sorted) {
+            if (out.size >= config.maxSummaryEntries) break
+            // writeUTF = 2-byte length prefix + UTF-8 key bytes; writeDouble = 8 bytes.
+            val entryBytes = 2 + e.key.toByteArray(Charsets.UTF_8).size + 8
+            if (bytes + entryBytes > SUMMARY_BYTE_BUDGET) break
+            out[e.key] = e.value
+            bytes += entryBytes
+        }
+        return out
+    }
 
     // ══════════════════════════════════════════════════════════════════════
     // Aging
@@ -362,6 +388,19 @@ class ProphetStrategy(
     /** Expose the P-table for UI display (Network tab shows probability per peer). */
     fun getPTable(): Map<String, Double> = pTable.toMap()
 
+    /**
+     * Seed the P-table from persisted delivery probabilities at startup so learned predictability
+     * survives an app restart (the pTable is otherwise in-memory only). Fills only entries we
+     * don't already have this session, so a fresh live encounter always wins over a stale value.
+     */
+    fun seedProbabilities(seed: Map<String, Double>) {
+        for ((nodeId, p) in seed) {
+            if (p > 0.0 && !pTable.containsKey(nodeId)) {
+                pTable[nodeId] = p.coerceIn(0.0, 1.0)
+            }
+        }
+    }
+
     override fun rankForDrop(candidates: List<DtnMessage>, bytesToFree: Long): List<DtnMessage> {
         // Drop messages that we're least confident of ever delivering — low P first,
         // then shortest remaining TTL as tie-break.
@@ -420,6 +459,12 @@ class ProphetStrategy(
 
     companion object {
         const val TAG = "PROPHET"
+        /**
+         * Byte budget for an encoded routing-summary P-vector. Kept safely below the 223-byte
+         * single-frame payload limit (DtnMessage.MAX_SINGLE_PACKET_PAYLOAD) so the summary always
+         * fits in one packet regardless of node-id lengths.
+         */
+        const val SUMMARY_BYTE_BUDGET = 200
     }
 }
 
@@ -491,4 +536,12 @@ data class ProphetConfig(
      * suppression, and [maxHops] bound the spread.
      */
     val relayBaseFloor: Double = 0.02,
+    /**
+     * Max entries put into an outgoing routing summary. The full P-table can exceed the 223-byte
+     * single-frame budget once ~8+ nodes are known, which made the orchestrator drop the summary
+     * on every flush and permanently halt transitivity / peer-P exchange. We send only the
+     * highest-predictability entries (the ones most useful to a peer choosing a next hop); a byte
+     * budget in [ProphetStrategy] buildRoutingSummary is the hard guard on top of this count.
+     */
+    val maxSummaryEntries: Int = 12,
 )

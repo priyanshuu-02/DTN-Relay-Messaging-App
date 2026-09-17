@@ -92,6 +92,20 @@ class StrategySelector(
 
     override fun importState(data: ByteArray) = active.importState(data)
 
+    /**
+     * Canonical PRoPHET delivery predictability toward a peer, INDEPENDENT of which strategy is
+     * currently active. Both PRoPHET variants learn on every encounter, so this is a stable value
+     * to persist into the contacts table (and to reflect in the UI) even when MaxProp / Epidemic /
+     * Q-Learning is the active router.
+     */
+    fun prophetDeliveryProbability(peerId: NodeId): Double = prophet.getDeliveryProbability(peerId)
+
+    /** Seed both PRoPHET variants' P-tables from persisted probabilities on startup. */
+    fun seedProphetProbabilities(seed: Map<String, Double>) {
+        prophet.seedProbabilities(seed)
+        stableProphet.seedProbabilities(seed)
+    }
+
     /** Export both strategies' states for full checkpoint. */
     fun exportAllStates(): Pair<ByteArray, ByteArray> =
         prophet.exportState() to maxProp.exportState()

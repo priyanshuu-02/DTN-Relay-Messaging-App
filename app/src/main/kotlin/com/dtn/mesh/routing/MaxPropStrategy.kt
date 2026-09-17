@@ -181,7 +181,7 @@ class MaxPropStrategy(
         val pq = java.util.PriorityQueue<Pair<String, Double>>(compareBy { it.second })
         pq.add(ME to 0.0)
         while (pq.isNotEmpty()) {
-            val (u, du) = pq.poll()
+            val (u, du) = pq.poll() ?: break
             if (!visited.add(u)) continue
             if (u == dest) break
             for (v in neighbours(u)) {
@@ -226,10 +226,15 @@ class MaxPropStrategy(
                         priority = (1.0 / (1.0 + cost)) * headStart * ttlFraction)
                     // A cheaper path exists through a different peer — hold for it.
                     nextHop != null -> null
-                    // No known path: single-hop fallback using this peer's own reported f(peer,dest).
+                    // No known path. Prefer this peer's own reported f(peer,dest); if it has none
+                    // either, still allow a BOUNDED low-priority exploratory forward so bundles can
+                    // reach freshly-met mules during bootstrap instead of dead-ending (parity with
+                    // PROPHET's relayBaseFloor). hopCount>=maxHops above + the orchestrator's
+                    // rate-limit keep this from turning into an unbounded flood.
                     else -> {
                         val peerF = peerFTables[peerId.value]?.get(destKey) ?: 0.0
-                        if (peerF > 0.0) ForwardCandidate(msg, priority = peerF * ttlFraction) else null
+                        val basePriority = if (peerF > 0.0) peerF else config.exploratoryFloor
+                        ForwardCandidate(msg, priority = basePriority * ttlFraction)
                     }
                 }
             }
@@ -377,4 +382,13 @@ data class MaxPropConfig(
     val newPacketHopThreshold: Int = 1,
     /** Priority multiplier applied to new (low-hop) packets for the head-start. */
     val headStartBoost: Double = 1.5,
+    /**
+     * Low-priority exploratory forward used when Dijkstra finds NO known path to the destination
+     * and the candidate peer reports no `f(peer,dest)` either (cold start, or a freshly-met mule
+     * we haven't exchanged summaries with). Without it MaxProp refused to hand a bundle to any
+     * exploratory carrier, so nothing spread until a complete cost-path already existed — a
+     * bootstrap dead-end. Mirrors PROPHET's `relayBaseFloor`; [maxHops] and the orchestrator's
+     * per-peer rate-limit bound the resulting spread.
+     */
+    val exploratoryFloor: Double = 0.02,
 )

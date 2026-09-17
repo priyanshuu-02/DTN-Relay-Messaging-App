@@ -84,34 +84,14 @@ class ForwardingWorker @AssistedInject constructor(
         // Phase 6: Buffer pressure enforcement
         queueManager.enforceBufferPressure(strategySelector)
 
-        // Phase 7: Drop buffered messages whose destination's P-value has decayed below
-        // threshold. If we can't reasonably expect to encounter the destination or a mule
-        // that can reach them, there's no point holding the message. Grace period of 2
-        // minutes so freshly-created messages aren't killed before we've learned P.
-        val prophet = strategySelector.active as? com.dtn.mesh.routing.ProphetStrategy
-        if (prophet != null) {
-            val buffered = queueManager.getAllBuffered()
-            val now = System.currentTimeMillis()
-            val dropIds = mutableListOf<String>()
-            for (msg in buffered) {
-                if (msg.destinationNodeId == com.dtn.mesh.model.NodeId.BROADCAST) continue
-                val age = now - msg.createdAtMs
-                if (age < 120_000L) continue // grace period: 2 minutes
-                val p = prophet.getDeliveryProbability(msg.destinationNodeId)
-                if (p < prophet.config.pMinThreshold) {
-                    dropIds.add(msg.id)
-                    lifecycle.log(LifecycleEvent.DROPPED, msg.id,
-                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                        hopCount = msg.hopCount,
-                        extra = "low reachability P=${"%.3f".format(p)} < ${prophet.config.pMinThreshold}")
-                    runCatching { decisionDao.setRewardByMessageId(msg.id, DtnOrchestrator.REWARD_EXPIRED) }
-                }
-            }
-            if (dropIds.isNotEmpty()) {
-                queueManager.dropMessages(dropIds)
-                Log.d(TAG, "P-threshold drop: ${dropIds.size} messages (P below ${prophet.config.pMinThreshold})")
-            }
-        }
+        // NOTE: a former "Phase 7" proactively DROPPED any buffered message whose destination
+        // P-value was below pMinThreshold after a 2-minute grace period. That was fundamentally
+        // wrong for a delay-tolerant network: a message to a node we have not encountered yet has
+        // P = 0.0 by definition, so store-carry-forward bundles (and anything a data mule is
+        // carrying) were deleted after ~2 minutes even though their TTL is hours. A message's
+        // lifetime is governed ONLY by its TTL (Phase 1 expiry) and, when storage is scarce, by
+        // buffer-pressure eviction (Phase 6). Low predictability means "keep carrying and wait
+        // for a better contact", never "delete". The phase was removed deliberately.
 
         Log.d(TAG, "Housekeeping cycle complete")
         return Result.success()

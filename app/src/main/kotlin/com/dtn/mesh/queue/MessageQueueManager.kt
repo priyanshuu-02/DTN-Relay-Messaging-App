@@ -42,6 +42,19 @@ class MessageQueueManager @Inject constructor(
     )
     val deliveredIds: SharedFlow<String> = _deliveredIds.asSharedFlow()
 
+    /**
+     * Emitted whenever a message leaves the buffer WITHOUT being delivered — it expired (TTL),
+     * or was dropped (manual "Clear", or a housekeeping drop). Mirrors [deliveredIds] so the UI
+     * can flip a stuck "buffered"/"sending…" chat bubble to "expired"/"dropped" and the
+     * orchestrator can prune its per-message send-tracking state. `reason` is one of
+     * [REASON_EXPIRED], [REASON_DROPPED], [REASON_CLEARED].
+     */
+    private val _terminalEvents = MutableSharedFlow<TerminalEvent>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val terminalEvents: SharedFlow<TerminalEvent> = _terminalEvents.asSharedFlow()
+
     // ──────────────────────────────────────────────────────────────────────
     // Ingest
     // ──────────────────────────────────────────────────────────────────────
@@ -121,7 +134,15 @@ class MessageQueueManager @Inject constructor(
     // ──────────────────────────────────────────────────────────────────────
 
     /** Mark all expired messages and return how many were expired. */
-    suspend fun expireMessages(): Int = messageDao.markExpiredMessages()
+    suspend fun expireMessages(): Int {
+        val now = System.currentTimeMillis()
+        // Capture the ids BEFORE the bulk UPDATE so we can tell the UI/orchestrator which
+        // messages just expired (Room UPDATE can't return the affected rows).
+        val expiringIds = messageDao.getExpiringMessageIds(now)
+        val n = messageDao.markExpiredMessages(now)
+        expiringIds.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_EXPIRED)) }
+        return n
+    }
 
     /** Purge old terminal-state messages beyond retention period. */
     suspend fun purgeOldMessages(): Int {
@@ -178,7 +199,14 @@ class MessageQueueManager @Inject constructor(
     }
 
     /** Manually clear the buffer — mark all active messages DROPPED. Returns count cleared. */
-    suspend fun clearBuffer(): Int = messageDao.clearAllActive()
+    suspend fun clearBuffer(): Int {
+        // Capture ids first so the UI can flip those bubbles to "dropped" and the orchestrator
+        // can prune send-tracking state — a bare UPDATE tells no one what changed.
+        val ids = messageDao.getActiveMessageIds()
+        messageDao.clearAllActive()
+        ids.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_CLEARED)) }
+        return ids.size
+    }
 
     /**
      * Mark a specific list of messages as DROPPED (used by the housekeeping worker when a
@@ -187,6 +215,7 @@ class MessageQueueManager @Inject constructor(
     suspend fun dropMessages(ids: List<String>) {
         if (ids.isEmpty()) return
         messageDao.markDropped(ids)
+        ids.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_DROPPED)) }
     }
 
     /** Check if a message exists in BUFFERED state. */
@@ -272,4 +301,21 @@ class MessageQueueManager @Inject constructor(
         forwardCount = entity.forwardCount,
         duplicateCount = entity.duplicateCount,
     )
+
+    companion object {
+        /** Message hit its TTL and was expired by the housekeeping worker. */
+        const val REASON_EXPIRED = "expired"
+        /** Message was dropped by a housekeeping policy. */
+        const val REASON_DROPPED = "dropped"
+        /** Buffer was manually cleared by the user ("Clear" button). */
+        const val REASON_CLEARED = "cleared"
+    }
 }
+
+/**
+ * A message leaving the buffer without being delivered. Carried on
+ * [MessageQueueManager.terminalEvents] so the UI can update the chat bubble and the orchestrator
+ * can prune per-message state. [reason] is one of [MessageQueueManager.REASON_EXPIRED],
+ * [MessageQueueManager.REASON_DROPPED], or [MessageQueueManager.REASON_CLEARED].
+ */
+data class TerminalEvent(val msgId: String, val reason: String)

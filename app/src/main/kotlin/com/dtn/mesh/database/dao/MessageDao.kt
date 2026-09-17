@@ -170,6 +170,16 @@ interface MessageDao {
     """)
     suspend fun clearAllActive(): Int
 
+    /**
+     * IDs of all currently-active (BUFFERED/FORWARDING) messages. Read BEFORE [clearAllActive]
+     * so callers can notify the UI which chat bubbles just transitioned to DROPPED.
+     */
+    @Query("""
+        SELECT id FROM messages
+        WHERE status = '${MessageStatus.BUFFERED}' OR status = '${MessageStatus.FORWARDING}'
+    """)
+    suspend fun getActiveMessageIds(): List<String>
+
     /** Increment duplicate count for an existing message. */
     @Query("UPDATE messages SET duplicate_count = duplicate_count + 1 WHERE id = :messageId")
     suspend fun incrementDuplicateCount(messageId: String)
@@ -194,6 +204,17 @@ interface MessageDao {
         AND expires_at_ms <= :nowMs
     """)
     suspend fun markExpiredMessages(nowMs: Long = System.currentTimeMillis()): Int
+
+    /**
+     * IDs of messages that WILL be expired by [markExpiredMessages] at [nowMs]. Read just before
+     * the update so callers can notify the UI which chat bubbles transitioned to EXPIRED.
+     */
+    @Query("""
+        SELECT id FROM messages
+        WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+        AND expires_at_ms <= :nowMs
+    """)
+    suspend fun getExpiringMessageIds(nowMs: Long = System.currentTimeMillis()): List<String>
 
     /** Permanently delete messages that have been expired/dropped for longer than retention period. */
     @Query("""

@@ -120,6 +120,8 @@ class DtnOrchestrator @Inject constructor(
         data class Status(val event: DeliveryStatusEvent) : OrchestratorEvent()
         data class QUpdateBatch(val decisions: List<ForwardingDecisionEntity>) : OrchestratorEvent()
         data object FlushBuffer : OrchestratorEvent()
+        /** Apply any reward-assigned-but-unapplied Q decisions now (real-time training). */
+        data object DrainQUpdates : OrchestratorEvent()
     }
 
     /**
@@ -201,6 +203,24 @@ class DtnOrchestrator @Inject constructor(
         for ((_, peers) in sentTo) peers.remove(peer)
     }
 
+    /**
+     * Reload persisted PROPHET delivery predictability from the contacts table into the routing
+     * strategy at startup. Without this, everything learned in a previous session was lost on
+     * restart (the P-table is in-memory) and the DB column — now written on every encounter —
+     * would only ever be read by the UI/export, never fed back into routing.
+     */
+    private suspend fun seedRoutingProbabilitiesFromDb() {
+        runCatching {
+            val seed = contactDao.getAll()
+                .filter { it.deliveryProbability > 0.0 }
+                .associate { it.nodeId to it.deliveryProbability }
+            if (seed.isNotEmpty()) {
+                strategySelector.seedProphetProbabilities(seed)
+                Log.d(TAG, "Seeded PROPHET P for ${seed.size} contact(s) from DB")
+            }
+        }.onFailure { Log.w(TAG, "seed routing probabilities from DB failed", it) }
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     fun start() {
@@ -215,6 +235,9 @@ class DtnOrchestrator @Inject constructor(
         sc.launch { transport.nodeEvents.collect { ch.trySend(OrchestratorEvent.Encounter(it)) } }
         sc.launch { transport.inboundMessages.collect { ch.trySend(OrchestratorEvent.Message(it)) } }
         sc.launch { transport.deliveryStatus.collect { ch.trySend(OrchestratorEvent.Status(it)) } }
+        // A buffered message that expired / was dropped / cleared is gone — drop its per-message
+        // send-tracking so the sentTo map doesn't leak entries for messages we'll never resend.
+        sc.launch { queueManager.terminalEvents.collect { forgetSentTo(it.msgId) } }
         // Proactive short-interval flush so buffered messages reach online peers promptly
         // instead of waiting for the next (debounced/suppressed) encounter event.
         sc.launch {
@@ -224,6 +247,10 @@ class DtnOrchestrator @Inject constructor(
             }
         }
         sc.launch {
+            // Restore learned PROPHET predictability from the DB BEFORE processing events, so a
+            // restart doesn't begin from a blank routing table. Runs on this single consumer
+            // coroutine so it can't race the pTable mutations that onEncounter performs.
+            seedRoutingProbabilitiesFromDb()
             for (ev in ch) {
                 try {
                     when (ev) {
@@ -232,6 +259,12 @@ class DtnOrchestrator @Inject constructor(
                         is OrchestratorEvent.Status -> onDeliveryStatus(ev.event)
                         is OrchestratorEvent.QUpdateBatch -> processBatchQUpdates(ev.decisions)
                         is OrchestratorEvent.FlushBuffer -> requestFlush()
+                        is OrchestratorEvent.DrainQUpdates -> {
+                            // Fetch fresh on the loop (not passed in) so concurrent drains can't
+                            // double-apply; markApplied inside processBatchQUpdates dedups.
+                            val pending = decisionDao.getPendingUpdates()
+                            if (pending.isNotEmpty()) processBatchQUpdates(pending)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Handler error for $ev", e)
@@ -345,6 +378,15 @@ class DtnOrchestrator @Inject constructor(
                 distanceMeters = distanceM,
             ),
         )
+        // Persist the canonical PROPHET delivery predictability so the contacts table reflects it
+        // (Network tab / export / DB queries) and so it can be reloaded on the next app start.
+        // We always write the PROPHET value (both PROPHET variants learn on every encounter),
+        // independent of which strategy is active, keeping the column's meaning stable.
+        runCatching {
+            contactDao.updateDeliveryProbability(
+                peerId.value, strategySelector.prophetDeliveryProbability(peerId), now,
+            )
+        }.onFailure { Log.w(TAG, "persist delivery probability failed", it) }
         // ── Encounter-history + probability logging ──────────────────────────────────────
         // Show exactly what each routing model consumed to (re)compute this peer's score:
         // the encounter-history signals (novelty, gap since last contact, RSSI/SNR, distance)
@@ -483,6 +525,7 @@ class DtnOrchestrator @Inject constructor(
         for ((msgId, sentPeers) in broadcastsSentTo) {
             if (sentPeers.containsAll(onlineIds)) {
                 queueManager.markDelivered(msgId)
+                lifecycle.markRouteDelivered(msgId) // keep route observation in sync with chat status
                 lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msgId,
                     extra = "broadcast fan-out complete (${onlineIds.size} peers)")
                 Log.d(TAG, "BROADCAST cleared: $msgId (sent to ${onlineIds.size} peers)")
@@ -538,6 +581,7 @@ class DtnOrchestrator @Inject constructor(
             // If a receipt already confirmed delivery elsewhere, clear locally.
             if (receiptStore.isDelivered(msg.id) && msg.destinationNodeId != NodeId.BROADCAST) {
                 queueManager.markDelivered(msg.id)
+                lifecycle.markRouteDelivered(msg.id) // route observation → RESOLVED, matches chat
                 forgetSentTo(msg.id)
                 continue
             }
@@ -584,6 +628,9 @@ class DtnOrchestrator @Inject constructor(
                     // BLE direct delivery: the GATT link is established and the write
                     // succeeded — reliable connection, so mark delivered immediately.
                     queueManager.markDelivered(msg.id)
+                    // Count a delivery attempt via this peer (success is credited in
+                    // resolveRewardDelivered) — feeds the Q-state historicalSuccessRate feature.
+                    runCatching { contactDao.incrementDeliveryAttempt(peerId.value) }
                     forgetSentTo(msg.id)
                     benchmark.recordDelivery(strat, wireMsg.hopCount, System.currentTimeMillis() - msg.createdAtMs)
                     // Q-learning credit: this forward delivered the message to its destination.
@@ -621,6 +668,9 @@ class DtnOrchestrator @Inject constructor(
                     Log.d(TAG, "BCAST → ${peerId.value.takeLast(8)}: ${msg.id.take(8)}")
                 }
                 else -> {
+                    // Count a delivery attempt via this mule — success is credited later when a
+                    // receipt confirms end delivery (feeds the Q-state historicalSuccessRate).
+                    runCatching { contactDao.incrementDeliveryAttempt(peerId.value) }
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
@@ -717,6 +767,9 @@ class DtnOrchestrator @Inject constructor(
             lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
                 origin = msg.originNodeId.value, extra = "from=${msg.originNodeId.value.takeLast(8)}")
             receiptStore.markDelivered(uuid)
+            // An end-to-end receipt confirms delivery — upgrade our route observation to RESOLVED
+            // whether or not we still hold a buffer copy (no-op if we never tracked this route).
+            lifecycle.markRouteDelivered(uuid)
             if (queueManager.existsInBuffer(uuid)) {
                 queueManager.markDelivered(uuid)
                 lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid)
@@ -899,7 +952,10 @@ class DtnOrchestrator @Inject constructor(
         val avgDurMs = if (c != null && c.totalEncounters > 0)
             c.totalEncounterDurationMs.toDouble() / c.totalEncounters else 0.0
         val encDur = (avgDurMs / 60_000.0).coerceIn(0.0, 1.0) // normalise by 60s
-        val deliveryProb = strategySelector.getDeliveryProbability(peer).coerceIn(0.0, 1.0)
+        // Feed the CANONICAL PROPHET predictability (not the active strategy's) — under Q-learning
+        // the active strategy's getDeliveryProbability is a constant 0.5 stub, which starved this
+        // feature. Both PROPHET variants learn on every encounter, so this is always meaningful.
+        val deliveryProb = strategySelector.prophetDeliveryProbability(peer).coerceIn(0.0, 1.0)
         val ttlFrac = (msg.remainingTtlMs().toDouble() / msg.ttlMs.coerceAtLeast(1L)).coerceIn(0.0, 1.0)
         val bufOcc = runCatching { queueManager.getBufferOccupancy() }.getOrDefault(0.0)
         val succ = if (c != null && c.deliveryAttemptCount > 0)
@@ -969,7 +1025,15 @@ class DtnOrchestrator @Inject constructor(
             decisionDao.setRewardByMessageId(msgId, REWARD_BASELINE_DELIVERED)
             if (deliveringPeer != null) {
                 decisionDao.setDifferentiatedReward(msgId, deliveringPeer, REWARD_FORWARD_DELIVERED)
+                // Credit this peer with a successful delivery — feeds the Q-state
+                // historicalSuccessRate feature (success/attempt), which was stuck at 0.0 because
+                // the success counter was never incremented anywhere.
+                contactDao.incrementDeliverySuccess(deliveringPeer)
             }
         }.onFailure { Log.w(TAG, "reward backfill failed for ${msgId.take(8)}", it) }
+        // Train the Q-engine on these freshly-assigned rewards NOW rather than waiting for the
+        // 15-minute housekeeping worker. Enqueued as a loop event so qEngine mutations stay on the
+        // single consumer coroutine (thread-safety). No-op for non-Q strategies (nothing pending).
+        eventChannel?.trySend(OrchestratorEvent.DrainQUpdates)
     }
 }

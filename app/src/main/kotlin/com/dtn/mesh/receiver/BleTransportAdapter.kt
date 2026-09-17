@@ -87,6 +87,8 @@ class BleTransportAdapter @Inject constructor(
 
         private const val DEFAULT_CHUNK = 20 // pre-MTU-negotiation safe size (23 - 3 ATT overhead)
         private const val ENCOUNTER_COOLDOWN_MS = 8_000L // min gap between encounter emits per peer
+        /** Fallback link RSSI (dBm) for an inbound write before the scan path has a real reading. */
+        private const val BLE_FALLBACK_RSSI = -70
         /**
          * If we haven't seen ANY signal from a peer (scan hit, GATT connect, inbound write,
          * outbound write) for this long, declare it offline. 20s balances responsiveness
@@ -127,6 +129,15 @@ class BleTransportAdapter @Inject constructor(
      * "still advertising" from "went out of range".
      */
     private val peerLastSeenMs = ConcurrentHashMap<String, Long>()
+
+    /**
+     * NodeId → most recent REAL RSSI (dBm) observed from that peer's scan advertisements. BLE
+     * GATT writes carry no RSSI, so inbound-message link metrics were previously hardcoded to
+     * -60 dBm; we now stamp them with the last real scan reading so signal-aware routing
+     * (Stability-Aware PROPHET, the Q-learning rssiNorm feature, the RSSI bars) sees true link
+     * quality. BLE has no SNR concept, so SNR is reported as 0 (neutral) rather than a fake value.
+     */
+    private val lastRssiByNode = ConcurrentHashMap<String, Int>()
 
     /** Scope for background jobs (staleness sweep). Recreated on each [connect]. */
     private var adapterScope: CoroutineScope? = null
@@ -245,6 +256,7 @@ class BleTransportAdapter @Inject constructor(
             val staleDevice = deviceForNode.remove(peerIdStr)
             peerLastSeenMs.remove(peerIdStr)
             lastEncounterEmit.remove(peerIdStr)
+            lastRssiByNode.remove(peerIdStr)
             staleDevice?.address?.let { addr ->
                 connectWaiters.remove(addr)?.complete(false)
                 chunkAckWaiters.remove(addr)?.complete(false)
@@ -313,7 +325,13 @@ class BleTransportAdapter @Inject constructor(
         buf.reset()
         if (bytes.size > 2 + total) buf.write(bytes, 2 + total, bytes.size - (2 + total))
 
-        val msg = DtnWireCodec.decode(wire, rssi = -60, snr = 10f) ?: return
+        // Stamp the inbound message with the best REAL link RSSI we have for the sending device.
+        // BLE GATT writes carry no RSSI; nodeFor(address) resolves the sender for already-known
+        // peers and we reuse their last scan reading (fallback until the scan path learns them).
+        // BLE has no SNR, so 0f (neutral) rather than the old fabricated 10 dB.
+        val addrNode = nodeFor(address)
+        val linkRssi = addrNode?.let { lastRssiByNode[it.value] } ?: BLE_FALLBACK_RSSI
+        val msg = DtnWireCodec.decode(wire, rssi = linkRssi, snr = 0f) ?: return
         // A successful decode means the peer is definitely reachable — refresh the origin's
         // last-seen so the sweeper doesn't misfire during an active exchange.
         peerLastSeenMs[msg.originNodeId.value] = System.currentTimeMillis()
@@ -332,9 +350,10 @@ class BleTransportAdapter @Inject constructor(
         val neighbour: NodeId? = if (msg.messageType.isHandshake) msg.originNodeId else nodeFor(address)
         if (neighbour != null && neighbour != identity.nodeId) {
             deviceForNode[neighbour.value] = device
-            // A live GATT write is a strong reachability signal; -60 dBm is a reasonable
-            // "connected neighbour" estimate that the scan path will refine if it ever fires.
-            emitOnlineEncounter(neighbour, rssi = -60)
+            // Use the neighbour's last REAL scan RSSI (fallback until the scan path learns it),
+            // not a hardcoded constant, so the encounter carries true link quality.
+            val neighbourRssi = lastRssiByNode[neighbour.value] ?: linkRssi
+            emitOnlineEncounter(neighbour, rssi = neighbourRssi)
         }
 
         _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = neighbour))
@@ -423,6 +442,7 @@ class BleTransportAdapter @Inject constructor(
             if (peer == identity.nodeId) return // ignore our own advertisement
 
             deviceForNode[peer.value] = result.device
+            lastRssiByNode[peer.value] = result.rssi // real link quality, reused for inbound writes
             emitOnlineEncounter(peer, result.rssi)
         }
 
