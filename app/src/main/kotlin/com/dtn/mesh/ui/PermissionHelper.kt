@@ -26,8 +26,10 @@ object PermissionHelper {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Location required for WiFi Direct peer discovery (all API levels)
+        // Location required for WiFi Direct peer discovery (all API levels). COARSE must be
+        // requested with FINE or Android 12 (API 31-32) ignores a FINE-only request.
         perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
 
         return perms.toTypedArray()
     }

@@ -139,4 +139,28 @@ data class ContactEntity(
      */
     @ColumnInfo(name = "custom_name")
     val customName: String? = null,
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Cryptographic identity (learned from a signed ANNOUNCE, trust-on-first-use)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /** Peer's X25519 public key (32 bytes) for end-to-end encryption, or null if unknown. */
+    @ColumnInfo(name = "x_pub", typeAffinity = ColumnInfo.BLOB)
+    val xPub: ByteArray? = null,
+
+    /** Peer's Ed25519 public key (32 bytes) for announce verification, or null if unknown. */
+    @ColumnInfo(name = "ed_pub", typeAffinity = ColumnInfo.BLOB)
+    val edPub: ByteArray? = null,
+
+    /** True once the user verified the safety number (QR / in person). TOFU-pinned otherwise. */
+    @ColumnInfo(name = "key_verified")
+    val keyVerified: Boolean = false,
+
+    /** When we first pinned this peer's keys (epoch ms). */
+    @ColumnInfo(name = "key_first_seen_ms")
+    val keyFirstSeenMs: Long = 0,
+
+    /** Display name advertised in the peer's signed ANNOUNCE. */
+    @ColumnInfo(name = "announce_name")
+    val announceName: String? = null,
 )

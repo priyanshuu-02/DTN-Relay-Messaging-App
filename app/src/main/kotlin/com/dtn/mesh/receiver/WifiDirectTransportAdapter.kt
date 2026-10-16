@@ -284,7 +284,15 @@ class WifiDirectTransportAdapter @Inject constructor(
             if (length > 0) dis.readFully(wireBytes)
 
             // Read sender's REAL node id (from LocalNodeIdentity on the other phone).
+            // SECURITY: bound the length read off the socket. A crafted frame with a huge
+            // senderIdLength previously allocated a multi-GB ByteArray → OutOfMemoryError (which
+            // isn't caught by `catch (Exception)`) and crashed the whole app. Node ids are short.
             val senderIdLength = dis.readInt()
+            if (senderIdLength < 1 || senderIdLength > 64) {
+                Log.w(TAG, "Bad sender id length ($senderIdLength), dropping")
+                socket.close()
+                return
+            }
             val senderId = String(ByteArray(senderIdLength).also { dis.readFully(it) })
             socket.close()
 

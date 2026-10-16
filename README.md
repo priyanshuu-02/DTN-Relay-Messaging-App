@@ -171,9 +171,15 @@ For offline analysis and benchmarking, the full research archive can be exported
 ## Compilation and Deployment
 
 ### Prerequisites
-* Android SDK (API 34+)
-* Java Development Kit (JDK) 17
-* Gradle 8.2+
+* Android SDK (compileSdk / targetSdk **35**, minSdk 26)
+* Java Development Kit (JDK) **17+** (JDK 21 is fine)
+* Gradle **8.9** — just use the wrapper (`./gradlew`), no separate install needed
+* For the LoRa hub firmware: **PlatformIO** (`pio`)
+
+Messages are end-to-end encrypted (X25519 + AES-256-GCM); 1:1 chats and private groups are
+encrypted, the public broadcast channel is cleartext. An optional MQTT internet relay bridges the
+mesh when online (Settings → Internet). The hubs run the firmware in `firmware/` on Heltec WiFi
+LoRa 32 V3 boards.
 
 ### Building the Project
 To compile the application and generate a debug APK:

@@ -1,77 +1,83 @@
 // ============================================================================
-//  DTN LoRa Hub — Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)
+//  DTN LoRa Hub — Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)   firmware v2
 //  Role: WiFi SoftAP for many phones  +  LoRa hub-to-hub backbone.
-//  Framework: Arduino / PlatformIO   Library: RadioLib
+//  Framework: Arduino / PlatformIO    Library: RadioLib 6.6.x, U8g2
 //
-//  Protocol (must match the Android app — unchanged in this revision):
-//   * Framed TCP on port 9740:  [1B type][2B length BE][payload]
-//       - HELLO    0x03  hub -> phone   payload = 4B HUB_ID (sent on connect)
-//       - REGISTER 0x01  phone -> hub   payload = 4B phone node id
-//       - BUNDLE   0x02  either way     payload = DTN bundle (32B header + data)
-//   * Self-contained 32-byte DTN header (see DtnWireCodec.kt):
+//  Phone <-> hub protocol (framed TCP :9740, matches LoRaHubTransportAdapter.kt):
+//     [1B type][2B length BE][payload]
+//       HELLO    0x03  hub -> phone   payload = 4B HUB_ID (sent on connect)
+//       REGISTER 0x01  phone -> hub   payload = 4B phone node id
+//       BUNDLE   0x02  either way     payload = DTN bundle (32B header + data)
+//  Self-contained 32-byte DTN header (see DtnWireCodec.kt):
 //       0:16 msgId  16:4 origin  20:4 dest  24:2 ttlMin  26:1 hop
-//       27:1 msgType  28:1 channel  29:1 fragIdx  30:1 fragTotal  31:1 reserved
-//     msgType values (app enum DtnMessageType, wire values):
-//       0x00 DATA, 0x01 ROUTING_SUMMARY, 0x02 ROUTING_ACK,
-//       0x03 BUNDLE_OFFER, 0x04 BUNDLE_REQUEST
+//       27:1 msgType  28:1 channel  29:1 fragIdx  30:1 fragTotal  31:1 flags
+//     msgType: 0x00 DATA, 0x01 ROUTING_SUMMARY, 0x02 ROUTING_ACK, 0x05 ANNOUNCE
 //
-//  New in this revision (all additive — wire protocol is untouched):
-//   * Real buffer with per-msg metadata (msgId, origin, dest, hop, ttl,
-//     bufferedAt, waitingForAck) — replaces the raw byte queue.
-//   * ACK-driven immediate buffer cleanup by parsing ROUTING_ACK payloads
-//     (which are already concatenated 16-byte UUIDs — see the app's
-//     DeliveryReceiptStore / DtnOrchestrator.processInboundReceipts).
-//   * ACK-dedup ring so a re-flooded ACK doesn't repeat cleanup work.
-//   * Heartbeat (empty ROUTING_SUMMARY with our HUB_ID as origin) so peer
-//     hubs learn we exist. The app already ignores empty summaries.
-//   * Per-peer last-seen tracking → live ACTIVE/INACTIVE table.
-//   * Log-distance RSSI→meters estimate (matches the phone-side estimator).
-//   * Serial monitor dashboards every DISTANCE_UPDATE_INTERVAL_MS:
-//       - Distance table (peer node id + estimated metres + status)
-//       - Buffer state (all currently-buffered bundles)
-//       - Runtime stats (counters + peak buffer)
-//   * Detailed message-lifecycle logging on Serial.
-//
-//  Not done here (intentionally — would require breaking the fixed header):
-//   * Appending a per-hop identity list to bundles for full cross-hub route
-//     display on the phone UI. The hub still logs its own view of each hop
-//     locally to the serial monitor.
+//  v2 changes (vs the original flood firmware):
+//   * Heltec V3 correct radio: 1.8V TCXO (+XTAL fallback), 22 dBm, 140 mA OCP,
+//     boosted RX, preamble 16, explicit SPI pins, DIO2 RF switch.
+//   * Region config (IN865 / EU868 / US915) in NVS; change over serial.
+//   * HUB_ID + SoftAP SSID suffix derived from the eFuse MAC (identical binary).
+//   * Interrupt RX/TX/CAD state machine (no more treating TX-done as RX).
+//   * Listen-before-talk (CAD) + random jitter + overhear-suppression.
+//   * Rolling 1-hour airtime ledger enforcing the region duty cycle.
+//   * TTL aged by buffer residence before every re-flood (no immortal bundles).
+//   * Non-blocking per-client TCP reader (a slow phone can't freeze the hub).
+//   * Store-and-forward: buffered bundles replayed to a phone when it REGISTERs.
+//   * ROUTING_ACK delivered to local phones (receipts cross hubs now).
+//   * OLED status screen, battery readout, watchdog.
+//  LoRa wire bytes are still EXACTLY the DTN bundle — no link header — so the
+//  255-byte frame budget and dedup are unchanged and phones need no changes.
 // ============================================================================
 #include <WiFi.h>
 #include <RadioLib.h>
+#include <Preferences.h>
+#include <U8g2lib.h>
+#include <Wire.h>
 #include <string.h>
 #include <math.h>
-// esp_random() ships with the ESP-IDF that Arduino-ESP32 wraps; header location
-// has moved between versions, so declare the symbol directly to avoid tying this
-// file to a specific SDK layout.
+#include "esp_task_wdt.h"
 extern "C" uint32_t esp_random(void);
 
-// ---- Per-hub identity (CHANGE PER DEVICE) ----------------------------------
-static const uint32_t HUB_ID   = 0xA0000001;      // unique 32-bit hub node id
-static const char*     AP_SSID = "DTN-HUB-A";     // "DTN-HUB-B" on the other hub
-static const char*     AP_PASS = "dtnmesh123";    // must match app HUB_PASSPHRASE (>= 8 chars)
-static const uint8_t   MAX_CLIENTS = 6;           // ESP32 SoftAP: keep <= 8
+// ---- Heltec WiFi LoRa 32 V3 pin map ---------------------------------------
+static const int PIN_LORA_NSS = 8, PIN_LORA_DIO1 = 14, PIN_LORA_RST = 12, PIN_LORA_BUSY = 13;
+static const int PIN_LORA_SCK = 9, PIN_LORA_MISO = 11, PIN_LORA_MOSI = 10;
+static const int PIN_OLED_SDA = 17, PIN_OLED_SCL = 18, PIN_OLED_RST = 21;
+static const int PIN_VEXT = 36;            // LOW = peripheral power on (OLED)
+static const int PIN_VBAT_ADC = 1;         // battery divider
+static const int PIN_VBAT_CTRL = 37;       // LOW enables the divider (V3.0/3.1)
+static const float TCXO_VOLTAGE = 1.8f;    // Heltec V3 TCXO
+static const uint8_t NET_SYNC   = 0x2B;    // private DTN sync word
+static const uint16_t PREAMBLE  = 16;
 
-// ---- SX1262 pins for Heltec WiFi LoRa 32 V3 --------------------------------
-SX1262 radio = new Module(8 /*NSS*/, 14 /*DIO1*/, 12 /*RST*/, 13 /*BUSY*/);
-static const float   LORA_FREQ = 868.0;  // 915.0 US / 433.0 many-Asia — MATCH LAW
-static const float   LORA_BW   = 125.0;
-static const uint8_t LORA_SF   = 9;
-static const uint8_t LORA_CR   = 5;
+// ---- Region profiles -------------------------------------------------------
+struct RegionCfg { const char* name; float freq; float bw; uint8_t sf; uint8_t cr; int8_t power; uint8_t dutyPct; };
+static const RegionCfg REGIONS[] = {
+    { "IN865", 866.300f, 125.0f, 9, 5, 22, 10 },  // India (865-867 MHz), self-capped 10%
+    { "EU868", 869.525f, 125.0f, 9, 5, 16, 10 },  // EU 869.4-869.65 sub-band, 10%
+    { "US915", 906.875f, 500.0f, 9, 5, 22, 100 }, // FCC: >=500 kHz BW, dwell < 400 ms
+};
+static const int NUM_REGIONS = sizeof(REGIONS) / sizeof(REGIONS[0]);
+int regionIdx = DTN_DEFAULT_REGION;
+#define CFG (REGIONS[regionIdx])
 
-// ---- Tunables --------------------------------------------------------------
-// Dashboard refresh cadence. Serial is expensive at 115200 baud, so keep this
-// sane; every 5 s is a good compromise for a hub with a few peers.
-static const uint32_t DISTANCE_UPDATE_INTERVAL_MS = 5000;
-// How often each hub broadcasts a keep-alive heartbeat over LoRa.
-static const uint32_t HEARTBEAT_INTERVAL_MS      = 5000;
-// A peer that hasn't been heard from within this window is marked INACTIVE.
-static const uint32_t NODE_TIMEOUT_MS            = 15000;
-// Bundles buffered for longer than this are TTL-expired locally. (The header's
-// ttlMinutes is authoritative for the mesh; this is a floor for hub-side eviction.)
-static const uint32_t BUFFER_TTL_FLOOR_MS        = 15UL * 60UL * 1000UL;
+// ---- Identity (derived from the eFuse MAC at boot) -------------------------
+uint32_t HUB_ID = 0xA0000001;
+char     AP_SSID[20] = "DTN-HUB-0000";
+static const char* AP_PASS = "dtnmesh123";   // must match app HUB_PASSPHRASE (>= 8 chars)
+static const uint8_t MAX_CLIENTS = 8;
 
-// ---- TCP server + connected phones -----------------------------------------
+// ---- Timing / limits -------------------------------------------------------
+static const uint32_t DASHBOARD_INTERVAL_MS = 10000;
+static const uint32_t HEARTBEAT_BASE_MS     = 60000;   // + up to 20% jitter
+static const uint32_t NODE_TIMEOUT_MS       = 180000;  // 3 missed heartbeats
+static const uint32_t OLED_INTERVAL_MS      = 1000;
+static const uint32_t CLIENT_IDLE_MS        = 120000;  // drop silent phones
+static const uint32_t SLOT_MS               = 20;      // ~5 symbols @ SF9/BW125
+static const uint8_t  HOP_LIMIT             = 8;        // shared ceiling with phones
+static const uint32_t WDT_TIMEOUT_S         = 30;
+
+// ---- Server + connected phones --------------------------------------------
 WiFiServer tcpServer(9740);
 struct DtnClient {
     WiFiClient sock;
@@ -79,818 +85,603 @@ struct DtnClient {
     bool       used;
     bool       greeted;
     uint32_t   lastSeenMs;
+    // non-blocking frame reader state
+    uint8_t    hdr[3];
+    int        hdrGot;
+    uint8_t    rxType;
+    uint16_t   rxLen;
+    int        rxGot;
+    uint8_t    rxBuf[256];
 };
 DtnClient clients[MAX_CLIENTS];
 
 enum : uint8_t { FRAME_REGISTER = 0x01, FRAME_BUNDLE = 0x02, FRAME_HELLO = 0x03 };
 
-// DTN self-contained header offsets & message types
-static const int      HDR_MIN         = 32;
-static const int      OFF_MSGID       = 0;
-static const int      OFF_ORIGIN      = 16;
-static const int      OFF_DEST        = 20;
-static const int      OFF_TTL_MIN     = 24;
-static const int      OFF_HOP         = 26;
-static const int      OFF_MSGTYPE     = 27;
-static const uint8_t  MSGTYPE_DATA            = 0x00;
-static const uint8_t  MSGTYPE_ROUTING_SUMMARY = 0x01;
-static const uint8_t  MSGTYPE_ROUTING_ACK     = 0x02;
-
-// Reserved destination meaning "deliver to every node" (matches NodeId.BROADCAST_NODE_NUM32).
+// ---- DTN header offsets & message types ------------------------------------
+static const int     HDR_MIN      = 32;
+static const int     OFF_MSGID    = 0;
+static const int     OFF_ORIGIN   = 16;
+static const int     OFF_DEST     = 20;
+static const int     OFF_TTL_MIN  = 24;
+static const int     OFF_HOP      = 26;
+static const int     OFF_MSGTYPE  = 27;
+static const uint8_t MSGTYPE_DATA            = 0x00;
+static const uint8_t MSGTYPE_ROUTING_SUMMARY = 0x01;
+static const uint8_t MSGTYPE_ROUTING_ACK     = 0x02;
+static const uint8_t MSGTYPE_ANNOUNCE        = 0x05;
 static const uint32_t BROADCAST_DEST = 0xFFFFFFFFu;
-// Hop count at which we stop re-flooding — protects the LoRa band from runaway packets.
-static const uint8_t  HOP_LIMIT      = 5;
 
-// ---- Dedup caches ----------------------------------------------------------
-// Two rings: one for recently-seen bundle IDs (any msgType), one for ACKed msg IDs
-// (so an ACK that has already caused cleanup here doesn't fire again on the
-// re-flooded copy that eventually loops back).
-static const int DEDUP_N = 128;
-uint8_t  dedupKey[DEDUP_N][16];
-int      dedupHead = 0;
-uint8_t  ackDedupKey[DEDUP_N][16];
-int      ackDedupHead = 0;
+// ---- Dedup ring ------------------------------------------------------------
+static const int DEDUP_N = 256;
+uint8_t dedupKey[DEDUP_N][16];
+int     dedupHead = 0;
+uint8_t ackDedupKey[DEDUP_N][16];
+int     ackDedupHead = 0;
 
-// ---- Buffer with per-message metadata --------------------------------------
-// Every bundle we intend to forward over LoRa is kept here until an ACK clears it
-// (or the hop / TTL / capacity guards evict it). Indexed by msgId — findInBuffer()
-// is O(N) with N ≤ BUFFER_CAPACITY. Storage of the full wire bytes lets us
-// re-transmit intact without re-parsing the header.
+// ---- Buffer (single source of truth for store/forward + TX) ----------------
 struct BufferEntry {
     bool     valid;
-    uint8_t  data[256];       // wire bundle (header + payload)
+    uint8_t  data[256];
     uint16_t len;
     uint8_t  msgId[16];
     uint32_t origin;
     uint32_t dest;
-    uint8_t  hopCount;
-    uint16_t ttlMin;          // as observed at insert time
+    uint16_t ttlMin;         // TTL as observed at insert
+    uint8_t  hopCount;       // current hop (written into data on TX)
     uint8_t  msgType;
     uint32_t bufferedAtMs;
-    bool     waitingForAck;   // true for unicast DATA still awaiting an ACK
+    bool     waitingForAck;
+    bool     txPending;      // queued for a LoRa (re)transmission
+    uint32_t txNotBeforeMs;  // jitter / backoff gate
+    uint8_t  txTries;
 };
-static const int BUFFER_CAPACITY = 32;
+static const int BUFFER_CAPACITY = 64;
 BufferEntry buffer[BUFFER_CAPACITY];
 uint32_t peakBufferUsage = 0;
 
-// ---- Known peers (other hubs learned from LoRa headers + heartbeats) -------
-struct KnownPeer {
-    bool     valid;
-    uint32_t nodeId;
-    int      lastRssi;
-    uint32_t lastSeenMs;
-    bool     active;
-};
-static const int MAX_KNOWN_PEERS = 8;
+// ---- Known peers (other hubs) ----------------------------------------------
+struct KnownPeer { bool valid; uint32_t nodeId; int lastRssi; uint32_t lastSeenMs; bool active; };
+static const int MAX_KNOWN_PEERS = 16;
 KnownPeer knownPeers[MAX_KNOWN_PEERS];
 
-// ---- Runtime statistics ----------------------------------------------------
+// ---- Stats -----------------------------------------------------------------
 struct Stats {
-    uint32_t msgsGenerated;      // hub-originated (heartbeats)
-    uint32_t msgsForwarded;      // pushed to the LoRa TX queue
-    uint32_t msgsDelivered;      // handed to a local phone
-    uint32_t acksGenerated;      // hub-originated ACKs (0 — hubs never mint them)
-    uint32_t acksReceived;       // ROUTING_ACK bundles processed
-    uint32_t duplicatesIgnored;  // bundles matched by the primary dedup ring
-    uint32_t duplicateAcksIgnored;
-    uint32_t ttlExpired;         // dropped because ttlMinutes == 0
-    uint32_t hopDropped;         // dropped because hop ≥ HOP_LIMIT
-    uint32_t bufferedNow;
-    uint32_t bufferInserts;
-    uint32_t bufferEvictions;
+    uint32_t msgsGenerated, msgsForwarded, msgsDelivered, acksReceived;
+    uint32_t duplicatesIgnored, duplicateAcksIgnored, ttlExpired, hopDropped;
+    uint32_t bufferedNow, bufferInserts, bufferEvictions, suppressed, cadBusy, dutyBlocked;
 };
 Stats stats = {};
 
-// ---- LoRa RX ISR flag ------------------------------------------------------
-volatile bool loraRxFlag = false;
-void IRAM_ATTR onLoRaRx() { loraRxFlag = true; }
+// ---- Airtime ledger (rolling hour, per-minute buckets) ---------------------
+uint32_t airMin[60] = {0};
+int      airIdx = 0;
+uint32_t lastAirMinute = 0;
+
+// ---- Radio -----------------------------------------------------------------
+SPIClass loraSpi(FSPI);
+SX1262 radio = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY, loraSpi);
+enum RadioState { RS_RX, RS_TX };
+volatile bool radioIrqFlag = false;
+RadioState radioState = RS_RX;
+uint32_t   lastToaUs = 0;
+void IRAM_ATTR onLoRaIrq() { radioIrqFlag = true; }
+
+// ---- OLED ------------------------------------------------------------------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, PIN_OLED_RST, PIN_OLED_SCL, PIN_OLED_SDA);
+bool oledOk = false;
+
+// ---- Config store ----------------------------------------------------------
+Preferences prefs;
+
+// ---- Schedules -------------------------------------------------------------
+uint32_t nextDashboardMs = 0, nextHeartbeatMs = 0, nextOledMs = 0;
+
+// ---- forward declarations --------------------------------------------------
+void sendFrame(WiFiClient& sock, uint8_t type, const uint8_t* payload, uint16_t len);
+bool deliverLocal(uint32_t dest, const uint8_t* data, uint16_t len);
+void processInboundAck(const uint8_t* data, uint16_t len);
+void routeBundle(const uint8_t* data, uint16_t len, bool fromLoRa, int rssi);
+int  countActivePeers(); int countInactivePeers(); int countConnectedPhones();
+float readBatteryVolts();
 
 // ============================================================================
 //  Byte helpers
 // ============================================================================
-uint32_t rd32(const uint8_t* p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-}
-uint16_t rd16(const uint8_t* p) { return ((uint16_t)p[0] << 8) | p[1]; }
+uint32_t rd32(const uint8_t* p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+uint16_t rd16(const uint8_t* p) { return ((uint16_t)p[0]<<8)|p[1]; }
+void wr32(uint8_t* p, uint32_t v){ p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
+void wr16(uint8_t* p, uint16_t v){ p[0]=v>>8; p[1]=v&0xFF; }
 
-void wr32(uint8_t* p, uint32_t v) {
-    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
-}
-
-// Short printable form of a 16-byte msg id — first 8 hex chars for logging.
 void msgIdShort(const uint8_t* id, char out[9]) {
     static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < 4; i++) {
-        out[i * 2 + 0] = hx[(id[i] >> 4) & 0xF];
-        out[i * 2 + 1] = hx[id[i] & 0xF];
-    }
-    out[8] = 0;
+    for (int i=0;i<4;i++){ out[i*2]=hx[(id[i]>>4)&0xF]; out[i*2+1]=hx[id[i]&0xF]; }
+    out[8]=0;
 }
-
-// Format a 32-bit node id as "!xxxxxxxx" to match the app's NodeId convention.
 void formatNodeId(uint32_t v, char out[10]) {
     static const char hx[] = "0123456789abcdef";
-    out[0] = '!';
-    for (int i = 0; i < 8; i++) out[1 + i] = hx[(v >> ((7 - i) * 4)) & 0xF];
-    out[9] = 0;
+    out[0]='!';
+    for (int i=0;i<8;i++) out[1+i]=hx[(v>>((7-i)*4))&0xF];
+    out[9]=0;
 }
 
 // ============================================================================
 //  Dedup rings
 // ============================================================================
 bool seenBefore(const uint8_t* id) {
-    for (int i = 0; i < DEDUP_N; i++)
-        if (memcmp(dedupKey[i], id, 16) == 0) return true;
-    memcpy(dedupKey[dedupHead], id, 16);
-    dedupHead = (dedupHead + 1) % DEDUP_N;
-    return false;
+    for (int i=0;i<DEDUP_N;i++) if (memcmp(dedupKey[i],id,16)==0) return true;
+    memcpy(dedupKey[dedupHead],id,16); dedupHead=(dedupHead+1)%DEDUP_N; return false;
 }
-
+void registerSeen(const uint8_t* id){ if(!seenBefore(id)){} }
 bool ackSeenBefore(const uint8_t* id) {
-    for (int i = 0; i < DEDUP_N; i++)
-        if (memcmp(ackDedupKey[i], id, 16) == 0) return true;
-    memcpy(ackDedupKey[ackDedupHead], id, 16);
-    ackDedupHead = (ackDedupHead + 1) % DEDUP_N;
-    return false;
+    for (int i=0;i<DEDUP_N;i++) if (memcmp(ackDedupKey[i],id,16)==0) return true;
+    memcpy(ackDedupKey[ackDedupHead],id,16); ackDedupHead=(ackDedupHead+1)%DEDUP_N; return false;
 }
 
 // ============================================================================
 //  Buffer management
 // ============================================================================
 int findInBuffer(const uint8_t* msgId) {
-    for (int i = 0; i < BUFFER_CAPACITY; i++)
-        if (buffer[i].valid && memcmp(buffer[i].msgId, msgId, 16) == 0) return i;
+    for (int i=0;i<BUFFER_CAPACITY;i++) if (buffer[i].valid && memcmp(buffer[i].msgId,msgId,16)==0) return i;
     return -1;
 }
-
-int findFreeSlot() {
-    for (int i = 0; i < BUFFER_CAPACITY; i++)
-        if (!buffer[i].valid) return i;
-    return -1;
-}
-
-// Evict the oldest entry (by bufferedAtMs) — used only when the buffer is at
-// capacity and a new bundle arrives. TTL floor also evicts periodically.
+int findFreeSlot() { for (int i=0;i<BUFFER_CAPACITY;i++) if(!buffer[i].valid) return i; return -1; }
 int evictOldest() {
-    int oldest = -1;
-    uint32_t oldestAt = 0xFFFFFFFF;
-    for (int i = 0; i < BUFFER_CAPACITY; i++) {
-        if (buffer[i].valid && buffer[i].bufferedAtMs < oldestAt) {
-            oldest = i;
-            oldestAt = buffer[i].bufferedAtMs;
-        }
-    }
-    if (oldest >= 0) {
-        buffer[oldest].valid = false;
-        stats.bufferEvictions++;
-        if (stats.bufferedNow > 0) stats.bufferedNow--;
-    }
+    int oldest=-1; uint32_t oldestAt=0xFFFFFFFF;
+    for (int i=0;i<BUFFER_CAPACITY;i++) if (buffer[i].valid && buffer[i].bufferedAtMs<oldestAt){ oldest=i; oldestAt=buffer[i].bufferedAtMs; }
+    if (oldest>=0){ buffer[oldest].valid=false; stats.bufferEvictions++; if(stats.bufferedNow) stats.bufferedNow--; }
     return oldest;
 }
+void updatePeak(){ if (stats.bufferedNow>peakBufferUsage) peakBufferUsage=stats.bufferedNow; }
 
-void updatePeak() {
-    if (stats.bufferedNow > peakBufferUsage) peakBufferUsage = stats.bufferedNow;
+int bufferInsert(const uint8_t* data, uint16_t len) {
+    if (len<HDR_MIN || len>255) return -1;
+    int exist=findInBuffer(data+OFF_MSGID); if (exist>=0) return -1;
+    int slot=findFreeSlot(); if (slot<0) slot=evictOldest(); if (slot<0) return -1;
+    BufferEntry& e=buffer[slot];
+    memcpy(e.data,data,len); e.len=len;
+    memcpy(e.msgId,data+OFF_MSGID,16);
+    e.origin=rd32(data+OFF_ORIGIN); e.dest=rd32(data+OFF_DEST);
+    e.ttlMin=rd16(data+OFF_TTL_MIN); e.hopCount=data[OFF_HOP]; e.msgType=data[OFF_MSGTYPE];
+    e.bufferedAtMs=millis();
+    e.waitingForAck=(e.msgType==MSGTYPE_DATA && e.dest!=BROADCAST_DEST);
+    e.txPending=false; e.txNotBeforeMs=0; e.txTries=0; e.valid=true;
+    stats.bufferedNow++; stats.bufferInserts++; updatePeak();
+    return slot;
 }
-
-// Insert or refresh a bundle in the buffer. Returns true if a NEW entry was created.
-// If the msgId is already present, the existing entry is left untouched (single valid
-// copy per node, as required) and this returns false.
-bool bufferInsert(const uint8_t* data, uint16_t len) {
-    if (len < HDR_MIN || len > 256) return false;
-
-    if (findInBuffer(data + OFF_MSGID) >= 0) return false; // already buffered
-
-    int slot = findFreeSlot();
-    if (slot < 0) slot = evictOldest();
-    if (slot < 0) return false;
-
-    BufferEntry& e = buffer[slot];
-    memcpy(e.data, data, len);
-    e.len = len;
-    memcpy(e.msgId, data + OFF_MSGID, 16);
-    e.origin      = rd32(data + OFF_ORIGIN);
-    e.dest        = rd32(data + OFF_DEST);
-    e.ttlMin      = rd16(data + OFF_TTL_MIN);
-    e.hopCount    = data[OFF_HOP];
-    e.msgType     = data[OFF_MSGTYPE];
-    e.bufferedAtMs = millis();
-    e.waitingForAck = (e.msgType == MSGTYPE_DATA && e.dest != BROADCAST_DEST);
-    e.valid = true;
-
-    stats.bufferedNow++;
-    stats.bufferInserts++;
-    updatePeak();
-    return true;
+// Aged remaining TTL (minutes) given buffer residence; <=0 means expired.
+int agedTtlMin(const BufferEntry& e){
+    uint32_t elapsedMin=(millis()-e.bufferedAtMs)/60000UL;
+    return (int)e.ttlMin - (int)elapsedMin;
 }
-
-// Remove a bundle by msgId. Returns true if an entry was actually removed.
-bool bufferRemove(const uint8_t* msgId) {
-    int idx = findInBuffer(msgId);
-    if (idx < 0) return false;
-    buffer[idx].valid = false;
-    if (stats.bufferedNow > 0) stats.bufferedNow--;
-    return true;
-}
-
-// Sweep out entries whose observed TTL has aged past our local floor.
 void bufferSweepExpired() {
-    uint32_t now = millis();
-    for (int i = 0; i < BUFFER_CAPACITY; i++) {
+    for (int i=0;i<BUFFER_CAPACITY;i++) {
         if (!buffer[i].valid) continue;
-        if (now - buffer[i].bufferedAtMs > BUFFER_TTL_FLOOR_MS) {
-            char idStr[9]; msgIdShort(buffer[i].msgId, idStr);
-            char origStr[10]; formatNodeId(buffer[i].origin, origStr);
-            char destStr[10]; formatNodeId(buffer[i].dest, destStr);
-            Serial.printf("[LC] Expired         msg=%s origin=%s dest=%s hop=%u\n",
-                          idStr, origStr, destStr, buffer[i].hopCount);
-            buffer[i].valid = false;
-            if (stats.bufferedNow > 0) stats.bufferedNow--;
-            stats.ttlExpired++;
-            stats.bufferEvictions++;
+        if (agedTtlMin(buffer[i])<=0) {
+            char idStr[9]; msgIdShort(buffer[i].msgId,idStr);
+            Serial.printf("[LC] Expired         msg=%s hop=%u\n", idStr, buffer[i].hopCount);
+            buffer[i].valid=false; if(stats.bufferedNow) stats.bufferedNow--;
+            stats.ttlExpired++; stats.bufferEvictions++;
         }
     }
 }
 
 // ============================================================================
-//  Peer tracking (other hubs and phones we've heard from)
+//  Peer tracking
 // ============================================================================
 void touchPeer(uint32_t nodeId, int rssi) {
-    if (nodeId == HUB_ID) return; // never track ourselves as a remote peer
-    // Refresh if known.
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) {
-        if (knownPeers[i].valid && knownPeers[i].nodeId == nodeId) {
-            knownPeers[i].lastRssi   = rssi;
-            knownPeers[i].lastSeenMs = millis();
-            knownPeers[i].active     = true;
-            return;
-        }
+    if (nodeId==HUB_ID || nodeId==0 || nodeId==BROADCAST_DEST) return;
+    for (int i=0;i<MAX_KNOWN_PEERS;i++) if (knownPeers[i].valid && knownPeers[i].nodeId==nodeId){
+        knownPeers[i].lastRssi=rssi; knownPeers[i].lastSeenMs=millis(); knownPeers[i].active=true; return;
     }
-    // Insert new — evict the stalest slot if we're full.
-    int slot = -1;
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) {
-        if (!knownPeers[i].valid) { slot = i; break; }
-    }
-    if (slot < 0) {
-        uint32_t oldestAt = 0xFFFFFFFF; int oldest = 0;
-        for (int i = 0; i < MAX_KNOWN_PEERS; i++)
-            if (knownPeers[i].lastSeenMs < oldestAt) { oldestAt = knownPeers[i].lastSeenMs; oldest = i; }
-        slot = oldest;
-    }
-    knownPeers[slot].valid      = true;
-    knownPeers[slot].nodeId     = nodeId;
-    knownPeers[slot].lastRssi   = rssi;
-    knownPeers[slot].lastSeenMs = millis();
-    knownPeers[slot].active     = true;
+    int slot=-1;
+    for (int i=0;i<MAX_KNOWN_PEERS;i++) if(!knownPeers[i].valid){ slot=i; break; }
+    if (slot<0){ uint32_t oldestAt=0xFFFFFFFF; int oldest=0;
+        for (int i=0;i<MAX_KNOWN_PEERS;i++) if (knownPeers[i].lastSeenMs<oldestAt){ oldestAt=knownPeers[i].lastSeenMs; oldest=i; }
+        slot=oldest; }
+    knownPeers[slot]={true,nodeId,rssi,millis(),true};
 }
-
-// Refresh ACTIVE/INACTIVE flags before we print the dashboard.
-void refreshPeerActivity() {
-    uint32_t now = millis();
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) {
-        if (!knownPeers[i].valid) continue;
-        knownPeers[i].active = (now - knownPeers[i].lastSeenMs) < NODE_TIMEOUT_MS;
-    }
-}
-
-// Log-distance RSSI→metres estimate. Same formula as the phone-side
-// RadioDistanceEstimator (Transport.LORA calibration).
-double estimateDistanceM(int rssi) {
-    if (rssi == 0) return -1.0; // unknown
-    // LoRa calibration: txPowerAt1m = -40 dBm, pathLossExponent = 3.0.
-    // d = 10^((TxPower_ref - RSSI) / (10 * n))
-    int clamped = rssi;
-    if (clamped < -120) clamped = -120;
-    if (clamped > -20)  clamped = -20;
-    double d = pow(10.0, ((-40.0) - (double)clamped) / 30.0);
-    if (!isfinite(d)) return -1.0;
-    if (d < 0.5)      d = 0.5;
-    if (d > 500.0)    d = 500.0;
-    return d;
+void refreshPeerActivity(){ uint32_t now=millis();
+    for (int i=0;i<MAX_KNOWN_PEERS;i++) if (knownPeers[i].valid) knownPeers[i].active=(now-knownPeers[i].lastSeenMs)<NODE_TIMEOUT_MS; }
+double estimateDistanceM(int rssi){
+    if (rssi==0) return -1.0; int c=rssi; if(c<-120)c=-120; if(c>-20)c=-20;
+    double d=pow(10.0,((-40.0)-(double)c)/30.0);
+    if(!isfinite(d))return -1.0; if(d<0.5)d=0.5; if(d>5000.0)d=5000.0; return d;
 }
 
 // ============================================================================
-//  Lifecycle logging
+//  Airtime ledger
 // ============================================================================
-void logLifecycle(const char* event, const uint8_t* msgId,
-                  uint32_t origin, uint32_t dest, uint8_t hop, uint16_t ttlMin) {
-    char idStr[9]; msgIdShort(msgId, idStr);
-    char origStr[10]; formatNodeId(origin, origStr);
-    char destStr[10]; formatNodeId(dest,   destStr);
-    Serial.printf("[LC] %-15s msg=%s origin=%s dest=%s hop=%u ttlMin=%u t=%lu\n",
-                  event, idStr, origStr, destStr, hop, ttlMin, (unsigned long)millis());
-}
-
-// ============================================================================
-//  TX queue → LoRa
-// ============================================================================
-// We keep a lightweight ring of raw wire bundles queued for TX. The full metadata
-// lives in the main buffer; this ring holds pointers-into-buffer so a single physical
-// copy is stored.
-struct TxItem { int bufferIndex; uint32_t enqueuedAtMs; };
-static const int TX_QUEUE_N = BUFFER_CAPACITY;
-TxItem txQueue[TX_QUEUE_N];
-int txHead = 0, txTail = 0;
-
-bool txEnqueue(int bufferIndex) {
-    int nxt = (txTail + 1) % TX_QUEUE_N;
-    if (nxt == txHead) return false; // full
-    txQueue[txTail].bufferIndex = bufferIndex;
-    txQueue[txTail].enqueuedAtMs = millis();
-    txTail = nxt;
-    return true;
-}
-
-// Enqueue a fresh copy of a bundle with hopCount bumped by 1. Used when we relay a
-// LoRa-inbound bundle further; the original stays in our buffer with its own hop
-// count so a subsequent ACK can still find it.
-bool txEnqueueForwardCopy(const uint8_t* data, uint16_t len) {
-    // We need a mutable copy with hop+1. Use the buffer as storage.
-    if (len < HDR_MIN) return false;
-    // If the incremented hop matches or exceeds the limit, don't bother.
-    uint8_t nextHop = (uint8_t)(data[OFF_HOP] + 1);
-    if (nextHop >= HOP_LIMIT) { stats.hopDropped++; return false; }
-    // Store the forward-copy under a synthetic distinct msgId? No — must keep the
-    // same msgId so end-to-end dedup works. Instead, we key the buffer by msgId
-    // and use the copy's live bytes for TX. Since a forward-copy of a bundle we
-    // already relay-buffered would collide, we just refresh the existing entry.
-    int idx = findInBuffer(data + OFF_MSGID);
-    if (idx < 0) {
-        // Not yet in buffer — insert then modify. bufferInsert copies raw bytes.
-        if (!bufferInsert(data, len)) return false;
-        idx = findInBuffer(data + OFF_MSGID);
-        if (idx < 0) return false;
+void rollAirtime(){
+    uint32_t m=millis()/60000UL;
+    if (m!=lastAirMinute){
+        uint32_t steps=m-lastAirMinute; if(steps>60)steps=60;
+        for (uint32_t k=0;k<steps;k++){ airIdx=(airIdx+1)%60; airMin[airIdx]=0; }
+        lastAirMinute=m;
     }
-    buffer[idx].data[OFF_HOP] = nextHop;
-    buffer[idx].hopCount = nextHop;
-    return txEnqueue(idx);
+}
+uint64_t airtimeSumUs(){ uint64_t s=0; for(int i=0;i<60;i++) s+=airMin[i]; return s; }
+bool airtimeAllows(uint32_t toaUs){
+    if (CFG.dutyPct>=100) return true;
+    rollAirtime();
+    uint64_t budget=(uint64_t)CFG.dutyPct*36000000ULL; // dutyPct% of 3600 s, in us
+    return airtimeSumUs()+toaUs <= budget;
+}
+void airtimeCommit(uint32_t toaUs){ rollAirtime(); airMin[airIdx]+=toaUs; }
+float airtimePct(){ uint64_t b=(uint64_t)3600000000ULL; return (float)((double)airtimeSumUs()*100.0/(double)b); }
+
+// ============================================================================
+//  Radio service (interrupt RX/TX/CAD state machine)
+// ============================================================================
+void startTxEntry(int idx){
+    BufferEntry& e=buffer[idx];
+    e.data[OFF_HOP]=e.hopCount;
+    int ttl=agedTtlMin(e); if (ttl<0) ttl=0; wr16(e.data+OFF_TTL_MIN,(uint16_t)ttl);
+    lastToaUs=radio.getTimeOnAir(e.len);
+    radioIrqFlag=false; radioState=RS_TX;
+    int st=radio.startTransmit(e.data,e.len);
+    if (st!=RADIOLIB_ERR_NONE){ radioState=RS_RX; radio.startReceive(); e.txTries++; e.txNotBeforeMs=millis()+200; return; }
+    e.txPending=false; stats.msgsForwarded++;
+    airtimeCommit(lastToaUs);
+}
+void serviceRadio(){
+    if (!radioIrqFlag) return;
+    radioIrqFlag=false;
+    if (radioState==RS_TX){
+        radio.finishTransmit(); radioState=RS_RX; radio.startReceive(); return;
+    }
+    // RX done
+    int len=radio.getPacketLength();
+    if (len>0 && len<=255){
+        uint8_t buf[256];
+        int st=radio.readData(buf,len);
+        int rssi=(int)radio.getRSSI();
+        radio.startReceive();           // re-arm before processing
+        if (st==RADIOLIB_ERR_NONE) routeBundle(buf,(uint16_t)len,true,rssi);
+    } else {
+        radio.startReceive();
+    }
+}
+void pumpLoRaTx(){
+    if (radioState!=RS_RX) return;
+    uint32_t now=millis();
+    int idx=-1; uint32_t oldest=0xFFFFFFFF;
+    for (int i=0;i<BUFFER_CAPACITY;i++){
+        BufferEntry& e=buffer[i];
+        if (e.valid && e.txPending && now>=e.txNotBeforeMs && e.bufferedAtMs<oldest){ idx=i; oldest=e.bufferedAtMs; }
+    }
+    if (idx<0) return;
+    BufferEntry& e=buffer[idx];
+    if (agedTtlMin(e)<=0){ e.txPending=false; return; }
+    if (e.hopCount>=HOP_LIMIT){ e.txPending=false; stats.hopDropped++; return; }
+    uint32_t toa=radio.getTimeOnAir(e.len);
+    if (!airtimeAllows(toa)){ e.txNotBeforeMs=now+3000; stats.dutyBlocked++; return; }
+    int cad=radio.scanChannel(); radioIrqFlag=false;
+    if (cad==RADIOLIB_LORA_DETECTED){ radio.startReceive(); e.txNotBeforeMs=now+random(SLOT_MS,8*SLOT_MS); stats.cadBusy++; return; }
+    startTxEntry(idx);
 }
 
 // ============================================================================
 //  Framing to phones
 // ============================================================================
 void sendFrame(WiFiClient& sock, uint8_t type, const uint8_t* payload, uint16_t len) {
-    uint8_t hdr[3] = { type, (uint8_t)(len >> 8), (uint8_t)(len & 0xFF) };
-    sock.write(hdr, 3);
-    if (len) sock.write(payload, len);
+    if (!sock.connected()) return;
+    if (sock.availableForWrite() < (int)(3+len)) return; // never block on a stalled phone
+    uint8_t hdr[3]={type,(uint8_t)(len>>8),(uint8_t)(len&0xFF)};
+    sock.write(hdr,3); if (len) sock.write(payload,len);
 }
-
-// Deliver a bundle to locally-connected phone(s). Fan-out for broadcast; unicast
-// only to the phone whose registered nodeId matches dest.
 bool deliverLocal(uint32_t dest, const uint8_t* data, uint16_t len) {
-    if (dest == BROADCAST_DEST) {
-        bool any = false;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].used && clients[i].sock.connected()) {
-                sendFrame(clients[i].sock, FRAME_BUNDLE, data, len);
-                clients[i].lastSeenMs = millis();
-                any = true;
-            }
-        }
-        return any;
-    }
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].used && clients[i].nodeId == dest && clients[i].sock.connected()) {
-            sendFrame(clients[i].sock, FRAME_BUNDLE, data, len);
-            clients[i].lastSeenMs = millis();
-            return true;
+    bool any=false;
+    for (int i=0;i<MAX_CLIENTS;i++){
+        if (!clients[i].used || !clients[i].sock.connected()) continue;
+        if (dest==BROADCAST_DEST || clients[i].nodeId==dest){
+            sendFrame(clients[i].sock,FRAME_BUNDLE,data,len);
+            clients[i].lastSeenMs=millis(); any=true;
+            if (dest!=BROADCAST_DEST) break;
         }
     }
-    return false;
+    return any;
+}
+// Replay buffered bundles a freshly-registered phone should have (store & forward).
+void replayToPhone(DtnClient& c){
+    int sent=0;
+    for (int i=0;i<BUFFER_CAPACITY && sent<40;i++){
+        if (!buffer[i].valid) continue;
+        if (agedTtlMin(buffer[i])<=0) continue;
+        if (buffer[i].dest==c.nodeId || buffer[i].dest==BROADCAST_DEST){
+            sendFrame(c.sock,FRAME_BUNDLE,buffer[i].data,buffer[i].len); sent++;
+        }
+    }
+    if (sent) Serial.printf("[NET] Replayed %d buffered bundle(s) to new phone\n", sent);
 }
 
 // ============================================================================
 //  ACK handling
 // ============================================================================
-// A ROUTING_ACK bundle's payload is a concatenation of 16-byte UUIDs — one for each
-// message the receipt covers. We iterate the payload, drop matching entries from
-// our buffer, and update stats. The bundle itself keeps propagating via the normal
-// re-flood path so peer hubs also see the receipt.
 void processInboundAck(const uint8_t* data, uint16_t len) {
-    if (len < HDR_MIN) return;
-    const uint8_t* payload = data + HDR_MIN;
-    uint16_t plen = len - HDR_MIN;
-    int count = plen / 16;
-    if (count == 0) return;
-
+    if (len<HDR_MIN) return;
+    const uint8_t* payload=data+HDR_MIN; uint16_t plen=len-HDR_MIN;
+    int count=plen/16; if (!count) return;
     stats.acksReceived++;
-    int cleared = 0;
-    for (int i = 0; i < count; i++) {
-        const uint8_t* mid = payload + i * 16;
-        if (ackSeenBefore(mid)) { stats.duplicateAcksIgnored++; continue; }
-        char idStr[9]; msgIdShort(mid, idStr);
-        // Locate and drop from buffer if we were still carrying a copy.
-        int bufIdx = findInBuffer(mid);
-        if (bufIdx >= 0) {
-            char origStr[10]; formatNodeId(buffer[bufIdx].origin, origStr);
-            char destStr[10]; formatNodeId(buffer[bufIdx].dest,   destStr);
-            Serial.printf("[LC] AckReceived     msg=%s origin=%s dest=%s hop=%u\n",
-                          idStr, origStr, destStr, buffer[bufIdx].hopCount);
-            Serial.printf("[LC] BufferCleared   msg=%s\n", idStr);
-            buffer[bufIdx].valid = false;
-            if (stats.bufferedNow > 0) stats.bufferedNow--;
-            cleared++;
-        } else {
-            Serial.printf("[LC] AckReceived     msg=%s (no local buffer entry)\n", idStr);
+    for (int i=0;i<count;i++){
+        const uint8_t* mid=payload+i*16;
+        if (ackSeenBefore(mid)){ stats.duplicateAcksIgnored++; continue; }
+        int bufIdx=findInBuffer(mid);
+        if (bufIdx>=0){
+            char idStr[9]; msgIdShort(mid,idStr);
+            Serial.printf("[LC] AckCleared      msg=%s\n", idStr);
+            buffer[bufIdx].valid=false; if(stats.bufferedNow) stats.bufferedNow--;
         }
     }
-    (void)cleared;
 }
 
 // ============================================================================
 //  Central routing decision
 // ============================================================================
-// Called every time a bundle arrives — from a locally-connected phone (fromLoRa=false)
-// or from the LoRa backbone (fromLoRa=true). Implements the intelligent-buffering
-// requirement:
-//   1. Primary dedup ring rejects repeats.
-//   2. TTL / hop-limit sanity checks.
-//   3. Locally deliver if the destination matches a connected phone (or broadcast).
-//   4. Buffer + queue for LoRa TX only if the message still has somewhere else to go.
-//   5. ROUTING_ACK bundles trigger buffer cleanup via processInboundAck.
+void queueForFlood(const uint8_t* data, uint16_t len, uint8_t newHop){
+    int idx=findInBuffer(data+OFF_MSGID);
+    if (idx<0) idx=bufferInsert(data,len);
+    if (idx<0) return;
+    buffer[idx].hopCount=newHop;
+    if (newHop>=HOP_LIMIT){ stats.hopDropped++; return; }
+    buffer[idx].txPending=true;
+    buffer[idx].txNotBeforeMs=millis()+random(SLOT_MS,8*SLOT_MS);
+}
 void routeBundle(const uint8_t* data, uint16_t len, bool fromLoRa, int rssi) {
-    if (len < HDR_MIN) return;
+    if (len<HDR_MIN || len>255) return;
+    uint32_t origin=rd32(data+OFF_ORIGIN), dst=rd32(data+OFF_DEST);
+    uint8_t  hop=data[OFF_HOP], mt=data[OFF_MSGTYPE];
+    uint16_t ttl=rd16(data+OFF_TTL_MIN);
+    if (fromLoRa) touchPeer(origin,rssi);
 
-    // Learn the sender hub / origin phone id (via LoRa) with fresh RSSI.
-    uint32_t originId = rd32(data + OFF_ORIGIN);
-    if (fromLoRa) touchPeer(originId, rssi);
+    // Overhear-suppression: another node relayed a bundle we had queued — cancel ours.
+    if (fromLoRa){ int qi=findInBuffer(data+OFF_MSGID); if (qi>=0 && buffer[qi].txPending){ buffer[qi].txPending=false; stats.suppressed++; } }
 
-    if (seenBefore(data + OFF_MSGID)) {
-        stats.duplicatesIgnored++;
-        logLifecycle("DupIgnored", data + OFF_MSGID, originId, rd32(data + OFF_DEST),
-                     data[OFF_HOP], rd16(data + OFF_TTL_MIN));
-        return;
-    }
+    if (fromLoRa && seenBefore(data+OFF_MSGID)){ stats.duplicatesIgnored++; return; }
 
-    uint16_t ttl  = rd16(data + OFF_TTL_MIN);
-    if (ttl == 0) {
-        stats.ttlExpired++;
-        logLifecycle("Expired", data + OFF_MSGID, originId, rd32(data + OFF_DEST),
-                     data[OFF_HOP], ttl);
-        return;
-    }
+    // Routing summaries: 1-hop neighbour state. Learn the peer, never buffer/flood.
+    if (mt==MSGTYPE_ROUTING_SUMMARY) return;
 
-    uint8_t  hop  = data[OFF_HOP];
-    uint8_t  mt   = data[OFF_MSGTYPE];
-    uint32_t dst  = rd32(data + OFF_DEST);
-    bool isBroadcast = (dst == BROADCAST_DEST);
+    if (ttl==0){ stats.ttlExpired++; return; }
 
-    // First-observation log — every new msg-id we see enters the log once.
-    logLifecycle("Observed", data + OFF_MSGID, originId, dst, hop, ttl);
+    bool isBroadcast=(dst==BROADCAST_DEST);
+    bool forHub=(dst==HUB_ID);
+    bool isAck=(mt==MSGTYPE_ROUTING_ACK);
 
-    // ACK bundles clear matching buffered messages and keep propagating.
-    if (mt == MSGTYPE_ROUTING_ACK) {
-        processInboundAck(data, len);
-        // Also re-flood ACKs onward so upstream carriers can clear too.
-        if (fromLoRa && hop < HOP_LIMIT) {
-            if (txEnqueueForwardCopy(data, len)) {
-                stats.msgsForwarded++;
-                logLifecycle("Forwarded", data + OFF_MSGID, originId, dst, (uint8_t)(hop + 1), ttl);
-            } else if (hop + 1 >= HOP_LIMIT) {
-                stats.hopDropped++;
-                logLifecycle("HopMax", data + OFF_MSGID, originId, dst, hop, ttl);
-            }
-        } else if (!fromLoRa) {
-            // ACK originated on our local phone — put it on the LoRa backbone.
-            if (bufferInsert(data, len)) {
-                int idx = findInBuffer(data + OFF_MSGID);
-                if (idx >= 0 && txEnqueue(idx)) {
-                    stats.msgsForwarded++;
-                    logLifecycle("Forwarded", data + OFF_MSGID, originId, dst, hop, ttl);
-                }
-            }
-        }
-        return;
-    }
+    if (isAck) processInboundAck(data,len);
 
-    // Heartbeats: an empty ROUTING_SUMMARY tells us a peer hub is alive. No further
-    // routing needed — we've already touched the peer's last-seen above.
-    if (mt == MSGTYPE_ROUTING_SUMMARY && len == HDR_MIN) {
-        // (No lifecycle log here — heartbeats are chatty; keep the log signal-heavy.)
-        return;
-    }
+    bool delivered=deliverLocal(dst,data,len);
+    if (delivered && !isAck && !isBroadcast) stats.msgsDelivered++;
 
-    // Deliver locally if destination is (a) a connected phone, or (b) broadcast.
-    bool delivered = deliverLocal(dst, data, len);
-    if (delivered) {
-        stats.msgsDelivered++;
-        logLifecycle("Delivered", data + OFF_MSGID, originId, dst, hop, ttl);
-    }
+    if (forHub && !isAck) return;                 // consumed by this hub
 
-    if (!fromLoRa) {
-        // From phone → the LoRa backbone. If this bundle was delivered locally and is
-        // NOT a broadcast, the source phone's peer is on our own SoftAP — no need to
-        // burn LoRa airtime forwarding a copy that would only echo back. Broadcasts
-        // still forward so other hubs' phones can receive them.
-        if (isBroadcast || !delivered) {
-            if (bufferInsert(data, len)) {
-                int idx = findInBuffer(data + OFF_MSGID);
-                if (idx >= 0 && txEnqueue(idx)) {
-                    stats.msgsForwarded++;
-                    logLifecycle("Buffered", data + OFF_MSGID, originId, dst, hop, ttl);
-                    logLifecycle("Forwarded", data + OFF_MSGID, originId, dst, hop, ttl);
-                }
-            } else {
-                // Already had this in buffer — enqueue for TX without re-inserting.
-                int idx = findInBuffer(data + OFF_MSGID);
-                if (idx >= 0 && txEnqueue(idx)) {
-                    stats.msgsForwarded++;
-                    logLifecycle("Forwarded", data + OFF_MSGID, originId, dst, hop, ttl);
-                }
-            }
-        }
-        // else: unicast delivered locally → intentionally NOT buffered.
-        return;
-    }
+    if (!fromLoRa) registerSeen(data+OFF_MSGID);  // so our echo is later ignored
 
-    // Inbound from LoRa. Re-flood onto our own backbone only if:
-    //   - it's a broadcast (needs to reach every region), or
-    //   - the destination is not on our SoftAP (someone else may hold the recipient).
-    if ((isBroadcast || !delivered) && hop < HOP_LIMIT) {
-        if (txEnqueueForwardCopy(data, len)) {
-            stats.msgsForwarded++;
-            logLifecycle("Forwarded", data + OFF_MSGID, originId, dst, (uint8_t)(hop + 1), ttl);
-        }
-    } else if (hop >= HOP_LIMIT) {
-        stats.hopDropped++;
-        logLifecycle("HopMax", data + OFF_MSGID, originId, dst, hop, ttl);
+    bool shouldFlood = isBroadcast || !delivered || isAck;
+    if (shouldFlood){
+        uint8_t newHop = fromLoRa ? (uint8_t)(hop+1) : hop;
+        queueForFlood(data,len,newHop);
     }
 }
 
 // ============================================================================
-//  Heartbeats
+//  Heartbeat (empty ROUTING_SUMMARY, origin = HUB_ID)
 // ============================================================================
-// A tiny (header-only) ROUTING_SUMMARY bundle whose origin is our HUB_ID. Peers
-// treat empty summaries as no-op learning packets; hubs use the origin to update
-// their last-seen table (see touchPeer). Sent every HEARTBEAT_INTERVAL_MS.
-uint32_t nextHeartbeatMs = 0;
-
-void buildHeartbeatHeader(uint8_t* hdr) {
-    // Fresh msgId — first 4 bytes are HUB_ID for readability, rest randomised so the
-    // dedup ring on peer hubs doesn't collapse successive heartbeats into one.
-    wr32(hdr + OFF_MSGID + 0, HUB_ID);
-    for (int i = 4; i < 16; i++) hdr[OFF_MSGID + i] = (uint8_t)(esp_random() & 0xFF);
-    wr32(hdr + OFF_ORIGIN, HUB_ID);
-    wr32(hdr + OFF_DEST,   BROADCAST_DEST);
-    hdr[OFF_TTL_MIN + 0] = 0; hdr[OFF_TTL_MIN + 1] = 5; // 5 minutes
-    hdr[OFF_HOP]         = 0;
-    hdr[OFF_MSGTYPE]     = MSGTYPE_ROUTING_SUMMARY;
-    hdr[28] = 0; hdr[29] = 0; hdr[30] = 1; hdr[31] = 0;
+void buildHeartbeat(uint8_t* hdr){
+    wr32(hdr+OFF_MSGID,HUB_ID);
+    for (int i=4;i<16;i++) hdr[OFF_MSGID+i]=(uint8_t)(esp_random()&0xFF);
+    wr32(hdr+OFF_ORIGIN,HUB_ID); wr32(hdr+OFF_DEST,BROADCAST_DEST);
+    wr16(hdr+OFF_TTL_MIN,5); hdr[OFF_HOP]=0; hdr[OFF_MSGTYPE]=MSGTYPE_ROUTING_SUMMARY;
+    hdr[28]=0; hdr[29]=0; hdr[30]=1; hdr[31]=0;
+}
+void maybeSendHeartbeat(){
+    uint32_t now=millis();
+    if ((int32_t)(now-nextHeartbeatMs)<0) return;
+    nextHeartbeatMs=now+HEARTBEAT_BASE_MS+random(0,HEARTBEAT_BASE_MS/5);
+    if (radioState!=RS_RX) { nextHeartbeatMs=now+2000; return; }
+    uint8_t hb[HDR_MIN]; buildHeartbeat(hb);
+    uint32_t toa=radio.getTimeOnAir(HDR_MIN);
+    if (!airtimeAllows(toa)) return;
+    radioIrqFlag=false; radioState=RS_TX;
+    if (radio.startTransmit(hb,HDR_MIN)==RADIOLIB_ERR_NONE){ stats.msgsGenerated++; seenBefore(hb+OFF_MSGID); airtimeCommit(toa); }
+    else { radioState=RS_RX; radio.startReceive(); }
 }
 
-void maybeSendHeartbeat() {
-    uint32_t now = millis();
-    if (now < nextHeartbeatMs) return;
-    nextHeartbeatMs = now + HEARTBEAT_INTERVAL_MS;
-    uint8_t hb[HDR_MIN];
-    buildHeartbeatHeader(hb);
-    // Send synchronously — heartbeats are ~32 B so they clear fast even at SF9.
-    int st = radio.transmit(hb, HDR_MIN);
-    radio.startReceive();
-    if (st == RADIOLIB_ERR_NONE) {
-        stats.msgsGenerated++;
-        // Also self-remember the msg id so a boomerang copy is ignored.
-        seenBefore(hb + OFF_MSGID);
+// ============================================================================
+//  TCP <-> phones (non-blocking)
+// ============================================================================
+void dispatchClientFrame(DtnClient& c){
+    if (c.rxType==FRAME_REGISTER && c.rxLen>=4){
+        c.nodeId=rd32(c.rxBuf);
+        touchPeer(c.nodeId,0);
+        char n[10]; formatNodeId(c.nodeId,n);
+        Serial.printf("[NET] Phone registered node=%s\n", n);
+        replayToPhone(c);
+    } else if (c.rxType==FRAME_BUNDLE){
+        routeBundle(c.rxBuf,c.rxLen,false,0);
     }
 }
-
-// ============================================================================
-//  TCP <-> phones
-// ============================================================================
-void readClient(DtnClient& c) {
-    while (c.sock.available() >= 3) {
-        uint8_t h[3];
-        c.sock.readBytes(h, 3);
-        uint8_t  type = h[0];
-        uint16_t len  = ((uint16_t)h[1] << 8) | h[2];
-        if (len == 0 || len > 512) { c.sock.stop(); c.used = false; return; }
-        uint8_t buf[512];
-        int got = 0;
-        while (got < len && c.sock.connected()) got += c.sock.readBytes(buf + got, len - got);
-        c.lastSeenMs = millis();
-        if (type == FRAME_REGISTER && len >= 4) {
-            c.nodeId = rd32(buf);
-            touchPeer(c.nodeId, /*rssi*/ 0); // phones have no RSSI toward the hub
-            char nStr[10]; formatNodeId(c.nodeId, nStr);
-            Serial.printf("[NET] Phone registered node=%s\n", nStr);
-        } else if (type == FRAME_BUNDLE) {
-            routeBundle(buf, len, /*fromLoRa*/ false, /*rssi*/ 0);
+void readClient(DtnClient& c){
+    while (c.sock.connected() && c.sock.available()>0){
+        if (c.hdrGot<3){
+            int want=3-c.hdrGot;
+            int got=c.sock.read(c.hdr+c.hdrGot,want);
+            if (got<=0) break;
+            c.hdrGot+=got;
+            if (c.hdrGot<3) break;
+            c.rxType=c.hdr[0]; c.rxLen=((uint16_t)c.hdr[1]<<8)|c.hdr[2]; c.rxGot=0;
+            if (c.rxLen>255){ Serial.println("[NET] oversize frame — dropping client"); c.sock.stop(); c.used=false; return; }
+            if (c.rxLen==0){ c.hdrGot=0; continue; } // keepalive/ping: ignore
+        } else {
+            int want=c.rxLen-c.rxGot;
+            int got=c.sock.read(c.rxBuf+c.rxGot,want);
+            if (got<=0) break;
+            c.rxGot+=got;
+            if (c.rxGot>=c.rxLen){ c.lastSeenMs=millis(); dispatchClientFrame(c); c.hdrGot=0; }
         }
     }
 }
-
-void acceptAndPoll() {
-    WiFiClient nc = tcpServer.available();
-    if (nc) {
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (!clients[i].used) {
-                clients[i] = { nc, 0, true, false, millis() };
-                break;
-            }
-        }
+void acceptAndPoll(){
+    WiFiClient nc=tcpServer.available();
+    if (nc){
+        int slot=-1; for (int i=0;i<MAX_CLIENTS;i++) if(!clients[i].used){ slot=i; break; }
+        if (slot>=0){ DtnClient& c=clients[slot]; c={}; c.sock=nc; c.used=true; c.lastSeenMs=millis(); }
+        else { nc.stop(); } // full
     }
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!clients[i].used) continue;
-        if (!clients[i].sock.connected()) {
-            if (clients[i].nodeId != 0) {
-                char nStr[10]; formatNodeId(clients[i].nodeId, nStr);
-                Serial.printf("[NET] Phone dropped   node=%s\n", nStr);
-            }
-            clients[i].sock.stop();
-            clients[i].used = false;
-            continue;
-        }
-        if (!clients[i].greeted) {
-            uint8_t id[4];
-            wr32(id, HUB_ID);
-            sendFrame(clients[i].sock, FRAME_HELLO, id, 4);
-            clients[i].greeted = true;
-        }
-        readClient(clients[i]);
+    uint32_t now=millis();
+    for (int i=0;i<MAX_CLIENTS;i++){
+        DtnClient& c=clients[i];
+        if (!c.used) continue;
+        if (!c.sock.connected()){ if(c.nodeId){ char n[10]; formatNodeId(c.nodeId,n); Serial.printf("[NET] Phone dropped node=%s\n",n);} c.sock.stop(); c.used=false; continue; }
+        if (!c.greeted){ uint8_t id[4]; wr32(id,HUB_ID); sendFrame(c.sock,FRAME_HELLO,id,4); c.greeted=true; }
+        readClient(c);
+        if (now-c.lastSeenMs>CLIENT_IDLE_MS){ Serial.println("[NET] idle phone timeout"); c.sock.stop(); c.used=false; }
     }
 }
 
 // ============================================================================
-//  LoRa pumps
+//  Battery / OLED
 // ============================================================================
-void pumpLoRaTx() {
-    if (txHead == txTail) return;
-    TxItem& it = txQueue[txHead];
-    BufferEntry& e = buffer[it.bufferIndex];
-    if (!e.valid) {
-        // Entry got cleared (e.g. an ACK removed it) between enqueue and TX — skip.
-        txHead = (txHead + 1) % TX_QUEUE_N;
-        return;
-    }
-    int st = radio.transmit(e.data, e.len);
-    if (st == RADIOLIB_ERR_NONE) txHead = (txHead + 1) % TX_QUEUE_N;
-    radio.startReceive();
+float readBatteryVolts(){
+    pinMode(PIN_VBAT_CTRL,OUTPUT); digitalWrite(PIN_VBAT_CTRL,LOW); delay(3);
+    uint32_t mv=analogReadMilliVolts(PIN_VBAT_ADC);
+    pinMode(PIN_VBAT_CTRL,INPUT);
+    return mv*4.9f/1000.0f;  // 390k/100k divider (approx; V3.0/3.1)
 }
-
-void pumpLoRaRx() {
-    if (!loraRxFlag) return;
-    loraRxFlag = false;
-    uint8_t buf[256];
-    int len = radio.getPacketLength();
-    if (len > 0 && radio.readData(buf, len) == RADIOLIB_ERR_NONE) {
-        int rssi = (int)radio.getRSSI();
-        routeBundle(buf, len, /*fromLoRa*/ true, rssi);
-    }
-    radio.startReceive();
+void drawOled(){
+    if (!oledOk) return;
+    char line[32];
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    char hid[10]; formatNodeId(HUB_ID,hid);
+    u8g2.drawStr(0,9,"DTN LoRa Hub");
+    u8g2.drawStr(0,20,hid);
+    snprintf(line,sizeof(line),"%s %.1fMHz",CFG.name,CFG.freq); u8g2.drawStr(0,31,line);
+    snprintf(line,sizeof(line),"ph:%d hub:%d buf:%lu",countConnectedPhones(),countActivePeers(),(unsigned long)stats.bufferedNow); u8g2.drawStr(0,42,line);
+    snprintf(line,sizeof(line),"fwd:%lu air:%.1f%%",(unsigned long)stats.msgsForwarded,airtimePct()); u8g2.drawStr(0,53,line);
+    snprintf(line,sizeof(line),"up:%lus %.2fV",(unsigned long)(millis()/1000),readBatteryVolts()); u8g2.drawStr(0,63,line);
+    u8g2.sendBuffer();
 }
+void maybeDrawOled(){ uint32_t now=millis(); if((int32_t)(now-nextOledMs)<0) return; nextOledMs=now+OLED_INTERVAL_MS; drawOled(); }
 
 // ============================================================================
-//  Serial monitor dashboards (Distance / Buffer / Stats)
+//  Serial dashboard + CLI
 // ============================================================================
-uint32_t nextDashboardMs = 0;
+int countActivePeers(){ int n=0; for(int i=0;i<MAX_KNOWN_PEERS;i++) if(knownPeers[i].valid&&knownPeers[i].active)n++; return n; }
+int countInactivePeers(){ int n=0; for(int i=0;i<MAX_KNOWN_PEERS;i++) if(knownPeers[i].valid&&!knownPeers[i].active)n++; return n; }
+int countConnectedPhones(){ int n=0; for(int i=0;i<MAX_CLIENTS;i++) if(clients[i].used&&clients[i].sock.connected())n++; return n; }
 
-int countActivePeers() {
-    int n = 0;
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) if (knownPeers[i].valid && knownPeers[i].active) n++;
-    return n;
-}
-int countInactivePeers() {
-    int n = 0;
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) if (knownPeers[i].valid && !knownPeers[i].active) n++;
-    return n;
-}
-int countConnectedPhones() {
-    int n = 0;
-    for (int i = 0; i < MAX_CLIENTS; i++) if (clients[i].used && clients[i].sock.connected()) n++;
-    return n;
-}
-
-void printDashboard() {
+void printDashboard(){
     refreshPeerActivity();
-
-    Serial.println();
-    Serial.println("========================= DTN HUB DASHBOARD =========================");
-
-    // Host header — always active while the firmware is running.
-    char hostStr[10]; formatNodeId(HUB_ID, hostStr);
-    Serial.printf("Host  : %s (HUB_ID) status=ACTIVE uptime=%lus\n",
-                  hostStr, (unsigned long)(millis() / 1000));
-
-    // ---- Distance table -----------------------------------------------------
-    Serial.println("\n[ DISTANCE TABLE ]");
-    Serial.println("+----------------+-----------+---------+---------+---------+");
-    Serial.println("| Node ID        | Distance  |  RSSI   | LastSeen| Status  |");
-    Serial.println("+----------------+-----------+---------+---------+---------+");
-    Serial.printf("| %-14s | %8s m | %6s  | %7s | %7s |\n",
-                  hostStr, "0.0", "-", "now", "ACTIVE");
-
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) {
-        if (!knownPeers[i].valid) continue;
-        char idStr[10]; formatNodeId(knownPeers[i].nodeId, idStr);
-        double d = estimateDistanceM(knownPeers[i].lastRssi);
-        char distStr[16];
-        if (d < 0) snprintf(distStr, sizeof(distStr), "%8s", "-");
-        else       snprintf(distStr, sizeof(distStr), "%8.1f", d);
-        char ageStr[16];
-        snprintf(ageStr, sizeof(ageStr), "%lus",
-                 (unsigned long)((millis() - knownPeers[i].lastSeenMs) / 1000UL));
-        Serial.printf("| %-14s | %s m | %6d  | %7s | %7s |\n",
-                      idStr, distStr, knownPeers[i].lastRssi, ageStr,
-                      knownPeers[i].active ? "ACTIVE" : "INACTIVE");
-    }
-    // Locally-connected phones (no RSSI on WiFi from the hub side).
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (!clients[i].used || !clients[i].sock.connected() || clients[i].nodeId == 0) continue;
-        char idStr[10]; formatNodeId(clients[i].nodeId, idStr);
-        Serial.printf("| %-14s | %8s m | %6s  | %7s | %7s |\n",
-                      idStr, "wifi", "-", "now", "ACTIVE");
-    }
-    Serial.println("+----------------+-----------+---------+---------+---------+");
-
-    // ---- Buffer state -------------------------------------------------------
-    Serial.println("\n[ BUFFER STATE ]");
-    Serial.println("+----------+----------------+----------------+-----+-----+--------+-------+");
-    Serial.println("| MsgId    | Origin         | Dest           | Hop | TTL | Age(s) | WaitAck|");
-    Serial.println("+----------+----------------+----------------+-----+-----+--------+-------+");
-    int shown = 0;
-    for (int i = 0; i < BUFFER_CAPACITY; i++) {
-        if (!buffer[i].valid) continue;
-        char idStr[9]; msgIdShort(buffer[i].msgId, idStr);
-        char oStr[10]; formatNodeId(buffer[i].origin, oStr);
-        char dStr[10]; formatNodeId(buffer[i].dest,   dStr);
-        uint32_t age = (millis() - buffer[i].bufferedAtMs) / 1000UL;
-        Serial.printf("| %-8s | %-14s | %-14s | %3u | %3u | %6lu | %5s |\n",
-                      idStr, oStr, dStr, buffer[i].hopCount, buffer[i].ttlMin,
-                      (unsigned long)age, buffer[i].waitingForAck ? "yes" : "no");
-        shown++;
-    }
-    if (shown == 0) Serial.println("| (buffer empty)                                                            |");
-    Serial.println("+----------+----------------+----------------+-----+-----+--------+-------+");
-
-    // ---- Runtime stats ------------------------------------------------------
-    Serial.println("\n[ RUNTIME STATS ]");
-    Serial.printf("  Generated=%lu  Forwarded=%lu  Delivered=%lu\n",
-                  (unsigned long)stats.msgsGenerated,
-                  (unsigned long)stats.msgsForwarded,
-                  (unsigned long)stats.msgsDelivered);
-    Serial.printf("  AcksReceived=%lu  DupIgnored=%lu  DupAcksIgnored=%lu\n",
-                  (unsigned long)stats.acksReceived,
-                  (unsigned long)stats.duplicatesIgnored,
-                  (unsigned long)stats.duplicateAcksIgnored);
-    Serial.printf("  TtlExpired=%lu  HopDropped=%lu\n",
-                  (unsigned long)stats.ttlExpired,
-                  (unsigned long)stats.hopDropped);
-    Serial.printf("  BufferNow=%lu  PeakBuffer=%lu  Inserts=%lu  Evictions=%lu\n",
-                  (unsigned long)stats.bufferedNow,
-                  (unsigned long)peakBufferUsage,
-                  (unsigned long)stats.bufferInserts,
-                  (unsigned long)stats.bufferEvictions);
-    Serial.printf("  ActivePeers=%d  InactivePeers=%d  ConnectedPhones=%d\n",
-                  countActivePeers(), countInactivePeers(), countConnectedPhones());
-    Serial.println("=====================================================================\n");
+    char hid[10]; formatNodeId(HUB_ID,hid);
+    Serial.println("\n==================== DTN HUB ====================");
+    Serial.printf("Host %s  region=%s %.3fMHz SF%u BW%.0f pwr=%ddBm duty=%u%%\n",
+                  hid, CFG.name, CFG.freq, CFG.sf, CFG.bw, CFG.power, CFG.dutyPct);
+    Serial.printf("uptime=%lus  phones=%d  hubs(active/inactive)=%d/%d  airtime=%.2f%%\n",
+                  (unsigned long)(millis()/1000), countConnectedPhones(), countActivePeers(), countInactivePeers(), airtimePct());
+    for (int i=0;i<MAX_KNOWN_PEERS;i++){ if(!knownPeers[i].valid) continue;
+        char id[10]; formatNodeId(knownPeers[i].nodeId,id);
+        Serial.printf("  peer %s rssi=%d dist~%.0fm %s\n", id, knownPeers[i].lastRssi,
+                      estimateDistanceM(knownPeers[i].lastRssi), knownPeers[i].active?"ACTIVE":"stale"); }
+    Serial.printf("buf=%lu/%d peak=%lu fwd=%lu dlv=%lu acks=%lu dup=%lu supp=%lu cad=%lu duty=%lu hop=%lu ttl=%lu\n",
+                  (unsigned long)stats.bufferedNow,BUFFER_CAPACITY,(unsigned long)peakBufferUsage,
+                  (unsigned long)stats.msgsForwarded,(unsigned long)stats.msgsDelivered,(unsigned long)stats.acksReceived,
+                  (unsigned long)stats.duplicatesIgnored,(unsigned long)stats.suppressed,(unsigned long)stats.cadBusy,
+                  (unsigned long)stats.dutyBlocked,(unsigned long)stats.hopDropped,(unsigned long)stats.ttlExpired);
+    Serial.println("cmd: region in|eu|us  |  stats  (current region persists in NVS)");
+    Serial.println("================================================\n");
 }
+void maybePrintDashboard(){ uint32_t now=millis(); if((int32_t)(now-nextDashboardMs)<0) return; nextDashboardMs=now+DASHBOARD_INTERVAL_MS; printDashboard(); }
 
-void maybePrintDashboard() {
-    uint32_t now = millis();
-    if (now < nextDashboardMs) return;
-    nextDashboardMs = now + DISTANCE_UPDATE_INTERVAL_MS;
-    printDashboard();
+void applyRegion(int idx, bool persist){
+    if (idx<0||idx>=NUM_REGIONS) return;
+    regionIdx=idx;
+    if (persist){ prefs.begin("dtn",false); prefs.putInt("region",idx); prefs.end(); }
+    Serial.printf("[CFG] region -> %s (%.3f MHz). Rebooting to re-init radio...\n", CFG.name, CFG.freq);
+    delay(300); ESP.restart();
+}
+void handleSerialCli(){
+    static char buf[32]; static int n=0;
+    while (Serial.available()){
+        char ch=Serial.read();
+        if (ch=='\n'||ch=='\r'){ buf[n]=0;
+            if (n>0){
+                if      (!strncmp(buf,"region in",9)) applyRegion(0,true);
+                else if (!strncmp(buf,"region eu",9)) applyRegion(1,true);
+                else if (!strncmp(buf,"region us",9)) applyRegion(2,true);
+                else if (!strcmp(buf,"stats")) printDashboard();
+            }
+            n=0;
+        } else if (n<(int)sizeof(buf)-1){ buf[n++]=ch; }
+    }
 }
 
 // ============================================================================
 //  setup / loop
 // ============================================================================
-void setup() {
-    Serial.begin(115200);
-    delay(200);
-    Serial.println();
-    Serial.println("DTN LoRa Hub firmware booting");
+void deriveIdentity(){
+    uint64_t mac=ESP.getEfuseMac();
+    HUB_ID=(uint32_t)(mac & 0xFFFFFFFFu);
+    if (HUB_ID==0 || HUB_ID==BROADCAST_DEST) HUB_ID=0xA0000001;
+    snprintf(AP_SSID,sizeof(AP_SSID),"DTN-HUB-%04X",(unsigned)(HUB_ID & 0xFFFF));
+}
+void initOled(){
+    pinMode(PIN_VEXT,OUTPUT); digitalWrite(PIN_VEXT,LOW); delay(50); // power peripherals
+    oledOk=u8g2.begin();
+    if (oledOk){ u8g2.clearBuffer(); u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0,20,"DTN hub boot..."); u8g2.sendBuffer(); }
+}
+void initRadio(){
+    loraSpi.begin(PIN_LORA_SCK,PIN_LORA_MISO,PIN_LORA_MOSI,PIN_LORA_NSS);
+    int st=radio.begin(CFG.freq,CFG.bw,CFG.sf,CFG.cr,NET_SYNC,CFG.power,PREAMBLE,TCXO_VOLTAGE,false);
+    if (st!=RADIOLIB_ERR_NONE){
+        Serial.printf("LoRa begin=%d with TCXO — retrying on XTAL\n",st);
+        st=radio.begin(CFG.freq,CFG.bw,CFG.sf,CFG.cr,NET_SYNC,CFG.power,PREAMBLE,0.0f,false);
+    }
+    if (st!=RADIOLIB_ERR_NONE){ Serial.printf("LoRa init failed (%d) — running WiFi-only\n",st); return; }
+    radio.setCurrentLimit(140.0);
+    radio.setRxBoostedGainMode(true);
+    radio.setDio2AsRfSwitch(true);
+    radio.setDio1Action(onLoRaIrq);
+    radio.startReceive();
+    Serial.printf("LoRa up: %s %.3fMHz SF%u BW%.0f CR4/%u pwr=%ddBm\n",CFG.name,CFG.freq,CFG.sf,CFG.bw,CFG.cr,CFG.power);
+}
+void setup(){
+    Serial.setTxBufferSize(2048);
+    Serial.begin(115200); delay(200);
+    Serial.println("\nDTN LoRa Hub firmware v2 booting");
+    randomSeed(esp_random());
 
-    for (int i = 0; i < BUFFER_CAPACITY; i++) buffer[i].valid = false;
-    for (int i = 0; i < MAX_KNOWN_PEERS; i++) knownPeers[i].valid = false;
-    memset(dedupKey, 0, sizeof(dedupKey));
-    memset(ackDedupKey, 0, sizeof(ackDedupKey));
+    prefs.begin("dtn",true); regionIdx=prefs.getInt("region",DTN_DEFAULT_REGION); prefs.end();
+    if (regionIdx<0||regionIdx>=NUM_REGIONS) regionIdx=DTN_DEFAULT_REGION;
+
+    for (int i=0;i<BUFFER_CAPACITY;i++) buffer[i].valid=false;
+    for (int i=0;i<MAX_KNOWN_PEERS;i++) knownPeers[i].valid=false;
+    memset(dedupKey,0,sizeof(dedupKey)); memset(ackDedupKey,0,sizeof(ackDedupKey));
+
+    deriveIdentity();
+    initOled();
 
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS, 1 /*channel*/, 0, MAX_CLIENTS);
-    tcpServer.begin();
-    Serial.printf("SoftAP %s up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+    WiFi.softAP(AP_SSID,AP_PASS,1,0,MAX_CLIENTS);
+    tcpServer.begin(); tcpServer.setNoDelay(true);
+    Serial.printf("SoftAP %s up at %s\n",AP_SSID,WiFi.softAPIP().toString().c_str());
 
-    int st = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR);
-    if (st != RADIOLIB_ERR_NONE) {
-        Serial.printf("LoRa init fail %d — halting\n", st);
-        while (true) delay(1000);
-    }
-    radio.setDio1Action(onLoRaRx);
-    radio.startReceive();
+    initRadio();
 
-    char hostStr[10]; formatNodeId(HUB_ID, hostStr);
-    Serial.printf("Hub %s ready\n", hostStr);
-    nextDashboardMs = millis() + DISTANCE_UPDATE_INTERVAL_MS;
-    nextHeartbeatMs = millis() + HEARTBEAT_INTERVAL_MS;
+    esp_task_wdt_init(WDT_TIMEOUT_S,true); esp_task_wdt_add(NULL);
+
+    char hid[10]; formatNodeId(HUB_ID,hid);
+    Serial.printf("Hub %s ready (region %s)\n",hid,CFG.name);
+    uint32_t now=millis();
+    nextDashboardMs=now+DASHBOARD_INTERVAL_MS; nextHeartbeatMs=now+2000; nextOledMs=now+500;
 }
-
-void loop() {
-    acceptAndPoll();          // WiFi: accept phones, greet, read frames
-    pumpLoRaRx();             // LoRa: receive backbone bundles
-    pumpLoRaTx();             // LoRa: transmit one queued bundle
-    maybeSendHeartbeat();     // LoRa: periodic keep-alive
-    bufferSweepExpired();     // TTL floor cleanup
-    maybePrintDashboard();    // Serial: distance table + buffer + stats
-    delay(2);
+void loop(){
+    esp_task_wdt_reset();
+    acceptAndPoll();
+    serviceRadio();
+    pumpLoRaTx();
+    maybeSendHeartbeat();
+    bufferSweepExpired();
+    maybeDrawOled();
+    maybePrintDashboard();
+    handleSerialCli();
 }

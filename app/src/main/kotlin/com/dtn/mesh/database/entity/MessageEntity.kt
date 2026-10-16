@@ -117,6 +117,14 @@ data class MessageEntity(
     @ColumnInfo(name = "message_type")
     val messageType: String = "DATA",
 
+    /**
+     * Header flags byte (crypto suite / version / routing flags). MUST be preserved across relay
+     * hops so a mule carrying an encrypted bundle re-emits it with the correct suite — otherwise
+     * the recipient could not decrypt it.
+     */
+    @ColumnInfo(name = "flags")
+    val flags: Int = 0,
+
     /** Payload size in bytes (denormalised for buffer-pressure calculations). */
     @ColumnInfo(name = "payload_size_bytes")
     val payloadSizeBytes: Int = payload.size,

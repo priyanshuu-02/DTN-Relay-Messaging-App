@@ -2,25 +2,10 @@ package com.dtn.mesh.model
 
 /**
  * Discriminator for DTN wire message types.
- * All share port PRIVATE_APP (256) but carry different payload semantics.
  *
- * Encoded as a single byte (offset 19) in the 24-byte DTN wire header.
- *
- * ## Wire Header Layout (24 bytes total)
- * ```
- * Byte offset | Size | Field
- * ──────────────────────────────────────────
- *  0          | 16   | messageId (UUID raw bytes)
- * 16          |  2   | ttlMinutes (UShort, big-endian)
- * 18          |  1   | hopCount
- * 19          |  1   | messageType (this enum)
- * 20          |  1   | channel
- * 21          |  1   | fragmentIndex (0 = complete, 1..N for fragments)
- * 22          |  1   | fragmentTotal (1 = no fragmentation)
- * 23          |  1   | reserved (must be 0x00)
- * ```
- *
- * Usable payload after header: 237 - 24 = 213 bytes per LoRa frame.
+ * Encoded as a single byte at offset 27 of the 32-byte self-contained DTN header
+ * (see [com.dtn.mesh.receiver.DtnWireCodec]). Usable payload after the 32-byte header is
+ * 223 bytes per single LoRa frame.
  */
 enum class DtnMessageType(val wireValue: Byte) {
     /** User-generated store-carry-forward message content. */
@@ -42,7 +27,14 @@ enum class DtnMessageType(val wireValue: Byte) {
      * Bundle request: list of message IDs we want the peer to transmit to us.
      * Sent in response to a BUNDLE_OFFER.
      */
-    BUNDLE_REQUEST(0x04);
+    BUNDLE_REQUEST(0x04),
+
+    /**
+     * Signed identity/key announcement. Broadcast so peers can learn this node's X25519
+     * (encryption) and Ed25519 (verification) public keys and bind them to its node id
+     * (trust-on-first-use). Payload = [com.dtn.mesh.crypto.Announce].
+     */
+    ANNOUNCE(0x05);
 
     companion object {
         /** Decode a wire byte to the enum, defaulting to DATA for unknown values. */
@@ -69,6 +61,9 @@ enum class DtnMessageType(val wireValue: Byte) {
 
     /** Whether this type carries user payload that participates in store-carry-forward. */
     val isUserData: Boolean get() = this == DATA
+
+    /** Whether this is a signed identity/key announcement. */
+    val isAnnounce: Boolean get() = this == ANNOUNCE
 
     /** Whether this type is part of the encounter handshake protocol. */
     val isHandshake: Boolean get() = this == ROUTING_SUMMARY || this == ROUTING_ACK

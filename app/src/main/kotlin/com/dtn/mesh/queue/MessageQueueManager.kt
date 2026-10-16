@@ -284,6 +284,7 @@ class MessageQueueManager @Inject constructor(
         lastSnr = msg.lastSnr,
         status = MessageStatus.BUFFERED,
         messageType = msg.messageType.name,
+        flags = msg.flags,
     )
 
     private fun fromEntity(entity: MessageEntity): DtnMessage = DtnMessage(
@@ -300,6 +301,10 @@ class MessageQueueManager @Inject constructor(
         lastSnr = entity.lastSnr,
         forwardCount = entity.forwardCount,
         duplicateCount = entity.duplicateCount,
+        // Preserve the wire type + crypto flags so relayed bundles stay intact end-to-end.
+        messageType = runCatching { com.dtn.mesh.model.DtnMessageType.valueOf(entity.messageType) }
+            .getOrDefault(com.dtn.mesh.model.DtnMessageType.DATA),
+        flags = entity.flags,
     )
 
     companion object {

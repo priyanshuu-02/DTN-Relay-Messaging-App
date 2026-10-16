@@ -1,9 +1,13 @@
 package com.dtn.mesh.service
 
 import android.util.Log
+import com.dtn.mesh.crypto.Announce
+import com.dtn.mesh.crypto.EnvelopeService
+import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.dao.ContactDao
 import com.dtn.mesh.database.dao.EncounterDao
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
+import com.dtn.mesh.database.entity.ChatMessageEntity
 import com.dtn.mesh.database.entity.ContactEntity
 import com.dtn.mesh.database.entity.EncounterEntity
 import com.dtn.mesh.database.entity.ForwardingDecisionEntity
@@ -61,6 +65,8 @@ class DtnOrchestrator @Inject constructor(
     private val receiptStore: DeliveryReceiptStore,
     private val qEngine: DoubleQLearningEngine,
     private val contactDao: ContactDao,
+    private val chatDao: ChatDao,
+    private val envelope: EnvelopeService,
     private val encounterDao: EncounterDao,
     private val decisionDao: ForwardingDecisionDao,
     private val strategySelector: StrategySelector,
@@ -520,16 +526,13 @@ class DtnOrchestrator @Inject constructor(
             }
         }
 
-        // Clear a broadcast only once it has actually been fanned to EVERY currently-online peer
-        // (fixes the gap where a mid-loop failure cleared a broadcast a peer never received).
-        for ((msgId, sentPeers) in broadcastsSentTo) {
-            if (sentPeers.containsAll(onlineIds)) {
-                queueManager.markDelivered(msgId)
-                lifecycle.markRouteDelivered(msgId) // keep route observation in sync with chat status
-                lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msgId,
-                    extra = "broadcast fan-out complete (${onlineIds.size} peers)")
-                Log.d(TAG, "BROADCAST cleared: $msgId (sent to ${onlineIds.size} peers)")
-            }
+        // Broadcasts / group messages are epidemic: they are NOT cleared after fan-out. They keep
+        // propagating to peers met later (store-carry-forward for broadcast) until their TTL
+        // expires, bounded by per-peer send throttling (recentlySentTo) + receiver-side dedup, and
+        // reclaimed by TTL expiry or buffer pressure. Clearing a broadcast once every *currently*
+        // online peer had it (the old behaviour) stranded peers that were offline at that instant.
+        if (broadcastsSentTo.isNotEmpty()) {
+            Log.d(TAG, "Broadcast fan-out this pass: ${broadcastsSentTo.size} msg(s) kept for epidemic spread")
         }
     }
 
@@ -799,24 +802,35 @@ class DtnOrchestrator @Inject constructor(
 
         // Routing summary from a peer — feed to strategy for transitivity + peer-P cache.
         if (msg.messageType == DtnMessageType.ROUTING_SUMMARY) {
-            runCatching {
-                // The wire ROUTING_SUMMARY frame doesn't carry the producing strategy's tag, so
-                // reconstruct it with OUR active strategy's tag. Two nodes running the same
-                // strategy interoperate; a summary from a peer running a different strategy is
-                // harmlessly ignored (its payload format wouldn't match anyway).
-                strategySelector.onRoutingSummaryReceived(
-                    peerId = msg.originNodeId,
-                    summary = RoutingSummary(
-                        strategyTag = strategySelector.name,
-                        payload = msg.payloadBytes,
-                    ),
-                )
-                Log.d(TAG, "ROUTING-SUMMARY-IN from ${msg.originNodeId.value.takeLast(8)}")
-            }.onFailure { Log.w(TAG, "routing-summary decode failed from ${msg.originNodeId.value}", it) }
+            // SECURITY: a routing summary describes a DIRECT neighbour's state. Only trust it when
+            // the transport attributes the frame to the very peer that claims to be its origin
+            // (a 1-hop message). A relayed or forged summary — including one carried over the LoRa
+            // hub with no attributable sender — is ignored, so it can't poison PRoPHET/MaxProp
+            // tables (a blackhole attack) or rebind another node's identity.
+            val via = packet.viaPeer
+            if (via != null && via == msg.originNodeId) {
+                runCatching {
+                    strategySelector.onRoutingSummaryReceived(
+                        peerId = msg.originNodeId,
+                        summary = RoutingSummary(strategyTag = strategySelector.name, payload = msg.payloadBytes),
+                    )
+                    Log.d(TAG, "ROUTING-SUMMARY-IN from ${msg.originNodeId.value.takeLast(8)}")
+                }.onFailure { Log.w(TAG, "routing-summary decode failed from ${msg.originNodeId.value}", it) }
+            } else {
+                Log.d(TAG, "Ignoring unattributed routing summary (via=${via?.value?.takeLast(8)}, origin=${msg.originNodeId.value.takeLast(8)})")
+            }
             return
         }
 
-        if (!msg.messageType.isUserData) return
+        // ANNOUNCE: a signed identity/key broadcast. Verify + pin the peer's keys (TOFU), then
+        // let it keep flooding so keys propagate across the mesh.
+        if (msg.messageType.isAnnounce) {
+            processAnnounce(msg)
+            if (queueManager.ingest(msg)) requestFlush() // epidemic relay of the announce
+            return
+        }
+
+        if (!msg.messageType.isUserData) return // unknown control type — drop (never shown as chat)
 
         // Remember the real previous hop (from the transport, not the wire origin) so the
         // relay logic never echoes this bundle straight back to whoever just gave it to us.
@@ -826,12 +840,18 @@ class DtnOrchestrator @Inject constructor(
         val isForMe = myId != null && msg.destinationNodeId.value == myId
         val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
 
-        if (isForMe || isBroadcast) {
-            // MESSAGE IS FOR US — ingest and mark delivered locally.
+        if (isForMe) {
+            // UNICAST TO US — decrypt, show in chat, acknowledge end-to-end.
             val stored = queueManager.ingest(msg)
             if (stored) {
+                val text = envelope.open(msg)
+                if (text != null) {
+                    persistInboundChat(msg, text, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
+                } else {
+                    Log.w(TAG, "RX-MINE undecryptable ${msg.id.take(8)} — no key for ${msg.originNodeId.value.takeLast(8)} yet?")
+                }
                 queueManager.markDelivered(msg.id)
-                receiptStore.markDelivered(msg.id) // we now have a receipt to propagate
+                receiptStore.markDelivered(msg.id) // propagate an end-to-end receipt
                 benchmark.recordDelivery(strategySelector.name, msg.hopCount,
                     System.currentTimeMillis() - msg.createdAtMs)
                 resolveRewardDelivered(msg.id, packet.viaPeer?.value)
@@ -839,58 +859,94 @@ class DtnOrchestrator @Inject constructor(
                     origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs())
                 lifecycle.recordIncoming(
-                    msgId = msg.id, source = msg.originNodeId.value,
-                    dest = msg.destinationNodeId.value,
-                    // Real immediate sender (from the transport), NOT the wire origin — origin
-                    // is only correct for a 1-hop message. Falls back to origin if unknown.
+                    msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
-                    me = transport.localNodeId?.value ?: "",
-                    delivered = true,
+                    me = transport.localNodeId?.value ?: "", delivered = true,
                 )
-                lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id,
-                    extra = "will push to ${contactDao.getOnlineContacts().size} online peers")
+                lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id, extra = "receipt queued")
                 Log.d(TAG, "RX-MINE: ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}")
-                // Propagate the fresh receipt immediately (non-blocking; keeps the loop hot).
                 requestFlush()
-            } else {
-                // DUPLICATE — we already have this message. But the sender clearly never
-                // got our ACK (otherwise they wouldn't re-send). If we have a receipt for
-                // this msgId, push it again immediately so the sender's buffer clears.
-                if (receiptStore.isDelivered(msg.id)) {
-                    lifecycle.log(LifecycleEvent.DUPLICATE, msg.id,
-                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                        extra = "already delivered — re-pushing ACK")
-                    Log.d(TAG, "DUP-MINE: ${msg.id.take(8)} — re-sending ACK to clear sender buffer")
-                    requestFlush()
-                } else {
-                    lifecycle.log(LifecycleEvent.DUPLICATE, msg.id,
-                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                        extra = "already ingested")
-                }
+            } else if (receiptStore.isDelivered(msg.id)) {
+                // Already have it and already hold a receipt — re-push so the sender's buffer clears.
+                lifecycle.log(LifecycleEvent.DUPLICATE, msg.id,
+                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                    extra = "already delivered — re-pushing ACK")
+                requestFlush()
             }
             return
         }
 
-        // MESSAGE FOR SOMEONE ELSE — we're a mule.
-        // If we already have a receipt saying it's delivered, ignore.
+        if (isBroadcast) {
+            // BROADCAST / GROUP — epidemic store-carry-forward. Buffer for onward flooding and
+            // show once if we can decrypt. Crucially NO receipt and NO early markDelivered: a
+            // broadcast keeps propagating until its TTL so peers met later still receive it.
+            // (Previously receivers minted receipts for broadcasts, which made the origin and
+            // hubs drop the broadcast after the first receiver got it.)
+            val stored = queueManager.ingest(msg)
+            if (stored) {
+                val text = envelope.open(msg) // suite-0 plaintext, or suite-2 group if we're a member
+                if (text != null) {
+                    val group = msg.channel > 0
+                    persistInboundChat(
+                        msg, text,
+                        convKey = if (group) "grp:${msg.channel}" else NodeId.BROADCAST.value,
+                        peer = null,
+                    )
+                }
+                lifecycle.recordIncoming(
+                    msgId = msg.id, source = msg.originNodeId.value, dest = "^all",
+                    prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
+                    me = transport.localNodeId?.value ?: "", delivered = false,
+                )
+                requestFlush()
+            }
+            return
+        }
+
+        // UNICAST FOR SOMEONE ELSE — we're a mule carrying opaque ciphertext we can't read.
         if (receiptStore.isDelivered(msg.id)) {
             Log.d(TAG, "RX-MULE ignored (already delivered): ${msg.id.take(8)}")
             return
         }
-        val stored = queueManager.ingest(msg)
-        if (stored) {
+        if (queueManager.ingest(msg)) {
             Log.d(TAG, "RX-MULE: ${msg.id.take(8)} → dest ${msg.destinationNodeId.value.takeLast(8)}")
             lifecycle.recordIncoming(
-                msgId = msg.id, source = msg.originNodeId.value,
-                dest = msg.destinationNodeId.value,
-                // Real immediate sender (from the transport), NOT the wire origin.
+                msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                 prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
-                me = transport.localNodeId?.value ?: "",
-                delivered = false,
+                me = transport.localNodeId?.value ?: "", delivered = false,
             )
-            // Try to deliver onward immediately if destination is online (non-blocking).
             requestFlush()
         }
+    }
+
+    /** Verify a signed ANNOUNCE and pin the peer's public keys (trust-on-first-use). */
+    private suspend fun processAnnounce(msg: DtnMessage) {
+        val announce = Announce.parseAndVerify(msg.payloadBytes) ?: run {
+            Log.w(TAG, "ANNOUNCE failed signature verification from ${msg.originNodeId.value.takeLast(8)}")
+            return
+        }
+        if (NodeId.fromNodeNum(announce.nodeNum) != msg.originNodeId) {
+            Log.w(TAG, "ANNOUNCE node-id binding mismatch; rejecting ${msg.originNodeId.value.takeLast(8)}")
+            return
+        }
+        runCatching {
+            contactDao.insertIfNew(ContactEntity(nodeId = msg.originNodeId.value))
+            contactDao.updateKeys(msg.originNodeId.value, announce.xPub, announce.edPub, announce.name, System.currentTimeMillis())
+        }.onFailure { Log.w(TAG, "pinning announce keys failed", it) }
+        Log.i(TAG, "ANNOUNCE pinned keys for ${msg.originNodeId.value.takeLast(8)} (${announce.name})")
+    }
+
+    /** Persist a decrypted inbound message into the user-visible chat log (dedup-by-id via REPLACE). */
+    private suspend fun persistInboundChat(msg: DtnMessage, text: String, convKey: String, peer: String?) {
+        runCatching {
+            chatDao.upsert(
+                ChatMessageEntity(
+                    id = msg.id, convKey = convKey, peerNodeId = peer, channel = msg.channel,
+                    direction = ChatMessageEntity.Direction.IN, text = text,
+                    status = ChatMessageEntity.Status.RECEIVED, createdAtMs = System.currentTimeMillis(),
+                ),
+            )
+        }.onFailure { Log.w(TAG, "persist inbound chat failed", it) }
     }
 
     // ══════════════════════════════════════════════════════════════════════

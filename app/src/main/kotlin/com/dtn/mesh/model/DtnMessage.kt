@@ -59,6 +59,11 @@ data class DtnMessage(
     val fragmentIndex: Int = 0,
     /** Total number of fragments (1 = no fragmentation). */
     val fragmentTotal: Int = 1,
+    /**
+     * Header flags byte (offset 31). bits0-2 = crypto suite (0 plain, 1 DM X25519, 2 channel),
+     * bit3 = receipt-lock present, bit4 = OK_TO_INTERNET, bit5 = VIA_INTERNET, bits6-7 = version.
+     */
+    val flags: Int = 0,
 ) {
     companion object {
         /**

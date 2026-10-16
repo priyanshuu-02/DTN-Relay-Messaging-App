@@ -1,0 +1,631 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "bf8f4c4010258af331c935ce94388c63",
+    "entities": [
+      {
+        "tableName": "messages",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `origin_node_id` TEXT NOT NULL, `destination_node_id` TEXT NOT NULL, `payload` BLOB NOT NULL, `port_num` INTEGER NOT NULL, `channel` INTEGER NOT NULL, `created_at_ms` INTEGER NOT NULL, `expires_at_ms` INTEGER NOT NULL, `ttl_ms` INTEGER NOT NULL, `hop_count` INTEGER NOT NULL, `forward_count` INTEGER NOT NULL, `duplicate_count` INTEGER NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `status` TEXT NOT NULL, `received_at_ms` INTEGER NOT NULL, `last_forwarded_to` TEXT, `last_forwarded_at_ms` INTEGER, `mesh_packet_id` INTEGER, `message_type` TEXT NOT NULL, `payload_size_bytes` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "originNodeId",
+            "columnName": "origin_node_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "destinationNodeId",
+            "columnName": "destination_node_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payload",
+            "columnName": "payload",
+            "affinity": "BLOB",
+            "notNull": true
+          },
+          {
+            "fieldPath": "portNum",
+            "columnName": "port_num",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "channel",
+            "columnName": "channel",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMs",
+            "columnName": "created_at_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expiresAtMs",
+            "columnName": "expires_at_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "ttlMs",
+            "columnName": "ttl_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hopCount",
+            "columnName": "hop_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "forwardCount",
+            "columnName": "forward_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "duplicateCount",
+            "columnName": "duplicate_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastRssi",
+            "columnName": "last_rssi",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSnr",
+            "columnName": "last_snr",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedAtMs",
+            "columnName": "received_at_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastForwardedTo",
+            "columnName": "last_forwarded_to",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "lastForwardedAtMs",
+            "columnName": "last_forwarded_at_ms",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "meshPacketId",
+            "columnName": "mesh_packet_id",
+            "affinity": "INTEGER",
+            "notNull": false
+          },
+          {
+            "fieldPath": "messageType",
+            "columnName": "message_type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSizeBytes",
+            "columnName": "payload_size_bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_messages_destination_node_id",
+            "unique": false,
+            "columnNames": [
+              "destination_node_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_destination_node_id` ON `${TABLE_NAME}` (`destination_node_id`)"
+          },
+          {
+            "name": "index_messages_expires_at_ms",
+            "unique": false,
+            "columnNames": [
+              "expires_at_ms"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_expires_at_ms` ON `${TABLE_NAME}` (`expires_at_ms`)"
+          },
+          {
+            "name": "index_messages_status",
+            "unique": false,
+            "columnNames": [
+              "status"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_status` ON `${TABLE_NAME}` (`status`)"
+          },
+          {
+            "name": "index_messages_origin_node_id",
+            "unique": false,
+            "columnNames": [
+              "origin_node_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_messages_origin_node_id` ON `${TABLE_NAME}` (`origin_node_id`)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "contacts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`node_id` TEXT NOT NULL, `delivery_probability` REAL NOT NULL, `last_aged_at_ms` INTEGER NOT NULL, `path_likelihood` REAL NOT NULL, `total_encounters` INTEGER NOT NULL, `total_encounter_duration_ms` INTEGER NOT NULL, `first_encounter_ms` INTEGER NOT NULL, `last_encounter_ms` INTEGER NOT NULL, `best_rssi` INTEGER NOT NULL, `best_snr` REAL NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `delivery_success_count` INTEGER NOT NULL, `delivery_attempt_count` INTEGER NOT NULL, `total_inter_contact_time_ms` INTEGER NOT NULL, `long_name` TEXT, `short_name` TEXT, `hw_model` TEXT, `is_online` INTEGER NOT NULL, `custom_name` TEXT, PRIMARY KEY(`node_id`))",
+        "fields": [
+          {
+            "fieldPath": "nodeId",
+            "columnName": "node_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryProbability",
+            "columnName": "delivery_probability",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAgedAtMs",
+            "columnName": "last_aged_at_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "pathLikelihood",
+            "columnName": "path_likelihood",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalEncounters",
+            "columnName": "total_encounters",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalEncounterDurationMs",
+            "columnName": "total_encounter_duration_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "firstEncounterMs",
+            "columnName": "first_encounter_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastEncounterMs",
+            "columnName": "last_encounter_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bestRssi",
+            "columnName": "best_rssi",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bestSnr",
+            "columnName": "best_snr",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastRssi",
+            "columnName": "last_rssi",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSnr",
+            "columnName": "last_snr",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliverySuccessCount",
+            "columnName": "delivery_success_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryAttemptCount",
+            "columnName": "delivery_attempt_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "totalInterContactTimeMs",
+            "columnName": "total_inter_contact_time_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "longName",
+            "columnName": "long_name",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "shortName",
+            "columnName": "short_name",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "hwModel",
+            "columnName": "hw_model",
+            "affinity": "TEXT",
+            "notNull": false
+          },
+          {
+            "fieldPath": "isOnline",
+            "columnName": "is_online",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "customName",
+            "columnName": "custom_name",
+            "affinity": "TEXT",
+            "notNull": false
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "node_id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_contacts_last_encounter_ms",
+            "unique": false,
+            "columnNames": [
+              "last_encounter_ms"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_contacts_last_encounter_ms` ON `${TABLE_NAME}` (`last_encounter_ms`)"
+          },
+          {
+            "name": "index_contacts_delivery_probability",
+            "unique": false,
+            "columnNames": [
+              "delivery_probability"
+            ],
+            "orders": [
+              "DESC"
+            ],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_contacts_delivery_probability` ON `${TABLE_NAME}` (`delivery_probability` DESC)"
+          }
+        ],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "encounters",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `peer_node_id` TEXT NOT NULL, `start_time_ms` INTEGER NOT NULL, `end_time_ms` INTEGER NOT NULL, `duration_ms` INTEGER NOT NULL, `packet_count` INTEGER NOT NULL, `best_rssi` INTEGER NOT NULL, `best_snr` REAL NOT NULL, `avg_rssi` REAL NOT NULL, `avg_snr` REAL NOT NULL, `messages_forwarded` INTEGER NOT NULL, `messages_received` INTEGER NOT NULL, `routing_summary_exchanged` INTEGER NOT NULL, FOREIGN KEY(`peer_node_id`) REFERENCES `contacts`(`node_id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "peerNodeId",
+            "columnName": "peer_node_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startTimeMs",
+            "columnName": "start_time_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endTimeMs",
+            "columnName": "end_time_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationMs",
+            "columnName": "duration_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "packetCount",
+            "columnName": "packet_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bestRssi",
+            "columnName": "best_rssi",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bestSnr",
+            "columnName": "best_snr",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "avgRssi",
+            "columnName": "avg_rssi",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "avgSnr",
+            "columnName": "avg_snr",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messagesForwarded",
+            "columnName": "messages_forwarded",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messagesReceived",
+            "columnName": "messages_received",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "routingSummaryExchanged",
+            "columnName": "routing_summary_exchanged",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_encounters_peer_node_id",
+            "unique": false,
+            "columnNames": [
+              "peer_node_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_encounters_peer_node_id` ON `${TABLE_NAME}` (`peer_node_id`)"
+          },
+          {
+            "name": "index_encounters_start_time_ms",
+            "unique": false,
+            "columnNames": [
+              "start_time_ms"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_encounters_start_time_ms` ON `${TABLE_NAME}` (`start_time_ms`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "contacts",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "peer_node_id"
+            ],
+            "referencedColumns": [
+              "node_id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "forwarding_decisions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `timestamp_ms` INTEGER NOT NULL, `message_id` TEXT NOT NULL, `peer_node_id` TEXT NOT NULL, `state_rssi_norm` REAL NOT NULL, `state_snr_norm` REAL NOT NULL, `state_encounter_frequency` REAL NOT NULL, `state_encounter_duration` REAL NOT NULL, `state_delivery_probability` REAL NOT NULL, `state_remaining_ttl_fraction` REAL NOT NULL, `state_buffer_occupancy` REAL NOT NULL, `state_historical_success_rate` REAL NOT NULL, `state_duplicate_count_norm` REAL NOT NULL, `action` TEXT NOT NULL, `q_value_selected` REAL NOT NULL, `epsilon` REAL NOT NULL, `was_exploratory` INTEGER NOT NULL, `routing_strategy` TEXT NOT NULL, `reward` REAL, `update_applied` INTEGER NOT NULL)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestampMs",
+            "columnName": "timestamp_ms",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageId",
+            "columnName": "message_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "peerNodeId",
+            "columnName": "peer_node_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateRssiNorm",
+            "columnName": "state_rssi_norm",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateSnrNorm",
+            "columnName": "state_snr_norm",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateEncounterFrequency",
+            "columnName": "state_encounter_frequency",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateEncounterDuration",
+            "columnName": "state_encounter_duration",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateDeliveryProbability",
+            "columnName": "state_delivery_probability",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateRemainingTtlFraction",
+            "columnName": "state_remaining_ttl_fraction",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateBufferOccupancy",
+            "columnName": "state_buffer_occupancy",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateHistoricalSuccessRate",
+            "columnName": "state_historical_success_rate",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateDuplicateCountNorm",
+            "columnName": "state_duplicate_count_norm",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "action",
+            "columnName": "action",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "qValueSelected",
+            "columnName": "q_value_selected",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epsilon",
+            "columnName": "epsilon",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "wasExploratory",
+            "columnName": "was_exploratory",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "routingStrategy",
+            "columnName": "routing_strategy",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "reward",
+            "columnName": "reward",
+            "affinity": "REAL",
+            "notNull": false
+          },
+          {
+            "fieldPath": "updateApplied",
+            "columnName": "update_applied",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_forwarding_decisions_timestamp_ms",
+            "unique": false,
+            "columnNames": [
+              "timestamp_ms"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_forwarding_decisions_timestamp_ms` ON `${TABLE_NAME}` (`timestamp_ms`)"
+          },
+          {
+            "name": "index_forwarding_decisions_message_id",
+            "unique": false,
+            "columnNames": [
+              "message_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_forwarding_decisions_message_id` ON `${TABLE_NAME}` (`message_id`)"
+          },
+          {
+            "name": "index_forwarding_decisions_action",
+            "unique": false,
+            "columnNames": [
+              "action"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_forwarding_decisions_action` ON `${TABLE_NAME}` (`action`)"
+          }
+        ],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'bf8f4c4010258af331c935ce94388c63')"
+    ]
+  }
+}

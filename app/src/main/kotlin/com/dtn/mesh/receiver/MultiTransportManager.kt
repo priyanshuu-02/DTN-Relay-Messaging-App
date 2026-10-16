@@ -28,25 +28,30 @@ class MultiTransportManager @Inject constructor(
     private val bleTransport: BleTransportAdapter,
     private val wifiDirectTransport: WifiDirectTransportAdapter,
     private val loRaHubTransport: LoRaHubTransportAdapter,
+    private val internetTransport: InternetTransportAdapter,
 ) : MeshTransport {
 
     companion object {
         private const val TAG = "MultiTransport"
     }
 
+    /** Local radio transports used for the send-priority chain + bulk connect/disconnect. */
     private val transports: List<DtnTransport> =
         listOf(bleTransport, wifiDirectTransport, loRaHubTransport)
+
+    /** Transports whose inbound streams we observe (local radios + the optional internet relay). */
+    private val inboundSources: List<DtnTransport> = transports + internetTransport
 
     // ── Merged Flows ─────────────────────────────────────────────────────
 
     override val inboundMessages: Flow<InboundPacket> =
-        transports.map { it.inboundMessages }.merge()
+        inboundSources.map { it.inboundMessages }.merge()
 
     override val nodeEvents: Flow<NodeEncounterEvent> =
-        transports.map { it.nodeEvents }.merge()
+        inboundSources.map { it.nodeEvents }.merge()
 
     override val deliveryStatus: Flow<DeliveryStatusEvent> =
-        transports.map { it.deliveryStatus }.merge()
+        inboundSources.map { it.deliveryStatus }.merge()
 
     private val _connectionState = MutableStateFlow(MeshConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<MeshConnectionState> = _connectionState.asStateFlow()
@@ -84,6 +89,25 @@ class MultiTransportManager @Inject constructor(
         updateConnectionState()
         return ok
     }
+
+    /** Connect the optional internet (MQTT) relay transport. */
+    suspend fun connectInternet(): Boolean {
+        val ok = internetTransport.connect()
+        updateConnectionState()
+        return ok
+    }
+
+    /** Disconnect the internet relay transport. */
+    fun disconnectInternet() {
+        internetTransport.disconnect()
+        updateConnectionState()
+    }
+
+    /** Whether the internet relay is currently connected. */
+    val isInternetConnected: Boolean get() = internetTransport.isConnected
+
+    /** Publish a bundle to the internet relay, if connected (bridge path for the origin). */
+    fun publishToInternet(message: DtnMessage) = internetTransport.publish(message)
 
     /** Connect only the BLE P2P transport. */
     suspend fun connectBle(): Boolean {

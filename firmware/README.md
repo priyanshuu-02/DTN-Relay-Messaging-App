@@ -15,19 +15,25 @@ pio device monitor      # serial log @115200
 
 (Or open this folder in VS Code with the PlatformIO extension.)
 
-## Per-hub configuration
+## Per-hub configuration (v2 — no per-device source edits)
 
-Edit the top of `src/main.cpp` for each device before flashing:
+The **same binary** is flashed to every hub. Each one derives a unique `HUB_ID` and SoftAP SSID
+suffix from its ESP32 eFuse MAC at boot (e.g. `DTN-HUB-B734`, hub id `!65dab734`), so you just
+`pio run -t upload --upload-port COMxx` to each board.
 
-| Constant   | Purpose                        | Example (Hub A / Hub B)         |
-|------------|--------------------------------|---------------------------------|
-| `HUB_ID`   | Unique 32-bit hub node id      | `0xA0000001` / `0xA0000002`     |
-| `AP_SSID`  | SoftAP name (prefix `DTN-HUB-`)| `"DTN-HUB-A"` / `"DTN-HUB-B"`   |
-| `AP_PASS`  | SoftAP passphrase (≥ 8 chars)  | must match app `HUB_PASSPHRASE` |
-| `LORA_FREQ`| LoRa band — **set to your law**| `868.0` EU / `915.0` US / `433.0` |
+The LoRa **region** is stored in NVS and defaults to **IN865** (India, 866.3 MHz). Change it over the
+serial monitor at runtime — type one of:
 
-The SSID prefix (`DTN-HUB-`), passphrase, TCP port (`9740`), and frame protocol must stay in sync
-with `LoRaHubTransportAdapter.kt` in the Android app.
+```
+region in    # IN865  866.3 MHz  (India)
+region eu    # EU868  869.525 MHz
+region us    # US915  906.875 MHz, BW500
+```
+
+The compile-time default is `-D DTN_DEFAULT_REGION` in `platformio.ini` (0=IN, 1=EU, 2=US).
+SoftAP SSID prefix (`DTN-HUB-`), passphrase (`dtnmesh123`), TCP port (`9740`) and the frame protocol
+stay in sync with `LoRaHubTransportAdapter.kt`. **Attach the LoRa antenna before powering on** —
+transmitting at 22 dBm without one can damage the radio.
 
 ## Protocol (matches the Android app)
 
@@ -37,11 +43,16 @@ Framed TCP on port 9740: `[1B type][2B length BE][payload]`
 - `REGISTER` (0x01) phone→hub, 4B phone node id, so the hub can deliver bundles back to that phone.
 - `BUNDLE` (0x02) either direction, a self-contained DTN bundle (32-byte header + payload).
 
-Over LoRa the hub floods bundles with message-ID **dedup**, **TTL** and a **hop limit** (≤ 5).
+Over LoRa the hub floods bundles with message-ID **dedup**, **TTL aging**, a **hop limit** (≤ 8),
+**listen-before-talk** (CAD) + random jitter, overhear-suppression, and a rolling-hour **duty-cycle**
+budget. It ages the header TTL by buffer residence and replays buffered bundles to a phone when it
+(re)registers (store-and-forward). An OLED status screen and battery readout are shown on the board.
 
-## Known limitations (research reference, not production)
+## Notes / limitations (research build)
 
-- No LoRa duty-cycle pacing — fine for 2–4 hubs; add before scaling.
-- No over-the-air encryption (WPA2 protects the SoftAP link only).
-- SoftAP serves ~4–8 concurrent phones.
+- Payload is **end-to-end encrypted by the phones** — the hub routes on the cleartext 32-byte header
+  only and never needs the keys. There is no hub-to-hub link MIC yet (a network-key AES-CMAC is a
+  future add; it would reduce the 223-byte LoRa payload budget).
+- WPA2 still protects the phone↔hub SoftAP link; the passphrase is shared and currently in source.
+- SoftAP serves ~8 concurrent phones (`MAX_CLIENTS`).
 - `HDR_MIN`/offsets in `main.cpp` must track any change to `DtnWireCodec` header layout.

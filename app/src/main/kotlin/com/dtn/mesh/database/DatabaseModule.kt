@@ -2,10 +2,13 @@ package com.dtn.mesh.database
 
 import android.content.Context
 import androidx.room.Room
+import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.dao.ContactDao
 import com.dtn.mesh.database.dao.EncounterDao
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
+import com.dtn.mesh.database.dao.GroupDao
 import com.dtn.mesh.database.dao.MessageDao
+import com.dtn.mesh.database.dao.SeenBundleDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -44,4 +47,13 @@ object DatabaseModule {
 
     @Provides
     fun provideForwardingDecisionDao(db: AppDatabase): ForwardingDecisionDao = db.forwardingDecisionDao()
+
+    @Provides
+    fun provideChatDao(db: AppDatabase): ChatDao = db.chatDao()
+
+    @Provides
+    fun provideSeenBundleDao(db: AppDatabase): SeenBundleDao = db.seenBundleDao()
+
+    @Provides
+    fun provideGroupDao(db: AppDatabase): GroupDao = db.groupDao()
 }

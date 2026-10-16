@@ -543,3 +543,127 @@ Ordered roughly by priority.
   semantics — harmless, worth a cleanup pass.
 - `MeshTransport` interface KDoc still describes the old Meshtastic contract; `mesh_packet_id` column name is
   now generic.
+
+
+---
+
+# PART E — 2026-10-16 session: E2E encryption, groups, internet relay, Heltec V3 firmware v2, UI
+
+Big feature + hardening pass. Build is green (`:app:assembleDebug`) and all JVM unit tests pass
+(55: the prior 47 + 8 new `DtnCryptoTest`). Firmware v2 compiles and was flashed to both hubs;
+the LoRa hub-to-hub backbone was verified live (each hub hears the other's heartbeat on IN865).
+
+## E.1 Hub firmware v2 (`firmware/`) — DONE + flashed
+Full rewrite of `firmware/src/main.cpp` (+ `platformio.ini`). Verified on two Heltec WiFi LoRa 32 V3:
+boot, SoftAP up, LoRa init on IN865 866.3 MHz, mutual heartbeat reception, airtime ≈0.02%.
+- Correct Heltec V3 radio: explicit SPI (SCK9/MISO11/MOSI10/NSS8, DIO1-14/RST12/BUSY13), 1.8 V TCXO
+  (+ automatic XTAL fallback), 22 dBm (region-capped), 140 mA OCP, boosted RX, preamble 16, sync 0x2B,
+  DIO2 as RF switch.
+- **Region config** (IN865 866.3 / EU868 869.525 / US915 906.875 @ BW500) stored in NVS; change at
+  runtime over serial (`region in|eu|us`). Default IN865 for Andhra/India. Compile default via
+  `-D DTN_DEFAULT_REGION`.
+- **HUB_ID + SoftAP SSID suffix derived from the eFuse MAC** → identical binary flashed to every hub;
+  they self-differentiate (observed `!65dab734` / `!64dab734`, SSID `DTN-HUB-B734`).
+- Interrupt RX/TX/CAD **state machine** (no longer mis-reads TX-done as RX).
+- **Listen-before-talk** (`scanChannel` CAD) + random jitter + overhear-suppression (cancels a queued
+  relay when the same msgId is heard from another hub).
+- **Rolling-hour airtime ledger** enforcing the region duty cycle (10% IN/EU).
+- **TTL aged by buffer residence** before every re-flood; shared hop limit 8.
+- **Non-blocking per-client TCP reader** (a slow/stalled phone can no longer freeze the hub); 255-byte MTU.
+- **Store-and-forward**: buffered bundles replayed to a phone when it REGISTERs.
+- **ROUTING_ACK delivered to local phones** (receipts now cross hubs).
+- OLED status screen (Vext GPIO36, reset GPIO21, I²C 17/18), battery readout (GPIO1/37), watchdog.
+- SoftAP SSID prefix `DTN-HUB-`, passphrase `dtnmesh123`, 192.168.4.1:9740 kept (app-compatible).
+- Known: observed peer RSSI ≈ −107 dBm at close range → antennas should be attached (flagged to user).
+
+## E.2 Cryptography (`crypto/`) — DONE (unit-tested)
+End-to-end X25519 + AES-256-GCM, pure-Java (BouncyCastle `bcprov-jdk18on:1.78.1` + platform JCE), runs
+on API 26+ (no dependency on the platform XDH provider which needs API 33).
+- `DtnCrypto`: X25519 ECDH, Ed25519 sign/verify, HKDF-SHA256, AEAD seal/open, node-id derivation, fingerprint.
+  Per-message AES key + nonce derived via HKDF(salt = messageId, info = suite‖origin‖dest‖frag) so each
+  (key,nonce) is used once — overhead is just the 16-byte GCM tag. Suites: 0 plain, 1 DM, 2 channel.
+- `KeyVault`: Android Keystore AES-256-GCM master key wrapping the identity blob at rest.
+- `DtnIdentity`: X25519 + Ed25519 keypair, persisted (Keystore-wrapped file), **node id derived from the
+  public keys** (`!%08x` of trunc(SHA-256(domain‖xPub‖edPub))) — replaces the spoofable ANDROID_ID hash.
+  `LocalNodeIdentity` now delegates to it. NOTE: node ids changed → on-device identity resets once.
+- `Announce`: signed identity/key broadcast (ANNOUNCE msgType 0x05) + verify; receivers check the
+  node-id↔key binding before pinning (TOFU).
+- `EnvelopeService`: sealText / open, choosing the suite by (dest, channel); AAD = masked header
+  (ttl/hop zeroed). `GroupKeyStore`: per-channel 32-byte keys (Keystore-wrapped) + QR invite strings.
+- `DtnCryptoTest`: round-trip, wrong-key, tamper-AAD, per-fragment keys, channel, nodeNum determinism,
+  announce sign/verify.
+
+## E.3 Wire format v2 — DONE
+- Header byte 31 (was "reserved") is now **flags**: bits0-2 crypto suite, bit6-7 version. `DtnMessage.flags`,
+  `DtnWireCodec` encode/decode flags + `aadHeader()`; `DtnMessageType.ANNOUNCE` added.
+- **TTL now counts down**: `encode` writes `remainingTtlMs()` (not the original ttl). Fixes the
+  "immortal bundle / latency ≈ 0" bug.
+- `MessageEntity.flags` column added; `MessageQueueManager.toEntity/fromEntity` preserve `flags` and
+  `messageType` so a mule re-emits an encrypted bundle intact (else the recipient couldn't decrypt).
+
+## E.4 Pipeline / orchestrator — DONE
+- Outgoing: `OutboundMessageService.sendText` → seal → persist plaintext to `ChatDao` → `ingest` →
+  (optional) publish to internet relay. `sendAnnounce` floods our keys.
+- Incoming (`DtnOrchestrator.onMessageReceived` rewritten):
+  - ANNOUNCE → verify + pin keys (TOFU) + epidemic relay.
+  - DM to us → decrypt → write chat IN → markDelivered + receipt.
+  - **Broadcast/group → epidemic**: buffer for onward flooding, decrypt+show once if we're a recipient,
+    **no receipt, no early markDelivered** (fixes receivers prematurely clearing broadcasts). Carries
+    until TTL. `flushOnce` no longer clears broadcasts after fan-out.
+  - unicast for someone else → opaque mule custody.
+- **Security**: routing summaries are only trusted when `viaPeer == origin` (1-hop) — blocks the
+  blackhole / identity-rebind attacks over relays/hub.
+- **Single-frame only** for now: the composer enforces a UTF-8 byte budget (fixes the >223-byte
+  head-of-line stall); multi-fragment reassembly is still TODO.
+
+## E.5 Database v3 — DONE (destructive fallback kept; reset OK per user)
+New tables `chat_messages` (persistent plaintext chat, decoupled from the forwarding buffer — fixes
+history being purged with the buffer), `seen_bundles` (tombstone table, wired but not yet consulted —
+resurrection fix is a follow-up), `groups`; contacts gained `x_pub/ed_pub/key_verified/key_first_seen_ms/
+announce_name`. `exportSchema` + `room.schemaLocation` set. Real migrations still TODO before field use.
+
+## E.6 Transports — DONE (partial)
+- **WiFi Direct**: fixed the unbounded `senderIdLength` read (was an OOM remote-crash). (Socket timeouts
+  / periodic discovery still TODO.)
+- **InternetTransportAdapter (MQTT, HiveMQ)**: optional relay (off by default), topics `dtn/v1/node/<hex>`
+  (DM) + `dtn/v1/bcast`. Bundles stay ciphertext, so a public broker (default `broker.hivemq.com:1883`)
+  is fine; switchable to a laptop/Render broker in Settings. Origin publishes once; inbound merges into
+  the orchestrator; dedup by messageId prevents loops. Works best when both ends are online (server-side
+  offline mailbox is a future enhancement). NOT in the local send-priority chain.
+- Still TODO: BLE reassembly reset on disconnect + length cap; LoRa-hub reconnect/backoff; `viaPeer` on
+  LoRa + WiFi Direct inbound.
+
+## E.7 UI — DONE (core)
+- Top-bar actions on the home screen: 👥 Groups, 🔑 Identity, ⚙ Settings (dialogs in `ui/ChatExtras.kt`).
+- **Identity dialog**: my QR (node id + public keys + name), safety number (fingerprint), scan a contact
+  or group QR (zxing) → pins + verifies.
+- **Settings dialog**: display name (used in announces), internet-relay toggle + MQTT broker URL.
+- **Groups**: create (random key + invite QR), join by scanning an invite, group chat cards in the list;
+  group messages use suite-2 channel encryption over broadcast.
+- **Composer**: live UTF-8 byte counter + over-limit block; `composerError` surfaced (no-key / too-long).
+- Chat now reads from `ChatDao` (persistent, dedup by id). `DtnViewModel` send path goes through
+  `OutboundMessageService`; status driven by `deliveredIds`/`terminalEvents` → `ChatDao.updateStatus`.
+- Platform: `allowBackup=false` (DB/keys no longer backed up); COARSE+FINE location requested.
+
+## E.8 Steering (`.kiro/steering/`) — DONE
+`project.md` (always) + `wire-protocol.md` (fileMatch receiver/firmware/model/crypto) so future sessions
+start grounded: architecture, build/test commands, the wire header + crypto envelope, firmware invariants,
+and the "no destructive migrations / no secrets in source / TTL counts down" rules.
+
+## E.9 Dependencies added
+`bouncycastle 1.78.1`, `zxing core 3.5.3` + `zxing-android-embedded 4.3.0`, `hivemq-mqtt-client 1.3.3`,
+`androidx.datastore-preferences 1.1.1`. AGP packaging excludes added for Netty's duplicate META-INF.
+
+## E.10 Still TODO (carried forward / newly opened)
+- Multi-fragment messages (>223 B): reassembly + per-fragment dedup + whole-parent eviction.
+- Consult `seen_bundles` tombstones in `onMessageReceived` to kill resurrection after the 1 h buffer purge
+  (table exists; purge in `ForwardingWorker`).
+- Hash-locked receipts (prevent forged ROUTING_ACK dropping custody) — hub + phone.
+- Real Room migrations (drop destructive fallback) before any field deployment.
+- Transport hardening: BLE reassembly reset + CRC, LoRa-hub reconnect loop, `viaPeer` on LoRa/WiFiDirect,
+  WiFi Direct socket timeouts + periodic discovery.
+- Confine routing/Q state to one dispatcher (ConcurrentModification risk under load).
+- Hub-side internet gateway (AP+STA) and server-side offline mailbox for the relay.
+- Foreground-service permission-before-start ordering; edge-to-edge insets on the chat screen; dark theme;
+  split `MainScreen.kt`; targetSdk 36 (needs AGP ≥ 8.9) for a Play release.
+- Firmware link-layer AES-CMAC MIC (network key) — deferred (would cut the 223-byte LoRa payload budget).

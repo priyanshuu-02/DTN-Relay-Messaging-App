@@ -42,6 +42,16 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // The MQTT client pulls in Netty, which ships duplicate META-INF resources.
+    packaging {
+        resources {
+            excludes += "/META-INF/INDEX.LIST"
+            excludes += "/META-INF/io.netty.versions.properties"
+            excludes += "/META-INF/DEPENDENCIES"
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
 }
 
 dependencies {
@@ -77,6 +87,19 @@ dependencies {
     // Serialization (for research export)
     implementation(libs.kotlinx.serialization.json)
 
+    // Cryptography: X25519 / Ed25519 / HKDF (pure-Java, works on API 26+)
+    implementation(libs.bouncycastle)
+
+    // QR identity exchange
+    implementation(libs.zxing.core)
+    implementation(libs.zxing.embedded)
+
+    // Internet transport (MQTT relay)
+    implementation(libs.hivemq.mqtt)
+
+    // Settings persistence
+    implementation(libs.datastore.preferences)
+
     // Testing
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
@@ -87,4 +110,7 @@ dependencies {
 
 kapt {
     correctErrorTypes = true
+    arguments {
+        arg("room.schemaLocation", "$projectDir/schemas")
+    }
 }

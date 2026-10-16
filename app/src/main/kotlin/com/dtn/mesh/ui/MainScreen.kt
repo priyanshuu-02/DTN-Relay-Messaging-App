@@ -85,7 +85,7 @@ import com.dtn.mesh.receiver.MeshConnectionState
 /* ==========================================================================
  *  Design palette
  * ========================================================================== */
-private object Palette {
+internal object Palette {
     val Primary = Color(0xFF0B7BC0)      // main brand blue
     val PrimaryDark = Color(0xFF075A8F)
     val PrimaryLight = Color(0xFF12A0D8)  // lighter blue for gradient end
@@ -155,6 +155,7 @@ private fun HomeScreen(viewModel: DtnViewModel) {
     val activeStrategy by viewModel.activeStrategy.collectAsState()
 
     var selectedTab by remember { mutableIntStateOf(0) }
+    var overlay by remember { mutableStateOf<String?>(null) }
 
     // System back: if we're on a non-Chats tab, return to Chats. Only exit from Chats tab.
     BackHandler(enabled = selectedTab != 0) { selectedTab = 0 }
@@ -171,6 +172,11 @@ private fun HomeScreen(viewModel: DtnViewModel) {
                         fontSize = 18.sp,
                         color = Color.White,
                     )
+                },
+                actions = {
+                    IconButton(onClick = { overlay = "groups" }) { Text("👥", fontSize = 18.sp) }
+                    IconButton(onClick = { overlay = "identity" }) { Text("🔑", fontSize = 18.sp) }
+                    IconButton(onClick = { overlay = "settings" }) { Text("⚙", fontSize = 18.sp) }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                     containerColor = Color.Transparent,
@@ -203,6 +209,12 @@ private fun HomeScreen(viewModel: DtnViewModel) {
                 }
             }
         }
+    }
+
+    when (overlay) {
+        "settings" -> SettingsDialog(viewModel) { overlay = null }
+        "identity" -> IdentityDialog(viewModel, onOpenChat = { viewModel.openChat(it); overlay = null }) { overlay = null }
+        "groups" -> GroupsDialog(viewModel, onOpenChat = { viewModel.openChat(it); overlay = null }) { overlay = null }
     }
 }
 
@@ -303,6 +315,7 @@ private fun ControlRow(state: MeshConnectionState, viewModel: DtnViewModel) {
 private fun ChatListTab(viewModel: DtnViewModel) {
     val peers by viewModel.peerList.collectAsState()
     val messages by viewModel.receivedMessages.collectAsState()
+    val groups by viewModel.groups.collectAsState()
     var renameTarget by remember { mutableStateOf<PeerInfo?>(null) }
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
@@ -314,6 +327,17 @@ private fun ChatListTab(viewModel: DtnViewModel) {
             )
         }
         item { Spacer(Modifier.height(4.dp)) }
+        if (groups.isNotEmpty()) {
+            items(groups, key = { "grp-${it.channel}" }) { g ->
+                GroupCard(
+                    name = g.name,
+                    subtitle = lastPreview(messages, chatKey = "grp:${g.channel}")
+                        ?: "Encrypted group · channel ${g.channel}",
+                    onClick = { viewModel.openChat("grp:${g.channel}") },
+                )
+            }
+            item { Spacer(Modifier.height(4.dp)) }
+        }
         if (peers.isEmpty()) {
             item { EmptyState("No peers seen yet.", "Connect and wait for discovery.") }
         } else {
@@ -373,6 +397,31 @@ private fun BroadcastCard(lastPreview: String?, onClick: () -> Unit) {
                     lastPreview ?: "Send to every peer in range",
                     fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupCard(name: String, subtitle: String, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        shape = RoundedCornerShape(16.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier.size(46.dp).clip(CircleShape).background(Palette.Broadcast),
+                contentAlignment = Alignment.Center,
+            ) { Text("👥", fontSize = 20.sp) }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(name, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Palette.TextPrimary)
+                Text(subtitle, fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1)
             }
         }
     }
@@ -586,6 +635,17 @@ private fun ChatDetailScreen(viewModel: DtnViewModel, chatKey: String) {
                 }
                 item { Spacer(Modifier.height(8.dp)) }
             }
+            val composerError by viewModel.composerError.collectAsState()
+            composerError?.let { err ->
+                Text(
+                    err,
+                    color = Palette.Error,
+                    fontSize = 11.sp,
+                    modifier = Modifier.fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .clickable { viewModel.clearComposerError() },
+                )
+            }
             MessageComposer(onSend = { viewModel.sendTestMessage(it) })
         }
     }
@@ -637,38 +697,51 @@ private fun MessageBubble(msg: ChatMessage) {
 @Composable
 private fun MessageComposer(onSend: (String) -> Unit) {
     var text by remember { mutableStateOf("") }
+    val byteLen = remember(text) { text.toByteArray(Charsets.UTF_8).size }
+    val over = byteLen > DtnViewModel.MAX_MSG_BYTES
     Surface(
         color = Palette.CardSurface,
         shadowElevation = 4.dp,
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it },
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message…", fontSize = 14.sp) },
-                singleLine = true,
-                shape = RoundedCornerShape(22.dp),
-                colors = TextFieldDefaults.colors(
-                    focusedContainerColor = Palette.Surface,
-                    unfocusedContainerColor = Palette.Surface,
-                    focusedIndicatorColor = Color.Transparent,
-                    unfocusedIndicatorColor = Color.Transparent,
-                ),
-            )
-            Spacer(Modifier.width(6.dp))
-            FilledIconButton(
-                onClick = {
-                    if (text.isNotBlank()) { onSend(text); text = "" }
-                },
-                colors = IconButtonDefaults.filledIconButtonColors(
-                    containerColor = Palette.Primary, contentColor = Color.White,
-                ),
-                modifier = Modifier.size(46.dp),
-            ) { Icon(Icons.Default.Send, contentDescription = "Send") }
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
+            if (text.isNotEmpty()) {
+                Text(
+                    "$byteLen/${DtnViewModel.MAX_MSG_BYTES} bytes",
+                    fontSize = 10.sp,
+                    color = if (over) Palette.Error else Palette.TextMuted,
+                    modifier = Modifier.padding(start = 12.dp, bottom = 2.dp),
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message…", fontSize = 14.sp) },
+                    singleLine = true,
+                    isError = over,
+                    shape = RoundedCornerShape(22.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Palette.Surface,
+                        unfocusedContainerColor = Palette.Surface,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent,
+                    ),
+                )
+                Spacer(Modifier.width(6.dp))
+                FilledIconButton(
+                    onClick = {
+                        if (text.isNotBlank() && !over) { onSend(text); text = "" }
+                    },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = Palette.Primary, contentColor = Color.White,
+                    ),
+                    modifier = Modifier.size(46.dp),
+                ) { Icon(Icons.Default.Send, contentDescription = "Send") }
+            }
         }
     }
 }

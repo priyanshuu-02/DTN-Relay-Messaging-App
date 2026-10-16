@@ -79,8 +79,10 @@ object DtnWireCodec {
         buffer.putInt(message.originNodeId.toNodeNum32())
         buffer.putInt(message.destinationNodeId.toNodeNum32())
 
-        // TTL in minutes (2 bytes UShort) — convert from ms
-        val ttlMinutes = (message.ttlMs / 60_000L).coerceIn(0, 65535).toInt()
+        // TTL in minutes (2 bytes UShort) — encode the REMAINING ttl so it counts DOWN across
+        // hops and bundles actually expire. (Was message.ttlMs, which reset the clock at every
+        // hop and made bundles effectively immortal.)
+        val ttlMinutes = (message.remainingTtlMs() / 60_000L).coerceIn(0, 65535).toInt()
         buffer.putShort(ttlMinutes.toShort())
 
         // Hop count (1 byte)
@@ -98,8 +100,8 @@ object DtnWireCodec {
         // Fragment total (1 byte)
         buffer.put(message.fragmentTotal.coerceIn(1, 255).toByte())
 
-        // Reserved (1 byte)
-        buffer.put(0x00.toByte())
+        // Flags (1 byte) — crypto suite / version / routing flags (was reserved 0x00)
+        buffer.put((message.flags and 0xFF).toByte())
 
         // Payload
         buffer.put(message.payloadBytes)
@@ -155,8 +157,8 @@ object DtnWireCodec {
         // Fragment total
         val fragmentTotal = buffer.get().toInt() and 0xFF
 
-        // Reserved (skip)
-        buffer.get()
+        // Flags
+        val flags = buffer.get().toInt() and 0xFF
 
         // Remaining bytes = payload
         val payloadSize = wireBytes.size - HEADER_SIZE
@@ -181,6 +183,36 @@ object DtnWireCodec {
             messageType = messageType,
             fragmentIndex = fragmentIndex,
             fragmentTotal = fragmentTotal,
+            flags = flags,
         )
+    }
+
+    /**
+     * The 32-byte header serialised for use as AEAD additional-authenticated-data, with the
+     * mutable fields (ttlMinutes, hopCount) zeroed. Both the sender and every recipient derive
+     * the exact same AAD regardless of how many hops changed the TTL/hop en route, so the
+     * ciphertext stays verifiable end-to-end while relays are still free to decrement TTL/hop.
+     */
+    fun aadHeader(message: DtnMessage): ByteArray {
+        val buffer = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
+        val uuid = uuidOf(message.id)
+        buffer.putLong(uuid.mostSignificantBits)
+        buffer.putLong(uuid.leastSignificantBits)
+        buffer.putInt(message.originNodeId.toNodeNum32())
+        buffer.putInt(message.destinationNodeId.toNodeNum32())
+        buffer.putShort(0)                                   // ttlMinutes masked
+        buffer.put(0)                                        // hopCount masked
+        buffer.put(message.messageType.wireValue)
+        buffer.put(message.channel.coerceIn(0, 255).toByte())
+        buffer.put(message.fragmentIndex.coerceIn(0, 255).toByte())
+        buffer.put(message.fragmentTotal.coerceIn(1, 255).toByte())
+        buffer.put((message.flags and 0xFF).toByte())
+        return buffer.array()
+    }
+
+    private fun uuidOf(id: String): UUID = try {
+        UUID.fromString(id)
+    } catch (e: IllegalArgumentException) {
+        UUID.nameUUIDFromBytes(id.toByteArray(Charsets.UTF_8))
     }
 }

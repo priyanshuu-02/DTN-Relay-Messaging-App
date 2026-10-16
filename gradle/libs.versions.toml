@@ -14,6 +14,12 @@ kotlinxSerializationJson = "1.7.3"
 junit = "4.13.2"
 androidxTestExt = "1.2.1"
 espresso = "3.6.1"
+bouncycastle = "1.78.1"
+zxing = "3.5.3"
+zxingEmbedded = "4.3.0"
+hivemqMqtt = "1.3.3"
+camerax = "1.3.4"
+datastore = "1.1.1"
 
 [libraries]
 hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
@@ -36,6 +42,11 @@ compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling
 activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 hilt-navigation-compose = { group = "androidx.hilt", name = "hilt-navigation-compose", version.ref = "hiltNavigationCompose" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
+bouncycastle = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
+zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxingEmbedded" }
+hivemq-mqtt = { group = "com.hivemq", name = "hivemq-mqtt-client", version.ref = "hivemqMqtt" }
+datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-ext = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExt" }
 androidx-test-espresso = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }

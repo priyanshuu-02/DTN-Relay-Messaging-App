@@ -4,8 +4,14 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.dtn.mesh.crypto.DtnIdentity
+import com.dtn.mesh.crypto.GroupKeyStore
+import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.dao.ContactDao
 import com.dtn.mesh.database.dao.MessageDao
+import com.dtn.mesh.database.entity.ChatMessageEntity
+import com.dtn.mesh.service.OutboundMessageService
+import com.dtn.mesh.settings.SettingsRepository
 import com.dtn.mesh.export.FileExportHelper
 import com.dtn.mesh.export.ResearchExporter
 import com.dtn.mesh.model.DtnMessage
@@ -38,6 +44,11 @@ class DtnViewModel @Inject constructor(
     private val exporter: ResearchExporter,
     private val contactDao: ContactDao,
     private val messageDao: MessageDao,
+    private val chatDao: ChatDao,
+    private val outbound: OutboundMessageService,
+    private val groupKeyStore: GroupKeyStore,
+    private val identity: DtnIdentity,
+    private val settings: SettingsRepository,
     private val lifecycleLog: com.dtn.mesh.service.MessageLifecycleLog,
     private val benchmarkTracker: com.dtn.mesh.learning.BenchmarkTracker,
 ) : AndroidViewModel(application) {
@@ -46,6 +57,10 @@ class DtnViewModel @Inject constructor(
         private const val TAG = "DtnViewModel"
         /** Sentinel string used to represent the "broadcast to everyone" chat in the UI. */
         const val BROADCAST_CHAT_ID = "__broadcast__"
+        /** Default message lifetime (4 hours). */
+        const val DEFAULT_TTL_MS = 4 * 3_600_000L
+        /** Conservative plaintext byte budget shown in the composer (actual check is server-side). */
+        const val MAX_MSG_BYTES = 200
     }
 
     val connectionState: StateFlow<MeshConnectionState> = transport.connectionState
@@ -127,9 +142,38 @@ class DtnViewModel @Inject constructor(
     private val _selectedDestination = MutableStateFlow<String?>(null)
     val selectedDestination: StateFlow<String?> = _selectedDestination.asStateFlow()
 
-    /** All chat messages (sent + received) — used by the Log tab and to compute per-peer views. */
-    private val _receivedMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
-    val receivedMessages: StateFlow<List<ChatMessage>> = _receivedMessages.asStateFlow()
+    /**
+     * All chat messages (sent + received), sourced from the persistent [ChatDao] chat log — the
+     * plaintext conversation store, decoupled from the forwarding buffer. Outgoing messages are
+     * written by [OutboundMessageService]; decrypted inbound messages by [DtnOrchestrator].
+     */
+    val receivedMessages: StateFlow<List<ChatMessage>> = chatDao.observeAll()
+        .map { rows -> rows.map { toChatMessage(it) } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Joined groups for the chat list (channel + name). */
+    val groups: StateFlow<List<GroupInfo>> = groupKeyStore.observeGroups()
+        .map { list -> list.map { GroupInfo(it.channel, it.name) } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Transient composer error (e.g. "no key yet", "too long") for the UI to surface. */
+    private val _composerError = MutableStateFlow<String?>(null)
+    val composerError: StateFlow<String?> = _composerError.asStateFlow()
+    fun clearComposerError() { _composerError.value = null }
+
+    // ── Settings (DataStore-backed) ─────────────────────────────────────────
+    val displayNameSetting: StateFlow<String> = settings.displayName
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+    val internetEnabled: StateFlow<Boolean> = settings.internetEnabled
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+    val brokerUrl: StateFlow<String> = settings.brokerUrl
+        .stateIn(viewModelScope, SharingStarted.Eagerly, SettingsRepository.DEFAULT_BROKER)
+
+    /** My public identity for the QR / safety-number screen. */
+    val myNodeId: String get() = identity.nodeId.value
+    val myFingerprintHex: String get() = identity.fingerprint().joinToString("") { "%02x".format(it) }
+
+    @Volatile private var cachedName: String = ""
 
     /**
      * Messages filtered to the currently selected chat.
@@ -141,7 +185,7 @@ class DtnViewModel @Inject constructor(
      * - No chat open: empty.
      */
     val filteredMessages: StateFlow<List<ChatMessage>> = combine(
-        _receivedMessages,
+        receivedMessages,
         _selectedChat,
     ) { all, selected ->
         when (selected) {
@@ -151,84 +195,39 @@ class DtnViewModel @Inject constructor(
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
-    /** Message ids already displayed as inbound — dedup guard against multi-path/re-flood. */
-    private val seenInboundIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-
-    /** True once the historical chat log has been read from Room. Prevents duplicate rehydration. */
-    @Volatile
-    private var chatHistoryLoaded = false
-
     init {
-        _localNodeId.value = transport.localNodeId?.value
+        _localNodeId.value = identity.nodeId.value
 
-        // NODE events: just refresh our known local id (peer bookkeeping is now DB-driven).
+        // NODE events: log only. Peer bookkeeping + inbound decryption + chat persistence are all
+        // handled in the orchestrator now; the UI just observes the ChatDao / contacts tables.
         viewModelScope.launch {
             transport.nodeEvents.collect { event ->
                 addLog("NODE: ${event.nodeId.value} online=${event.isOnline} rssi=${event.rssi}")
-                _localNodeId.value = transport.localNodeId?.value
             }
         }
 
+        // Hop-level transport ACKs are informational only (never end-to-end delivery proof).
         viewModelScope.launch {
-            transport.inboundMessages.collect { packet ->
-                val msg = packet.message
-
-                // Ignore control-plane bundles (receipts, routing summaries) in the chat UI.
-                if (!msg.messageType.isUserData) return@collect
-
-                // Dedup by message id — the same bundle can physically arrive more than once.
-                if (!seenInboundIds.add(msg.id)) return@collect
-
-                // Only messages addressed to us or broadcast should appear in the chat.
-                val myId = transport.localNodeId?.value
-                val isForMe = myId != null && msg.destinationNodeId.value == myId
-                val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
-                if (!isForMe && !isBroadcast) return@collect
-
-                val text = String(msg.payloadBytes, Charsets.UTF_8)
-                val from = msg.originNodeId.value
-                addLog("RX from ${from.takeLast(8)}: \"$text\"")
-                _receivedMessages.value = _receivedMessages.value + ChatMessage(
-                    msgId = msg.id,
-                    text = text,
-                    from = from,
-                    // For a broadcast toNodeId=null (renders only in broadcast chat). For an
-                    // incoming 1:1, we store the sender as the conversation peer so the filter
-                    // `it.peerOf() == selected` catches it in that peer's 1:1 chat.
-                    toNodeId = if (isBroadcast) null else from,
-                    isOutgoing = false,
-                    status = "✓ received",
-                    time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date()),
-                )
-            }
-        }
-
-        viewModelScope.launch {
-            // Transport-level ACK is per-hop, not end-to-end — we only log it here. A
-            // hop-ACK for a mule-relayed bundle would incorrectly promote the sender's
-            // chat bubble to "delivered", so we DON'T mark UI delivered from this signal.
             transport.deliveryStatus.collect { event ->
                 addLog("ACK: pktId=${event.meshPacketId} status=${event.status}")
             }
         }
 
-        // Real end-to-end delivered signal. Fires when queueManager.markDelivered is called
-        // (direct delivery, broadcast fan-out completes, or a receipt arrives).
+        // End-to-end delivered (receipt arrived / direct delivery) → mark the chat row delivered.
         viewModelScope.launch {
-            queueManager.deliveredIds.collect { msgId -> markChatDeliveredById(msgId) }
+            queueManager.deliveredIds.collect { msgId ->
+                runCatching { chatDao.updateStatus(msgId, ChatMessageEntity.Status.DELIVERED) }
+            }
         }
 
-        // A message left the buffer WITHOUT delivery (TTL expiry, housekeeping drop, or manual
-        // Clear). Flip the stuck chat bubble so it no longer shows "buffered"/"sending…", and for
-        // a manual Clear also emit a DROPPED lifecycle event (expiry/housekeeping drops are
-        // already logged by ForwardingWorker, so we don't double-log those).
+        // A message left the buffer without delivery (TTL expiry / housekeeping / manual clear).
         viewModelScope.launch {
             queueManager.terminalEvents.collect { ev ->
-                val label = when (ev.reason) {
-                    MessageQueueManager.REASON_EXPIRED -> "expired"
-                    else -> "dropped"
+                val status = when (ev.reason) {
+                    MessageQueueManager.REASON_EXPIRED -> ChatMessageEntity.Status.EXPIRED
+                    else -> ChatMessageEntity.Status.DROPPED
                 }
-                markChatTerminalById(ev.msgId, label)
+                runCatching { chatDao.updateStatus(ev.msgId, status) }
                 if (ev.reason == MessageQueueManager.REASON_CLEARED) {
                     lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.DROPPED, ev.msgId,
                         extra = "buffer cleared by user")
@@ -236,46 +235,51 @@ class DtnViewModel @Inject constructor(
             }
         }
 
-        // Load past chat history from DB. We do this once at construction — as soon as we
-        // know our own node id — so previously-exchanged messages survive app restarts.
-        viewModelScope.launch { loadChatHistoryIfPossible() }
+        // Re-announce our identity/keys periodically while connected so newly-met peers can learn
+        // our public keys (and therefore encrypt DMs to us). Announces flood + are TOFU-pinned.
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(120_000L)
+                if (transport.isConnected) runCatching { outbound.sendAnnounce(displayName()) }
+            }
+        }
+
+        // Keep the cached display name in sync so announces use the user's chosen name.
+        viewModelScope.launch { settings.displayName.collect { cachedName = it } }
     }
 
-    /** Load the historical chat view (best-effort — silently no-ops if we don't know our id yet). */
-    private suspend fun loadChatHistoryIfPossible() {
-        if (chatHistoryLoaded) return
-        val myId = transport.localNodeId?.value ?: return
-        val rows = messageDao.getChatHistoryFor(myId)
-        chatHistoryLoaded = true
-        val history = rows.mapNotNull { e ->
-            val text = try { String(e.payload, Charsets.UTF_8) } catch (_: Exception) { return@mapNotNull null }
-            val isOutgoing = e.originNodeId == myId
-            val isBroadcast = e.destinationNodeId == "^all"
-            val peer = when {
-                isBroadcast -> null              // toNodeId=null → lives in the broadcast chat only
-                isOutgoing -> e.destinationNodeId
-                else -> e.originNodeId
-            }
-            val status = when (e.status) {
-                "DELIVERED" -> if (isOutgoing) "✓ delivered" else "✓ received"
-                "BUFFERED", "FORWARDING" -> "buffered"
-                "EXPIRED" -> "expired"
-                "DROPPED" -> "dropped"
-                else -> e.status
-            }
-            ChatMessage(
-                msgId = e.id,
-                text = text,
-                from = if (isOutgoing) "me" else e.originNodeId,
-                toNodeId = peer,
-                isOutgoing = isOutgoing,
-                status = status,
-                time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(e.createdAtMs)),
-            )
+    /** Short human name advertised in our announce: the user-set name, else a node-id short form. */
+    private fun displayName(): String = cachedName.ifBlank { "node-" + identity.nodeId.value.takeLast(4) }
+
+    /** Map a persisted chat row to the UI model. */
+    private fun toChatMessage(e: ChatMessageEntity): ChatMessage {
+        val isOut = e.direction == ChatMessageEntity.Direction.OUT
+        val toNodeId = when {
+            e.convKey.startsWith("grp:") -> e.convKey
+            e.convKey == NodeId.BROADCAST.value -> null
+            else -> e.peerNodeId ?: e.convKey
         }
-        // Mark all as already-seen so we don't re-append duplicates when live inbound flow catches up.
-        for (r in rows) seenInboundIds.add(r.id)
-        _receivedMessages.value = history + _receivedMessages.value
+        return ChatMessage(
+            msgId = e.id,
+            text = e.text,
+            from = if (isOut) "me" else (e.peerNodeId ?: e.convKey),
+            toNodeId = toNodeId,
+            isOutgoing = isOut,
+            status = mapChatStatus(e.status, isOut),
+            time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date(e.createdAtMs)),
+        )
+    }
+
+    private fun mapChatStatus(status: String, isOut: Boolean): String = when (status) {
+        ChatMessageEntity.Status.SENDING -> "sending…"
+        ChatMessageEntity.Status.SENT -> "✓ sent"
+        ChatMessageEntity.Status.BUFFERED -> "buffered"
+        ChatMessageEntity.Status.DELIVERED -> if (isOut) "✓ delivered" else "✓ received"
+        ChatMessageEntity.Status.RECEIVED -> "✓ received"
+        ChatMessageEntity.Status.EXPIRED -> "expired"
+        ChatMessageEntity.Status.DROPPED -> "dropped"
+        ChatMessageEntity.Status.FAILED -> "failed"
+        else -> status
     }
 
     // ── Actions ──────────────────────────────────────────────────────────
@@ -297,9 +301,13 @@ class DtnViewModel @Inject constructor(
                 // calling it too is a harmless no-op.
                 orchestrator.start()
                 addLog("Transports initiated — foreground service running")
-                _localNodeId.value = transport.localNodeId?.value
-                // Now that we (probably) know our id, try loading chat history if init couldn't.
-                loadChatHistoryIfPossible()
+                _localNodeId.value = identity.nodeId.value
+                // Announce our identity/keys so peers can encrypt to us (TOFU pinning on their side).
+                runCatching { outbound.sendAnnounce(displayName()) }
+                // Bring up the internet relay if the user enabled it in settings.
+                if (runCatching { settings.internetEnabledOnce() }.getOrDefault(false)) {
+                    (transport as? com.dtn.mesh.receiver.MultiTransportManager)?.connectInternet()
+                }
             } else {
                 addLog("ERROR: Connection failed")
             }
@@ -396,61 +404,38 @@ class DtnViewModel @Inject constructor(
     }
 
     fun sendTestMessage(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
         viewModelScope.launch {
-            val destKey = _selectedChat.value
-            val dest = when (destKey) {
-                null, BROADCAST_CHAT_ID -> NodeId.BROADCAST
-                else -> NodeId(destKey)
+            val sel = _selectedChat.value
+            val (dest, channel) = when {
+                sel == null || sel == BROADCAST_CHAT_ID -> NodeId.BROADCAST to 0
+                sel.startsWith("grp:") -> NodeId.BROADCAST to (sel.removePrefix("grp:").toIntOrNull() ?: 0)
+                else -> NodeId(sel) to 0
             }
-            val msg = DtnMessage(
-                id = UUID.randomUUID().toString(),
-                originNodeId = transport.localNodeId ?: NodeId.LOCAL,
-                destinationNodeId = dest,
-                payloadBytes = text.toByteArray(Charsets.UTF_8),
-                createdAtMs = System.currentTimeMillis(),
-                ttlMs = 4 * 3_600_000L, // 4 hours
-                messageType = DtnMessageType.DATA,
-            )
-            val stored = queueManager.ingest(msg)
-            if (stored) {
-                val isBroadcast = dest == NodeId.BROADCAST
-                val target = if (isBroadcast) "ALL" else dest.value.takeLast(8)
-                // Label the bubble by whether the destination is reachable RIGHT NOW: a unicast
-                // dest that's a directly-online peer (or, for broadcast, any online peer) will be
-                // delivered within a moment, so it shows "sending…" and then "✓ delivered" — not
-                // the misleading "buffered", which we reserve for messages genuinely held for a
-                // data mule (dest offline). The bundle is still persisted first either way; this
-                // is purely the chat label, not a change to store-carry-forward behaviour.
-                val knownPeers = peerList.value
-                val destReachable = if (isBroadcast) knownPeers.any { it.isOnline }
-                    else knownPeers.any { it.nodeId == dest.value && it.isOnline }
-                val initialStatus = if (destReachable) "sending…" else "buffered"
-                addLog("QUEUED: \"$text\" → $target (${msg.id.take(8)})")
-                lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.CREATED, msg.id,
-                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                    ttlRemainingMs = msg.ttlMs)
-                lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.BUFFERED, msg.id,
-                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value)
-                lifecycleLog.recordAsOrigin(msg.id,
-                    source = msg.originNodeId.value,
-                    dest = msg.destinationNodeId.value,
-                    me = msg.originNodeId.value)
-                _receivedMessages.value = _receivedMessages.value + ChatMessage(
-                    msgId = msg.id,
-                    text = text,
-                    from = "me",
-                    // Broadcast → toNodeId=null (lives only in the broadcast chat).
-                    toNodeId = if (isBroadcast) null else dest.value,
-                    isOutgoing = true,
-                    status = initialStatus,
-                    time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date()),
-                )
-                // Trigger immediate forwarding. Wrapped defensively so a stopped-and-restarted
-                // orchestrator (see restartable channel in DtnOrchestrator) can never crash us.
-                runCatching { orchestrator.triggerFlush() }
-                    .onFailure { Log.e(TAG, "triggerFlush failed", it) }
-            } else {
-                addLog("REJECTED: duplicate or expired")
+            when (val result = outbound.sendText(trimmed, dest, channel, DEFAULT_TTL_MS)) {
+                is OutboundMessageService.Result.Sent -> {
+                    val m = result.message
+                    val target = when {
+                        channel > 0 -> "grp:$channel"
+                        dest == NodeId.BROADCAST -> "ALL"
+                        else -> dest.value.takeLast(8)
+                    }
+                    addLog("QUEUED: \"$trimmed\" → $target (${m.id.take(8)})")
+                    lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.CREATED, m.id,
+                        origin = m.originNodeId.value, dest = m.destinationNodeId.value, ttlRemainingMs = m.ttlMs)
+                    lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.BUFFERED, m.id,
+                        origin = m.originNodeId.value, dest = m.destinationNodeId.value)
+                    lifecycleLog.recordAsOrigin(m.id, source = m.originNodeId.value,
+                        dest = m.destinationNodeId.value, me = m.originNodeId.value)
+                    runCatching { orchestrator.triggerFlush() }.onFailure { Log.e(TAG, "triggerFlush failed", it) }
+                }
+                OutboundMessageService.Result.NoKey ->
+                    _composerError.value = "No encryption key for this contact yet — share your QR or wait for their announce."
+                is OutboundMessageService.Result.TooLong ->
+                    _composerError.value = "Message too long (max ${result.maxBytes} bytes for this chat)."
+                OutboundMessageService.Result.Error ->
+                    _composerError.value = "Could not queue message (duplicate or expired)."
             }
         }
     }
@@ -652,31 +637,103 @@ class DtnViewModel @Inject constructor(
         }
     }
 
-    /**
-     * Flip the outgoing chat bubble with the given DTN message id to "✓ delivered".
-     * Called from the [MessageQueueManager.deliveredIds] observer — never fires for
-     * mule-relayed hops, only for real end-delivery.
-     */
-    private fun markChatDeliveredById(msgId: String) {
-        val list = _receivedMessages.value.toMutableList()
-        val idx = list.indexOfFirst { it.msgId == msgId && it.isOutgoing }
-        if (idx >= 0 && list[idx].status != "✓ delivered") {
-            list[idx] = list[idx].copy(status = "✓ delivered")
-            _receivedMessages.value = list
+    // Chat-bubble status is now driven by the persistent ChatDao log (updated from the
+    // deliveredIds / terminalEvents collectors in init), so the old in-memory bubble mutators
+    // (markChatDeliveredById / markChatTerminalById) are gone.
+
+    // ── Groups ─────────────────────────────────────────────────────────────
+
+    /** Create a new encrypted group; returns the invite string to share (QR). */
+    fun createGroup(name: String, onReady: (String) -> Unit = {}) {
+        viewModelScope.launch {
+            runCatching {
+                val g = groupKeyStore.createGroup(name.ifBlank { "group" })
+                val key = groupKeyStore.key(g.channel) ?: ByteArray(0)
+                val invite = groupKeyStore.inviteString(g.channel, g.name, key)
+                addLog("Created group '${g.name}' on channel ${g.channel}")
+                onReady(invite)
+            }.onFailure { _composerError.value = "Could not create group: ${it.message}" }
         }
     }
 
-    /**
-     * Flip an outgoing chat bubble to a terminal non-delivery status ("expired"/"dropped").
-     * Never overrides a "✓ delivered" bubble — a late terminal event for an already-delivered
-     * message must not undo the delivered state.
-     */
-    private fun markChatTerminalById(msgId: String, label: String) {
-        val list = _receivedMessages.value.toMutableList()
-        val idx = list.indexOfFirst { it.msgId == msgId && it.isOutgoing }
-        if (idx >= 0 && list[idx].status != "✓ delivered" && list[idx].status != label) {
-            list[idx] = list[idx].copy(status = label)
-            _receivedMessages.value = list
+    /** Join a group from a scanned/pasted invite string. */
+    fun joinGroupFromInvite(invite: String, onJoined: (Int) -> Unit = {}) {
+        viewModelScope.launch {
+            val parsed = groupKeyStore.parseInvite(invite.trim())
+            if (parsed == null) { _composerError.value = "Invalid group invite"; return@launch }
+            val (channel, name, key) = parsed
+            runCatching {
+                groupKeyStore.joinGroup(channel, name, key)
+                addLog("Joined group '$name' (channel $channel)")
+                onJoined(channel)
+            }.onFailure { _composerError.value = "Could not join group: ${it.message}" }
+        }
+    }
+
+    /** Invite string for an existing group (for re-sharing). */
+    fun groupInvite(channel: Int, onReady: (String?) -> Unit) {
+        viewModelScope.launch {
+            val g = groupKeyStore.groups().firstOrNull { it.channel == channel }
+            val key = groupKeyStore.key(channel)
+            onReady(if (g != null && key != null) groupKeyStore.inviteString(channel, g.name, key) else null)
+        }
+    }
+
+    // ── Identity QR (exchange keys in person without waiting for an announce) ──
+
+    /** Our identity QR payload: node id + public keys + name, so a contact can pin us directly. */
+    fun identityQrString(): String {
+        val x = android.util.Base64.encodeToString(identity.xPub, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+        val ed = android.util.Base64.encodeToString(identity.edPub, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+        return "dtnid:1:$x:$ed:${displayName()}"
+    }
+
+    /** Pin a contact from their scanned identity QR (marks them verified). Returns their node id. */
+    fun importContactQr(text: String, onDone: (String?) -> Unit) {
+        viewModelScope.launch {
+            val node = runCatching {
+                require(text.startsWith("dtnid:1:"))
+                val parts = text.removePrefix("dtnid:1:").split(":", limit = 3)
+                val xPub = android.util.Base64.decode(parts[0], android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                val edPub = android.util.Base64.decode(parts[1], android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+                val name = parts.getOrNull(2) ?: ""
+                require(xPub.size == 32 && edPub.size == 32)
+                val nodeId = NodeId.fromNodeNum(com.dtn.mesh.crypto.DtnCrypto.deriveNodeNum(xPub, edPub))
+                contactDao.insertIfNew(com.dtn.mesh.database.entity.ContactEntity(nodeId = nodeId.value))
+                contactDao.updateKeys(nodeId.value, xPub, edPub, name, System.currentTimeMillis())
+                contactDao.setKeyVerified(nodeId.value, true)
+                if (name.isNotBlank()) contactDao.updateCustomName(nodeId.value, name)
+                addLog("Verified contact ${nodeId.value.takeLast(8)} ($name) from QR")
+                nodeId.value
+            }.getOrNull()
+            if (node == null) _composerError.value = "Invalid contact QR"
+            onDone(node)
+        }
+    }
+
+    // ── Settings actions ─────────────────────────────────────────────────────
+
+    fun setDisplayName(name: String) {
+        viewModelScope.launch {
+            settings.setDisplayName(name)
+            if (transport.isConnected) runCatching { outbound.sendAnnounce(name.ifBlank { displayName() }) }
+        }
+    }
+
+    fun setBrokerUrl(url: String) { viewModelScope.launch { settings.setBrokerUrl(url.trim()) } }
+
+    fun setInternetEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            settings.setInternetEnabled(enabled)
+            val mgr = transport as? com.dtn.mesh.receiver.MultiTransportManager
+            if (enabled) {
+                addLog("Internet relay: connecting…")
+                val ok = mgr?.connectInternet() ?: false
+                addLog(if (ok) "Internet relay connected" else "Internet relay failed to connect")
+            } else {
+                mgr?.disconnectInternet()
+                addLog("Internet relay disconnected")
+            }
         }
     }
 
@@ -708,6 +765,9 @@ data class ChatMessage(
     /** The "other side" of this chat — used by [DtnViewModel.filteredMessages]. */
     fun peerOf(): String? = toNodeId
 }
+
+/** A joined group/channel shown in the chat list. */
+data class GroupInfo(val channel: Int, val name: String)
 
 /** A peer we've seen. Sourced from the Room contacts table so it survives app restarts. */
 data class PeerInfo(

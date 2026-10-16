@@ -198,4 +198,31 @@ interface ContactDao {
      */
     @Query("UPDATE contacts SET last_rssi = :rssi, last_snr = :snr WHERE node_id = :nodeId")
     suspend fun updateSignal(nodeId: String, rssi: Int, snr: Float)
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Cryptographic identity (keys learned from signed announces)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Pin a peer's public keys on first sight (trust-on-first-use). `key_first_seen_ms` is only
+     * set the first time. Does NOT overwrite the `key_verified` flag. Caller must ensure the
+     * announce's node-id binding was already validated.
+     */
+    @Query("""
+        UPDATE contacts SET
+            x_pub = :xPub,
+            ed_pub = :edPub,
+            announce_name = :name,
+            key_first_seen_ms = CASE WHEN key_first_seen_ms = 0 THEN :nowMs ELSE key_first_seen_ms END
+        WHERE node_id = :nodeId
+    """)
+    suspend fun updateKeys(nodeId: String, xPub: ByteArray?, edPub: ByteArray?, name: String?, nowMs: Long)
+
+    /** Mark a contact's keys as user-verified (safety number / QR), or clear verification. */
+    @Query("UPDATE contacts SET key_verified = :verified WHERE node_id = :nodeId")
+    suspend fun setKeyVerified(nodeId: String, verified: Boolean)
+
+    /** Contacts for which we hold an X25519 key (can encrypt to). */
+    @Query("SELECT * FROM contacts WHERE x_pub IS NOT NULL")
+    suspend fun getContactsWithKeys(): List<ContactEntity>
 }
