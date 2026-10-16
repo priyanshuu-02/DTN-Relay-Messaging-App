@@ -741,3 +741,58 @@ second "Intermediate half" checkpoint.
 - targetSdk 36 / AGP upgrade (only for a Play release); split `MainScreen.kt`; full dark theme.
 - On-device end-to-end test (needs the user: tap Connect, approve the WiFi dialog, a second phone).
 - Tombstones (F.4), reconnect (F.5), migration (F.6), fragmentation (F.8) are now DONE.
+
+---
+
+# PART G — 2026-10-16 (cont.): announce-buffer bloat fix + on-device connect findings
+
+On-device bring-up (1 phone + both Heltec hubs over USB). Hub A OLED read `ph:1 hub:1` once the
+phone joined; build green, 59 unit tests still pass. The fixes below are **query/logic only — no
+entity/schema change**, so Room's identity hash is unchanged and reinstalling does NOT wipe the DB.
+
+## G.1 Bug — the forwarding buffer grew ~1/min with "broadcast messages" the user never sent
+- **Reported symptom.** With a single phone connected (no second phone), the buffer count climbed by
+  one every minute or two; a "broadcast message" kept appearing in the buffer/Network view. Chat
+  history was actually empty.
+- **Root cause (confirmed by pulling the live Room DB via `run-as`).** Every buffered row was a
+  `ANNOUNCE` originating from the phone itself (`!99a9769a`), dest `^all`, one per ~120 s. The periodic
+  identity re-announce in `DtnViewModel` (so newly-met peers can TOFU-pin our keys) ingests each
+  announce into the store-carry-forward buffer for epidemic relay. With no peer to hand them to and no
+  supersede rule, every re-announce added a new buffered bundle (TTL-capped at ~5–6 live), and the
+  user-visible buffer count/list showed this control traffic as mystery broadcasts.
+
+## G.2 Fix
+- **Supersede stale announces** (`MessageDao.supersedeAnnounces`, wired in `MessageQueueManager.ingest`):
+  when a fresh `ANNOUNCE` is stored, that origin's previous active announces are hard-DELETEd (keys are
+  identical; only the newest needs relaying). Keeps at most one announce per node in the buffer. Applies
+  to announces received from other nodes too (one per origin), not just our own.
+- **Hide control traffic from the UI** (`MessageDao.observeBufferedCount` / `observeBufferedMessages`):
+  both now filter `message_type = 'DATA'`, so the "Buffer N" badge and Network list reflect only real
+  user messages. Control bundles still live in the buffer for the protocol; the orchestrator's relay
+  path (`getAllBuffered`) is unchanged.
+- **Eased cadence** (`DtnViewModel`): re-announce every **5 min** (was 2), well inside the 10-min
+  announce TTL — less LoRa airtime, same key propagation.
+- **Verified against the real pulled DB:** DATA-only buffered count = 0 (was showing the announces);
+  the supersede DELETE collapses 6 active announces → 1. Build green, 59 tests pass, APK reinstalled
+  and launched clean (no DB wipe).
+
+## G.3 On-device connect findings (behaviour notes, not code changes)
+- **LoRa hub join is a WiFi SoftAP step, easy to miss.** Pressing **Connect** fires a one-shot
+  `WifiNetworkSpecifier` request for SSID prefix `DTN-HUB-`; Android shows a system "connect to
+  DTN-HUB-xxxx?" dialog that must be approved. On API 29+ the app binds only to that requested network
+  (a manual join from system WiFi settings is NOT picked up). If the dialog is dismissed, the hub stays
+  at `ph:0` and the app sits on "Connecting…". Re-trigger via Disconnect→Connect. Nearby-devices +
+  location permissions must be granted or the dialog never appears.
+- **"Connected" badge = local mesh radios only** (BLE / WiFi Direct / LoRa hub). The internet (MQTT)
+  relay is a separate opt-in toggle and deliberately does not change that badge.
+
+## G.4 Newly opened / still deferred
+- **Dedicated "Connect to Hub" button + hub-connected indicator.** `connectHubOnly()` exists in the
+  ViewModel but isn't surfaced as its own button; the hub join currently rides the main Connect. A
+  dedicated, retryable control would remove the "stuck on Connecting" confusion.
+- **Namespace the MQTT broadcast topic.** The internet relay publishes/subscribes `dtn/v1/bcast` on the
+  public `broker.hivemq.com`, a globally shared topic — fine for testing, but anyone on that broker can
+  see ciphertext/headers or inject broadcasts. Namespace (or move to the planned private relay) before
+  real use. `No-Local` is also not set, so the origin receives its own publish back (currently harmless:
+  deduped by message id in the orchestrator).
+- Everything in F.9 that was still open remains open.

@@ -50,14 +50,23 @@ interface MessageDao {
         status: String = MessageStatus.BUFFERED,
     ): List<MessageEntity>
 
-    /** Reactive flow of buffered message count (for UI / buffer pressure monitoring). */
-    @Query("SELECT COUNT(*) FROM messages WHERE status = '${MessageStatus.BUFFERED}'")
+    /**
+     * Reactive flow of buffered message count (for the UI "Buffer N" badge).
+     * Counts only user DATA — control bundles (ANNOUNCE key-gossip, routing acks) live in the
+     * same buffer for relay but are not user-visible traffic, so they must not inflate the badge.
+     */
+    @Query("SELECT COUNT(*) FROM messages WHERE status = '${MessageStatus.BUFFERED}' AND message_type = 'DATA'")
     fun observeBufferedCount(): Flow<Int>
 
-    /** Reactive flow of all currently-buffered message entities (for the Network tab). */
+    /**
+     * Reactive flow of currently-buffered message entities (for the Network tab list).
+     * DATA only — see [observeBufferedCount]; the periodic identity ANNOUNCE would otherwise
+     * show up as a stream of mystery "broadcast" rows the user never sent.
+     */
     @Query("""
         SELECT * FROM messages 
         WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+          AND message_type = 'DATA'
         ORDER BY received_at_ms DESC
     """)
     fun observeBufferedMessages(): Flow<List<MessageEntity>>
@@ -116,6 +125,23 @@ interface MessageDao {
     /** Check if a message ID already exists (deduplication check without full insert). */
     @Query("SELECT COUNT(*) FROM messages WHERE id = :messageId")
     suspend fun existsById(messageId: String): Boolean
+
+    /**
+     * Supersede older identity announces from one origin. A node re-announces the same public
+     * keys periodically so newly-met peers can learn them (TOFU); only the newest copy is useful,
+     * so when a fresh ANNOUNCE lands we hard-delete that origin's previous active announces. This
+     * keeps at most one announce per node in the relay buffer instead of accumulating one every
+     * re-announce interval (which, with no peer to hand them to, grew the buffer without bound).
+     * DELETE (not mark-dropped) because announces are ephemeral control traffic, not user messages.
+     */
+    @Query("""
+        DELETE FROM messages
+        WHERE message_type = 'ANNOUNCE'
+          AND origin_node_id = :origin
+          AND id != :keepId
+          AND status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+    """)
+    suspend fun supersedeAnnounces(origin: String, keepId: String)
 
     // ──────────────────────────────────────────────────────────────────────
     // Status transitions

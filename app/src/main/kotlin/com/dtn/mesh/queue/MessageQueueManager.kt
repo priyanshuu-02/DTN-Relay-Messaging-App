@@ -78,7 +78,15 @@ class MessageQueueManager @Inject constructor(
 
         val entity = toEntity(message)
         val rowId = messageDao.insert(entity)
-        return rowId != -1L
+        val stored = rowId != -1L
+
+        // A fresh identity announce supersedes any older announce from the same node: the keys are
+        // identical and only the newest needs relaying, so we drop that origin's stale copies.
+        // Without this, a node's periodic re-announce piled up one buffered bundle per interval.
+        if (stored && message.messageType == com.dtn.mesh.model.DtnMessageType.ANNOUNCE) {
+            messageDao.supersedeAnnounces(message.originNodeId.value, message.id)
+        }
+        return stored
     }
 
     // ──────────────────────────────────────────────────────────────────────

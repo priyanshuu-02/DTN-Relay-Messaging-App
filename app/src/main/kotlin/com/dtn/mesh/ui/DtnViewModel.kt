@@ -237,9 +237,13 @@ class DtnViewModel @Inject constructor(
 
         // Re-announce our identity/keys periodically while connected so newly-met peers can learn
         // our public keys (and therefore encrypt DMs to us). Announces flood + are TOFU-pinned.
+        // Each re-announce supersedes our previous one in the buffer (MessageDao.supersedeAnnounces),
+        // so this refreshes the single buffered copy rather than stacking up. Kept well inside the
+        // 10-min announce TTL; 5 min trades a little key-propagation latency for much less LoRa
+        // airtime than the old 2-min cadence.
         viewModelScope.launch {
             while (true) {
-                kotlinx.coroutines.delay(120_000L)
+                kotlinx.coroutines.delay(5 * 60_000L)
                 if (transport.isConnected) runCatching { outbound.sendAnnounce(displayName()) }
             }
         }
