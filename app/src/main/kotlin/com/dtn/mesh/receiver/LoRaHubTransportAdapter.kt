@@ -89,6 +89,8 @@ class LoRaHubTransportAdapter @Inject constructor(
     private var boundNetwork: Network? = null
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
+    @Volatile private var wantConnection = false
+    private var connectionJob: kotlinx.coroutines.Job? = null
 
     /** The hub's node id, learned from its HELLO frame. Null until connected. */
     private var hubNodeId: NodeId? = null
@@ -122,17 +124,19 @@ class LoRaHubTransportAdapter @Inject constructor(
 
     override suspend fun connect(): Boolean {
         if (isConnected) return true
+        wantConnection = true
         _connectionState.value = MeshConnectionState.CONNECTING
 
         try {
-            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                requestHubNetwork()
-                true // async — CONNECTED is reported from the network callback
-            } else {
-                // Legacy: assume user joined the hub WiFi manually; connect on the active network.
-                scope.launch { openSocketAndRun(network = null) }
-                true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                requestHubNetwork() // learns the hub's WiFi Network via the callback
             }
+            // One supervised reconnect loop serves both the API-29 specifier path and the legacy
+            // manual-join path, retrying with exponential backoff whenever the socket drops.
+            if (connectionJob?.isActive != true) {
+                connectionJob = scope.launch { hubConnectionLoop() }
+            }
+            return true
         } catch (e: SecurityException) {
             Log.e(TAG, "LoRa Hub permission missing: ${e.message}")
             _connectionState.value = MeshConnectionState.DISCONNECTED
@@ -147,6 +151,9 @@ class LoRaHubTransportAdapter @Inject constructor(
     }
 
     override fun disconnect() {
+        wantConnection = false
+        runCatching { connectionJob?.cancel() }
+        connectionJob = null
         _connectionState.value = MeshConnectionState.DISCONNECTED
         runCatching { socket?.close() }
         socket = null
@@ -156,6 +163,40 @@ class LoRaHubTransportAdapter @Inject constructor(
         networkCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
         networkCallback = null
         boundNetwork = null
+    }
+
+    /**
+     * Keeps a connection to the hub while [wantConnection] holds: (re)connects, registers, pumps
+     * the read loop until the socket drops, then backs off and retries. Waits for [boundNetwork]
+     * (set by the WiFi specifier callback) on API 29+; uses the active network on legacy.
+     */
+    private suspend fun hubConnectionLoop() {
+        val legacy = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+        var backoff = 1_000L
+        while (wantConnection) {
+            val net = boundNetwork
+            if (net == null && !legacy) { kotlinx.coroutines.delay(1_000L); continue } // wait for hub WiFi
+            try {
+                val sock = (net?.socketFactory?.createSocket() ?: Socket()).also { it.tcpNoDelay = true }
+                sock.connect(InetSocketAddress(HUB_IP, HUB_PORT), CONNECT_TIMEOUT_MS)
+                socket = sock
+                output = DataOutputStream(sock.getOutputStream())
+                // Announce ourselves so the hub can route bundles back to us (+ replay buffered ones).
+                writeFrameBlocking(FRAME_REGISTER, int32(identity.nodeNum32))
+                _connectionState.value = MeshConnectionState.CONNECTED
+                backoff = 1_000L
+                Log.i(TAG, "Connected to hub at $HUB_IP:$HUB_PORT as ${identity.nodeId}")
+                readLoop(DataInputStream(sock.getInputStream())) // blocks until the socket drops
+            } catch (e: Exception) {
+                Log.w(TAG, "Hub connect/read failed: ${e.message}")
+            }
+            _connectionState.value = MeshConnectionState.DISCONNECTED
+            runCatching { socket?.close() }; socket = null; output = null
+            hubNodeId?.let { emitHubEncounter(it, online = false) }; hubNodeId = null
+            if (!wantConnection) break
+            kotlinx.coroutines.delay(backoff)
+            backoff = (backoff * 2).coerceAtMost(30_000L)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -174,12 +215,12 @@ class LoRaHubTransportAdapter @Inject constructor(
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "Hub WiFi available")
-                boundNetwork = network
-                scope.launch { openSocketAndRun(network) }
+                boundNetwork = network // the reconnect loop picks this up and (re)connects
             }
 
             override fun onLost(network: Network) {
                 Log.w(TAG, "Hub WiFi lost")
+                boundNetwork = null // the loop will wait until the hub WiFi returns
                 _connectionState.value = MeshConnectionState.DISCONNECTED
                 runCatching { socket?.close() }
                 socket = null; output = null
@@ -197,28 +238,6 @@ class LoRaHubTransportAdapter @Inject constructor(
     }
 
     // ── Socket + read loop ───────────────────────────────────────────────
-
-    private fun openSocketAndRun(network: Network?) {
-        try {
-            val sock = (network?.socketFactory?.createSocket() ?: Socket()).also { it.tcpNoDelay = true }
-            sock.connect(InetSocketAddress(HUB_IP, HUB_PORT), CONNECT_TIMEOUT_MS)
-            socket = sock
-            output = DataOutputStream(sock.getOutputStream())
-
-            // Announce ourselves so the hub can route bundles back to us.
-            writeFrameBlocking(FRAME_REGISTER, int32(identity.nodeNum32))
-
-            _connectionState.value = MeshConnectionState.CONNECTED
-            Log.i(TAG, "Connected to hub at $HUB_IP:$HUB_PORT as ${identity.nodeId}")
-
-            readLoop(DataInputStream(sock.getInputStream()))
-        } catch (e: Exception) {
-            Log.e(TAG, "Hub connect/read failed", e)
-            _connectionState.value = MeshConnectionState.DISCONNECTED
-            runCatching { socket?.close() }
-            socket = null; output = null
-        }
-    }
 
     private fun readLoop(input: DataInputStream) {
         while (socket?.isClosed == false) {
@@ -240,7 +259,9 @@ class LoRaHubTransportAdapter @Inject constructor(
                 }
                 FRAME_BUNDLE -> {
                     val msg = DtnWireCodec.decode(payload, rssi = -40, snr = 15f) ?: continue
-                    _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel))
+                    // The hub is our immediate previous hop — attribute it so the orchestrator's
+                    // reverse-echo suppression and 1-hop routing-summary trust apply to hub traffic.
+                    _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = hubNodeId))
                 }
                 else -> Log.d(TAG, "Unknown frame type $type")
             }

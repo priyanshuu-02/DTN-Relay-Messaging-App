@@ -7,8 +7,10 @@ import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.dao.ContactDao
 import com.dtn.mesh.database.dao.EncounterDao
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
+import com.dtn.mesh.database.dao.SeenBundleDao
 import com.dtn.mesh.database.entity.ChatMessageEntity
 import com.dtn.mesh.database.entity.ContactEntity
+import com.dtn.mesh.database.entity.SeenBundleEntity
 import com.dtn.mesh.database.entity.EncounterEntity
 import com.dtn.mesh.database.entity.ForwardingDecisionEntity
 import com.dtn.mesh.learning.DoubleQLearningEngine
@@ -66,6 +68,7 @@ class DtnOrchestrator @Inject constructor(
     private val qEngine: DoubleQLearningEngine,
     private val contactDao: ContactDao,
     private val chatDao: ChatDao,
+    private val seenBundleDao: SeenBundleDao,
     private val envelope: EnvelopeService,
     private val encounterDao: EncounterDao,
     private val decisionDao: ForwardingDecisionDao,
@@ -75,6 +78,8 @@ class DtnOrchestrator @Inject constructor(
 ) {
     companion object {
         private const val TAG = "DtnOrchestrator"
+        /** How long a dedup tombstone is kept for a message with no known absolute expiry. */
+        private const val TOMBSTONE_RETENTION_MS = 24L * 3_600_000L
         /** Each UUID = 16 bytes; max receipts per bundle = MAX_SINGLE_PACKET_PAYLOAD / 16. */
         private const val UUID_BYTES = 16
         private const val MAX_RECEIPTS_PER_BUNDLE = DtnMessage.MAX_SINGLE_PACKET_PAYLOAD / UUID_BYTES // 13
@@ -156,6 +161,9 @@ class DtnOrchestrator @Inject constructor(
      * our buffer.
      */
     private val receivedFrom = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Reassembles multi-fragment messages for THIS node, keyed by canonical parent id. */
+    private val reassembler = FragmentReassembler()
 
     /** "$msgId|$peer" → last time we recorded a Q-learning decision, to throttle table growth. */
     private val qLogged = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -243,7 +251,22 @@ class DtnOrchestrator @Inject constructor(
         sc.launch { transport.deliveryStatus.collect { ch.trySend(OrchestratorEvent.Status(it)) } }
         // A buffered message that expired / was dropped / cleared is gone — drop its per-message
         // send-tracking so the sentTo map doesn't leak entries for messages we'll never resend.
-        sc.launch { queueManager.terminalEvents.collect { forgetSentTo(it.msgId) } }
+        sc.launch {
+            queueManager.terminalEvents.collect { ev ->
+                forgetSentTo(ev.msgId)
+                // Tombstone messages that reached a definitive end so a late re-flood can't
+                // resurrect them after the buffer row is purged. Pressure drops are transient
+                // (the message may still be deliverable elsewhere) so they get NO tombstone.
+                val now = System.currentTimeMillis()
+                when (ev.reason) {
+                    MessageQueueManager.REASON_EXPIRED ->
+                        rememberTombstone(ev.msgId, "", "", SeenBundleEntity.Status.EXPIRED, now + TOMBSTONE_RETENTION_MS)
+                    MessageQueueManager.REASON_CLEARED ->
+                        rememberTombstone(ev.msgId, "", "", SeenBundleEntity.Status.DROPPED, now + TOMBSTONE_RETENTION_MS)
+                    else -> { /* pressure drop — re-acceptable, no tombstone */ }
+                }
+            }
+        }
         // Proactive short-interval flush so buffered messages reach online peers promptly
         // instead of waiting for the next (debounced/suppressed) encounter event.
         sc.launch {
@@ -840,18 +863,27 @@ class DtnOrchestrator @Inject constructor(
         val isForMe = myId != null && msg.destinationNodeId.value == myId
         val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
 
+        // Resurrection guard: a terminal tombstone (delivered / expired / dropped) means we are
+        // done with this id — don't re-accept a late or re-flooded copy even though the forwarding
+        // buffer row may have been purged. A delivered DM still re-pushes its receipt so the sender
+        // can clear its own copy.
+        runCatching { seenBundleDao.get(msg.id) }.getOrNull()?.let { tomb ->
+            when (tomb.status) {
+                SeenBundleEntity.Status.DELIVERED -> { if (isForMe) requestFlush(); return }
+                SeenBundleEntity.Status.EXPIRED, SeenBundleEntity.Status.DROPPED -> return
+                else -> { /* SEEN — fall through */ }
+            }
+        }
+
         if (isForMe) {
             // UNICAST TO US — decrypt, show in chat, acknowledge end-to-end.
             val stored = queueManager.ingest(msg)
             if (stored) {
-                val text = envelope.open(msg)
-                if (text != null) {
-                    persistInboundChat(msg, text, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
-                } else {
-                    Log.w(TAG, "RX-MINE undecryptable ${msg.id.take(8)} — no key for ${msg.originNodeId.value.takeLast(8)} yet?")
-                }
+                openAndPersistInbound(msg, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // propagate an end-to-end receipt
+                rememberTombstone(msg.id, msg.originNodeId.value, msg.destinationNodeId.value,
+                    SeenBundleEntity.Status.DELIVERED, msg.createdAtMs + msg.ttlMs)
                 benchmark.recordDelivery(strategySelector.name, msg.hopCount,
                     System.currentTimeMillis() - msg.createdAtMs)
                 resolveRewardDelivered(msg.id, packet.viaPeer?.value)
@@ -884,15 +916,11 @@ class DtnOrchestrator @Inject constructor(
             // hubs drop the broadcast after the first receiver got it.)
             val stored = queueManager.ingest(msg)
             if (stored) {
-                val text = envelope.open(msg) // suite-0 plaintext, or suite-2 group if we're a member
-                if (text != null) {
-                    val group = msg.channel > 0
-                    persistInboundChat(
-                        msg, text,
-                        convKey = if (group) "grp:${msg.channel}" else NodeId.BROADCAST.value,
-                        peer = null,
-                    )
-                }
+                openAndPersistInbound(
+                    msg,
+                    convKey = if (msg.channel > 0) "grp:${msg.channel}" else NodeId.BROADCAST.value,
+                    peer = null,
+                )
                 lifecycle.recordIncoming(
                     msgId = msg.id, source = msg.originNodeId.value, dest = "^all",
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
@@ -936,17 +964,75 @@ class DtnOrchestrator @Inject constructor(
         Log.i(TAG, "ANNOUNCE pinned keys for ${msg.originNodeId.value.takeLast(8)} (${announce.name})")
     }
 
+    /**
+     * Decrypt an inbound DATA bundle addressed to us (or a group we're in) and persist it to the
+     * chat log, reassembling multi-fragment messages by their canonical parent id first. Byte-exact
+     * reassembly (decode to text only after joining all chunks) keeps multi-byte UTF-8 chars intact
+     * when a character straddles a fragment boundary.
+     */
+    private suspend fun openAndPersistInbound(msg: DtnMessage, convKey: String, peer: String?) {
+        val bytes = envelope.openBytes(msg) ?: run {
+            Log.w(TAG, "RX undecryptable ${msg.id.take(8)} (no key / not a group member?)")
+            return
+        }
+        if (msg.fragmentTotal <= 1) {
+            persistInboundChat(msg.id, msg.channel, convKey, peer, String(bytes, Charsets.UTF_8))
+            return
+        }
+        val parentKey = com.dtn.mesh.crypto.Fragmenter.canonicalParent(msg.id)
+        val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return
+        persistInboundChat(parentKey, msg.channel, convKey, peer, String(full, Charsets.UTF_8))
+    }
+
     /** Persist a decrypted inbound message into the user-visible chat log (dedup-by-id via REPLACE). */
-    private suspend fun persistInboundChat(msg: DtnMessage, text: String, convKey: String, peer: String?) {
+    private suspend fun persistInboundChat(id: String, channel: Int, convKey: String, peer: String?, text: String) {
         runCatching {
             chatDao.upsert(
                 ChatMessageEntity(
-                    id = msg.id, convKey = convKey, peerNodeId = peer, channel = msg.channel,
+                    id = id, convKey = convKey, peerNodeId = peer, channel = channel,
                     direction = ChatMessageEntity.Direction.IN, text = text,
                     status = ChatMessageEntity.Status.RECEIVED, createdAtMs = System.currentTimeMillis(),
                 ),
             )
         }.onFailure { Log.w(TAG, "persist inbound chat failed", it) }
+    }
+
+    /** In-memory reassembly of multi-fragment messages, bounded by a 10-minute timeout. */
+    private class FragmentReassembler {
+        private class Pending(val total: Int) {
+            val chunks = HashMap<Int, ByteArray>()
+            val firstMs = System.currentTimeMillis()
+        }
+        private val pending = java.util.concurrent.ConcurrentHashMap<String, Pending>()
+
+        @Synchronized
+        fun add(parentKey: String, index: Int, total: Int, chunk: ByteArray): ByteArray? {
+            prune()
+            val p = pending.getOrPut(parentKey) { Pending(total) }
+            p.chunks[index] = chunk
+            if (p.chunks.size < p.total) return null
+            pending.remove(parentKey)
+            val out = java.io.ByteArrayOutputStream()
+            for (i in 0 until p.total) out.write(p.chunks[i] ?: return null)
+            return out.toByteArray()
+        }
+
+        private fun prune() {
+            val cutoff = System.currentTimeMillis() - 600_000L
+            pending.entries.removeAll { it.value.firstMs < cutoff }
+        }
+    }
+
+    /** Record a dedup/terminal tombstone so a late re-flood of [id] can't resurrect the message. */
+    private suspend fun rememberTombstone(id: String, origin: String, dest: String, status: String, expiresAtMs: Long) {
+        runCatching {
+            seenBundleDao.upsert(
+                SeenBundleEntity(
+                    messageId = id, originNodeId = origin, destinationNodeId = dest,
+                    status = status, expiresAtMs = expiresAtMs,
+                ),
+            )
+        }.onFailure { Log.w(TAG, "tombstone write failed for ${id.take(8)}", it) }
     }
 
     // ══════════════════════════════════════════════════════════════════════

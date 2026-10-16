@@ -48,7 +48,7 @@ class ProphetStrategy(
      * P(local, peer) — our own delivery predictability vector.
      * Key is peer NodeId string. Values are always in [0, 1].
      */
-    private val pTable: MutableMap<String, Double> = mutableMapOf()
+    private val pTable: MutableMap<String, Double> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * Stability-Aware state (only used when [ProphetConfig.stabilityAware] is true):
@@ -57,11 +57,11 @@ class ProphetStrategy(
      * modulates the encounter boost — rewarding durable, reliable contacts instead of a
      * single lucky close ping, and never saturating P to 1.0 from one encounter.
      */
-    private val emaRssi: MutableMap<String, Double> = mutableMapOf()
-    private val encounterCounts: MutableMap<String, Int> = mutableMapOf()
+    private val emaRssi: MutableMap<String, Double> = java.util.concurrent.ConcurrentHashMap()
+    private val encounterCounts: MutableMap<String, Int> = java.util.concurrent.ConcurrentHashMap()
 
     /** Last encounter time per peer (epoch ms) — drives the RFC 6693 adaptive encounter weight. */
-    private val lastEncounterMs: MutableMap<String, Long> = mutableMapOf()
+    private val lastEncounterMs: MutableMap<String, Long> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * Cached P-vectors reported *by* each peer during routing-summary exchange.
@@ -69,7 +69,7 @@ class ProphetStrategy(
      * forwarding to decide whether peer j is a better carrier for a given destination
      * than we are. Entries stay until overwritten by a fresher summary from j.
      */
-    private val peerPTables: MutableMap<String, MutableMap<String, Double>> = mutableMapOf()
+    private val peerPTables: MutableMap<String, MutableMap<String, Double>> = java.util.concurrent.ConcurrentHashMap()
 
     /** Timestamp of last aging pass (epoch ms). */
     private var lastAgedAtMs: Long = System.currentTimeMillis()

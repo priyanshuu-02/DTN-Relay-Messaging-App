@@ -3,6 +3,7 @@ package com.dtn.mesh.service
 import com.dtn.mesh.crypto.Announce
 import com.dtn.mesh.crypto.DtnIdentity
 import com.dtn.mesh.crypto.EnvelopeService
+import com.dtn.mesh.crypto.Fragmenter
 import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.entity.ChatMessageEntity
 import com.dtn.mesh.model.DtnMessage
@@ -42,53 +43,63 @@ class OutboundMessageService @Inject constructor(
      * @param channel 0 for DM/broadcast, >0 for a group channel.
      */
     suspend fun sendText(text: String, dest: NodeId, channel: Int, ttlMs: Long): Result {
-        val id = UUID.randomUUID().toString()
-        val sealed = envelope.sealText(text, id, identity.nodeId, dest, channel)
-        val (payload, flags) = when (sealed) {
-            is EnvelopeService.Sealed.Ok -> sealed.payload to sealed.flags
-            EnvelopeService.Sealed.NoKey -> return Result.NoKey
-            is EnvelopeService.Sealed.TooLong -> return Result.TooLong(sealed.maxBytes)
-        }
         val now = System.currentTimeMillis()
-        val msg = DtnMessage(
-            id = id,
-            originNodeId = identity.nodeId,
-            destinationNodeId = dest,
-            payloadBytes = payload,
-            createdAtMs = now,
-            ttlMs = ttlMs,
-            messageType = DtnMessageType.DATA,
-            channel = channel,
-            flags = flags,
-        )
         val isBroadcast = dest == NodeId.BROADCAST
         val convKey = when {
             channel > 0 -> "grp:$channel"
             isBroadcast -> NodeId.BROADCAST.value
             else -> dest.value
         }
-        // DMs await an end-to-end receipt (SENDING → DELIVERED). Broadcast/group have no receipt,
-        // so they are shown as SENT immediately once queued/flooded.
-        val initialStatus = if (channel > 0 || isBroadcast) {
-            ChatMessageEntity.Status.SENT
-        } else {
-            ChatMessageEntity.Status.SENDING
+        val peer = if (channel > 0 || isBroadcast) null else dest.value
+        val plain = text.toByteArray(Charsets.UTF_8)
+        val budget = envelope.maxPlaintextBytes(dest, channel)
+
+        // ── Single frame (the common case) ──
+        if (plain.size <= budget) {
+            val id = UUID.randomUUID().toString()
+            val (payload, flags) = when (val s = envelope.sealBytes(plain, id, identity.nodeId, dest, channel, 0, 1)) {
+                is EnvelopeService.Sealed.Ok -> s.payload to s.flags
+                EnvelopeService.Sealed.NoKey -> return Result.NoKey
+                is EnvelopeService.Sealed.TooLong -> return Result.TooLong(s.maxBytes)
+            }
+            val msg = DtnMessage(
+                id = id, originNodeId = identity.nodeId, destinationNodeId = dest, payloadBytes = payload,
+                createdAtMs = now, ttlMs = ttlMs, messageType = DtnMessageType.DATA, channel = channel, flags = flags,
+            )
+            // DMs await an end-to-end receipt (SENDING → DELIVERED); broadcast/group have no single
+            // receipt, so they are shown as SENT once queued/flooded.
+            val status = if (channel > 0 || isBroadcast) ChatMessageEntity.Status.SENT else ChatMessageEntity.Status.SENDING
+            chatDao.upsert(ChatMessageEntity(id, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, status, now))
+            val stored = queueManager.ingest(msg)
+            if (stored) internet.publish(msg) // bridge to the internet relay too (no-op if not connected)
+            return if (stored) Result.Sent(msg) else Result.Error
         }
-        chatDao.upsert(
-            ChatMessageEntity(
-                id = id,
-                convKey = convKey,
-                peerNodeId = if (channel > 0 || isBroadcast) null else dest.value,
-                channel = channel,
-                direction = ChatMessageEntity.Direction.OUT,
-                text = text,
-                status = initialStatus,
-                createdAtMs = now,
-            ),
-        )
-        val stored = queueManager.ingest(msg)
-        if (stored) internet.publish(msg) // bridge to the internet relay too (no-op if not connected)
-        return if (stored) Result.Sent(msg) else Result.Error
+
+        // ── Fragment: split into independently-sealed bundles that share a canonical parent id ──
+        val chunks = plain.toList().chunked(budget).map { it.toByteArray() }
+        if (chunks.size > Fragmenter.MAX_FRAGMENTS) return Result.TooLong(budget * Fragmenter.MAX_FRAGMENTS)
+        val canonical = Fragmenter.canonicalParent(UUID.randomUUID().toString())
+        val total = chunks.size
+        var first: DtnMessage? = null
+        for ((i, chunk) in chunks.withIndex()) {
+            val fragId = Fragmenter.fragmentId(canonical, i)
+            val (payload, flags) = when (val s = envelope.sealBytes(chunk, fragId, identity.nodeId, dest, channel, i, total)) {
+                is EnvelopeService.Sealed.Ok -> s.payload to s.flags
+                EnvelopeService.Sealed.NoKey -> return Result.NoKey
+                is EnvelopeService.Sealed.TooLong -> return Result.TooLong(s.maxBytes)
+            }
+            val msg = DtnMessage(
+                id = fragId, originNodeId = identity.nodeId, destinationNodeId = dest, payloadBytes = payload,
+                createdAtMs = now, ttlMs = ttlMs, messageType = DtnMessageType.DATA, channel = channel,
+                fragmentIndex = i, fragmentTotal = total, flags = flags,
+            )
+            if (first == null) first = msg
+            if (queueManager.ingest(msg)) internet.publish(msg)
+        }
+        // One chat row for the whole message, keyed by the canonical parent id (status SENT: a
+        // multi-fragment message is acknowledged per fragment, not tracked as one delivery).
+        chatDao.upsert(ChatMessageEntity(canonical, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, ChatMessageEntity.Status.SENT, now))
+        return first?.let { Result.Sent(it) } ?: Result.Error
     }
 
     /** Broadcast a signed identity announce so peers can learn our keys (TOFU). */

@@ -5,13 +5,14 @@ import com.dtn.mesh.model.ForwardingAction
 /**
  * A single Q-table: maps discretised state keys to action-value estimates.
  *
- * Thread safety: not internally synchronised. The engine serialises access.
- * This is acceptable because the Q-update path is single-threaded (batched
- * in ForwardingWorker on a sequential coroutine).
+ * Thread safety: backed by [java.util.concurrent.ConcurrentHashMap] (outer + inner) so reads on the
+ * flush/selection coroutines can't hit a ConcurrentModificationException while the update path
+ * (orchestrator loop / WorkManager) mutates it. Updates are still not strictly atomic, which is
+ * acceptable for this research RL engine.
  */
 class QTable {
 
-    private val table: MutableMap<String, MutableMap<ForwardingAction, Double>> = mutableMapOf()
+    private val table: MutableMap<String, MutableMap<ForwardingAction, Double>> = java.util.concurrent.ConcurrentHashMap()
 
     /** Get Q(state, action). Returns 0.0 for unseen state-action pairs (optimistic init). */
     fun get(stateKey: String, action: ForwardingAction): Double =
@@ -19,7 +20,7 @@ class QTable {
 
     /** Set Q(state, action) = value. */
     fun set(stateKey: String, action: ForwardingAction, value: Double) {
-        table.getOrPut(stateKey) { mutableMapOf() }[action] = value
+        table.getOrPut(stateKey) { java.util.concurrent.ConcurrentHashMap() }[action] = value
     }
 
     /** Get all Q-values for a state. Returns empty map for unseen states. */
@@ -50,7 +51,7 @@ class QTable {
     fun import(data: Map<String, Map<ForwardingAction, Double>>) {
         table.clear()
         data.forEach { (key, actions) ->
-            table[key] = actions.toMutableMap()
+            table[key] = java.util.concurrent.ConcurrentHashMap(actions)
         }
     }
 

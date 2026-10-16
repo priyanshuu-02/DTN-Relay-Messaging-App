@@ -43,6 +43,10 @@ import com.dtn.mesh.database.entity.SeenBundleEntity
     // survive; peers re-announce their keys). Wire a real Migration before any field deployment.
     version = 3,
     exportSchema = true,
+    // v2 → v3 is purely additive (new columns + new tables), so Room generates the migration
+    // automatically from the exported schemas. The destructive fallback in DatabaseModule remains
+    // only as a safety net for any other/unknown version jump.
+    autoMigrations = [androidx.room.AutoMigration(from = 2, to = 3)],
 )
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {

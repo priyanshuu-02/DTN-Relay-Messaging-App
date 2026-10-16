@@ -6,6 +6,7 @@ import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
+import com.dtn.mesh.database.dao.SeenBundleDao
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.routing.StrategySelector
 import com.dtn.mesh.service.DtnOrchestrator
@@ -35,6 +36,7 @@ class ForwardingWorker @AssistedInject constructor(
     private val strategySelector: StrategySelector,
     private val decisionDao: ForwardingDecisionDao,
     private val orchestrator: DtnOrchestrator,
+    private val seenBundleDao: SeenBundleDao,
     private val lifecycle: MessageLifecycleLog,
 ) : CoroutineWorker(context, params) {
 
@@ -69,6 +71,10 @@ class ForwardingWorker @AssistedInject constructor(
 
         // Phase 3: Purge old terminal messages
         queueManager.purgeOldMessages()
+
+        // Phase 3b: Purge dedup tombstones whose retention window has elapsed (safe to forget).
+        runCatching { seenBundleDao.purgeExpired(System.currentTimeMillis()) }
+            .onSuccess { if (it > 0) Log.d(TAG, "Purged $it expired tombstones") }
 
         // Phase 4: Periodic routing aging (both strategies)
         strategySelector.onPeriodicAge()

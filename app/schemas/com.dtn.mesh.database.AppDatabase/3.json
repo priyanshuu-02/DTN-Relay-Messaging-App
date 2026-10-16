@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 3,
-    "identityHash": "59d245d049700fdd90f48dcb599bbe1c",
+    "identityHash": "5a2ec1228c86b5c94f552a15ceffaf9d",
     "entities": [
       {
         "tableName": "messages",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `origin_node_id` TEXT NOT NULL, `destination_node_id` TEXT NOT NULL, `payload` BLOB NOT NULL, `port_num` INTEGER NOT NULL, `channel` INTEGER NOT NULL, `created_at_ms` INTEGER NOT NULL, `expires_at_ms` INTEGER NOT NULL, `ttl_ms` INTEGER NOT NULL, `hop_count` INTEGER NOT NULL, `forward_count` INTEGER NOT NULL, `duplicate_count` INTEGER NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `status` TEXT NOT NULL, `received_at_ms` INTEGER NOT NULL, `last_forwarded_to` TEXT, `last_forwarded_at_ms` INTEGER, `mesh_packet_id` INTEGER, `message_type` TEXT NOT NULL, `flags` INTEGER NOT NULL, `payload_size_bytes` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `origin_node_id` TEXT NOT NULL, `destination_node_id` TEXT NOT NULL, `payload` BLOB NOT NULL, `port_num` INTEGER NOT NULL, `channel` INTEGER NOT NULL, `created_at_ms` INTEGER NOT NULL, `expires_at_ms` INTEGER NOT NULL, `ttl_ms` INTEGER NOT NULL, `hop_count` INTEGER NOT NULL, `forward_count` INTEGER NOT NULL, `duplicate_count` INTEGER NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `status` TEXT NOT NULL, `received_at_ms` INTEGER NOT NULL, `last_forwarded_to` TEXT, `last_forwarded_at_ms` INTEGER, `mesh_packet_id` INTEGER, `message_type` TEXT NOT NULL, `flags` INTEGER NOT NULL DEFAULT 0, `payload_size_bytes` INTEGER NOT NULL, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -132,7 +132,8 @@
             "fieldPath": "flags",
             "columnName": "flags",
             "affinity": "INTEGER",
-            "notNull": true
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "payloadSizeBytes",
@@ -189,7 +190,7 @@
       },
       {
         "tableName": "contacts",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`node_id` TEXT NOT NULL, `delivery_probability` REAL NOT NULL, `last_aged_at_ms` INTEGER NOT NULL, `path_likelihood` REAL NOT NULL, `total_encounters` INTEGER NOT NULL, `total_encounter_duration_ms` INTEGER NOT NULL, `first_encounter_ms` INTEGER NOT NULL, `last_encounter_ms` INTEGER NOT NULL, `best_rssi` INTEGER NOT NULL, `best_snr` REAL NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `delivery_success_count` INTEGER NOT NULL, `delivery_attempt_count` INTEGER NOT NULL, `total_inter_contact_time_ms` INTEGER NOT NULL, `long_name` TEXT, `short_name` TEXT, `hw_model` TEXT, `is_online` INTEGER NOT NULL, `custom_name` TEXT, `x_pub` BLOB, `ed_pub` BLOB, `key_verified` INTEGER NOT NULL, `key_first_seen_ms` INTEGER NOT NULL, `announce_name` TEXT, PRIMARY KEY(`node_id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`node_id` TEXT NOT NULL, `delivery_probability` REAL NOT NULL, `last_aged_at_ms` INTEGER NOT NULL, `path_likelihood` REAL NOT NULL, `total_encounters` INTEGER NOT NULL, `total_encounter_duration_ms` INTEGER NOT NULL, `first_encounter_ms` INTEGER NOT NULL, `last_encounter_ms` INTEGER NOT NULL, `best_rssi` INTEGER NOT NULL, `best_snr` REAL NOT NULL, `last_rssi` INTEGER NOT NULL, `last_snr` REAL NOT NULL, `delivery_success_count` INTEGER NOT NULL, `delivery_attempt_count` INTEGER NOT NULL, `total_inter_contact_time_ms` INTEGER NOT NULL, `long_name` TEXT, `short_name` TEXT, `hw_model` TEXT, `is_online` INTEGER NOT NULL, `custom_name` TEXT, `x_pub` BLOB, `ed_pub` BLOB, `key_verified` INTEGER NOT NULL DEFAULT 0, `key_first_seen_ms` INTEGER NOT NULL DEFAULT 0, `announce_name` TEXT, PRIMARY KEY(`node_id`))",
         "fields": [
           {
             "fieldPath": "nodeId",
@@ -327,13 +328,15 @@
             "fieldPath": "keyVerified",
             "columnName": "key_verified",
             "affinity": "INTEGER",
-            "notNull": true
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "keyFirstSeenMs",
             "columnName": "key_first_seen_ms",
             "affinity": "INTEGER",
-            "notNull": true
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "announceName",
@@ -834,7 +837,7 @@
     "views": [],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '59d245d049700fdd90f48dcb599bbe1c')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '5a2ec1228c86b5c94f552a15ceffaf9d')"
     ]
   }
 }

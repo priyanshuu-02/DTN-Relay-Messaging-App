@@ -153,11 +153,11 @@ data class ContactEntity(
     val edPub: ByteArray? = null,
 
     /** True once the user verified the safety number (QR / in person). TOFU-pinned otherwise. */
-    @ColumnInfo(name = "key_verified")
+    @ColumnInfo(name = "key_verified", defaultValue = "0")
     val keyVerified: Boolean = false,
 
     /** When we first pinned this peer's keys (epoch ms). */
-    @ColumnInfo(name = "key_first_seen_ms")
+    @ColumnInfo(name = "key_first_seen_ms", defaultValue = "0")
     val keyFirstSeenMs: Long = 0,
 
     /** Display name advertised in the peer's signed ANNOUNCE. */

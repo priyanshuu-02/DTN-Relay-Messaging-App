@@ -48,10 +48,10 @@ class MaxPropStrategy(
      * Path likelihood table: f(local, peer_i).
      * Updated on each encounter. Normalised to sum = 1.0 across all peers.
      */
-    private val fTable: MutableMap<String, Double> = mutableMapOf()
+    private val fTable: MutableMap<String, Double> = java.util.concurrent.ConcurrentHashMap()
 
     /** Raw encounter counts per peer — used to compute path likelihoods. */
-    private val encounterCounts: MutableMap<String, Int> = mutableMapOf()
+    private val encounterCounts: MutableMap<String, Int> = java.util.concurrent.ConcurrentHashMap()
 
     /** Total encounters observed (denominator for likelihood). */
     private var totalEncounters: Int = 0
@@ -61,7 +61,7 @@ class MaxPropStrategy(
      * These are the input to the MaxProp minimum-cost path search — without a neighbour's own
      * f-vector we can only reason one hop. Refreshed on each routing-summary exchange.
      */
-    private val peerFTables: MutableMap<String, MutableMap<String, Double>> = mutableMapOf()
+    private val peerFTables: MutableMap<String, MutableMap<String, Double>> = java.util.concurrent.ConcurrentHashMap()
 
     // ──────────────────────────────────────────────────────────────────────
     // Encounter handling

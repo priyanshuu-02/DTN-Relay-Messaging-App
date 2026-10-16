@@ -182,9 +182,17 @@ class WifiDirectTransportAdapter @Inject constructor(
      */
     private fun startStalenessSweeper() {
         sweeperJob = scope.launch {
+            var lastDiscoveryMs = 0L
             while (isActive) {
                 delay(SWEEPER_TICK_MS)
                 val now = System.currentTimeMillis()
+
+                // 0) Periodically re-trigger P2P discovery — WiFi P2P discovery stops on its own
+                //    after ~2 minutes, so without this nothing new is found after the first sweep.
+                if (now - lastDiscoveryMs > DISCOVERY_INTERVAL_MS) {
+                    lastDiscoveryMs = now
+                    runCatching { startPeerDiscovery() }
+                }
 
                 // 1) Fire HELLO heartbeats to every known peer to prove we're still alive.
                 //    If the socket connect fails we DON'T refresh their timestamp, so the
@@ -270,6 +278,7 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     private fun handleIncomingConnection(socket: Socket) {
         try {
+            socket.soTimeout = 5000 // don't pin an IO thread forever on a stalled peer
             val remoteIp = socket.inetAddress?.hostAddress
             val dis = DataInputStream(socket.getInputStream())
             // Protocol: [4 bytes wireLength][wireBytes][4 bytes senderIdLength][senderIdBytes]
@@ -320,7 +329,8 @@ class WifiDirectTransportAdapter @Inject constructor(
                     rssi = -30, // WiFi Direct — strong signal proxy
                     snr = 20f,
                 ) ?: return
-                _inboundMessages.tryEmit(InboundPacket(message = msg, channel = 0))
+                // Attribute the immediate sender so reverse-echo suppression / 1-hop summary trust apply.
+                _inboundMessages.tryEmit(InboundPacket(message = msg, channel = 0, viaPeer = fromNode))
                 Log.d(TAG, "Received ${wireBytes.size}B from $senderId via P2P")
             } else {
                 Log.d(TAG, "HELLO from $senderId @ $remoteIp")

@@ -292,6 +292,14 @@ class BleTransportAdapter @Inject constructor(
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                // Drop any partial reassembly for this device so the next transfer re-syncs cleanly
+                // (the write characteristic alone never signals a client disconnect).
+                rxBuffers.remove(device.address)
+            }
+        }
+
         override fun onCharacteristicWriteRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -318,6 +326,14 @@ class BleTransportAdapter @Inject constructor(
         val bytes = buf.toByteArray()
         if (bytes.size < 2) return
         val total = ((bytes[0].toInt() and 0xFF) shl 8) or (bytes[1].toInt() and 0xFF)
+        // Sanity cap: a valid framed bundle is [2B len][≤255 wire]. A corrupt or aborted transfer
+        // can leave bytes that decode to a bogus length — reset so we re-sync instead of buffering
+        // junk (and never swallow large amounts of good traffic behind a bad header).
+        if (total <= 0 || total > DtnMessage.LORA_MAX_FRAME_BYTES) {
+            Log.w(TAG, "BLE reassembly: bad frame length $total from $address — resetting buffer")
+            buf.reset()
+            return
+        }
         if (bytes.size - 2 < total) return // more chunks pending
 
         val wire = bytes.copyOfRange(2, 2 + total)

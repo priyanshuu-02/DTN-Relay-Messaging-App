@@ -37,8 +37,17 @@ class EnvelopeService @Inject constructor(
         if (channel <= 0 && dest == NodeId.BROADCAST) DtnMessage.MAX_SINGLE_PACKET_PAYLOAD
         else DtnMessage.MAX_SINGLE_PACKET_PAYLOAD - DtnCrypto.GCM_TAG_LEN
 
-    suspend fun sealText(text: String, messageId: String, origin: NodeId, dest: NodeId, channel: Int): Sealed {
-        val plain = text.toByteArray(Charsets.UTF_8)
+    suspend fun sealText(text: String, messageId: String, origin: NodeId, dest: NodeId, channel: Int): Sealed =
+        sealBytes(text.toByteArray(Charsets.UTF_8), messageId, origin, dest, channel, 0, 1)
+
+    /**
+     * Seal one payload (a whole message, or one fragment of it). [fragIndex]/[fragTotal] feed the
+     * AEAD nonce + AAD so each fragment authenticates independently.
+     */
+    suspend fun sealBytes(
+        plain: ByteArray, messageId: String, origin: NodeId, dest: NodeId, channel: Int,
+        fragIndex: Int, fragTotal: Int,
+    ): Sealed {
         val originNum = origin.toNodeNum32()
         val destNum = dest.toNodeNum32()
         val mid = uuid16(messageId)
@@ -49,8 +58,8 @@ class EnvelopeService @Inject constructor(
                 val max = DtnMessage.MAX_SINGLE_PACKET_PAYLOAD - DtnCrypto.GCM_TAG_LEN
                 if (plain.size > max) return Sealed.TooLong(max)
                 val flags = flagsFor(DtnCrypto.SUITE_CHANNEL)
-                val aad = aad(messageId, origin, dest, channel, flags)
-                Sealed.Ok(DtnCrypto.seal(key, mid, originNum, destNum, DtnCrypto.SUITE_CHANNEL, 0, aad, plain), flags)
+                val aad = aad(messageId, origin, dest, channel, flags, fragIndex, fragTotal)
+                Sealed.Ok(DtnCrypto.seal(key, mid, originNum, destNum, DtnCrypto.SUITE_CHANNEL, fragIndex, aad, plain), flags)
             }
             dest == NodeId.BROADCAST -> {
                 val max = DtnMessage.MAX_SINGLE_PACKET_PAYLOAD
@@ -63,43 +72,49 @@ class EnvelopeService @Inject constructor(
                 if (plain.size > max) return Sealed.TooLong(max)
                 val root = DtnCrypto.x25519(identity.xPriv, peerX)
                 val flags = flagsFor(DtnCrypto.SUITE_DM)
-                val aad = aad(messageId, origin, dest, 0, flags)
-                Sealed.Ok(DtnCrypto.seal(root, mid, originNum, destNum, DtnCrypto.SUITE_DM, 0, aad, plain), flags)
+                val aad = aad(messageId, origin, dest, 0, flags, fragIndex, fragTotal)
+                Sealed.Ok(DtnCrypto.seal(root, mid, originNum, destNum, DtnCrypto.SUITE_DM, fragIndex, aad, plain), flags)
             }
         }
     }
 
-    /** Decrypt [msg] if we can. Returns plaintext, or null (not for us / no key / tamper). */
-    suspend fun open(msg: DtnMessage): String? {
+    /** Decrypt [msg] to text if we can. Returns null (not for us / no key / tamper). */
+    suspend fun open(msg: DtnMessage): String? = openBytes(msg)?.let { String(it, Charsets.UTF_8) }
+
+    /**
+     * Decrypt the raw plaintext BYTES. Used for fragment reassembly, where concatenating must be
+     * byte-exact (a multi-byte UTF-8 char can straddle a fragment boundary, so each fragment is
+     * decoded as text only after all byte-chunks are joined).
+     */
+    suspend fun openBytes(msg: DtnMessage): ByteArray? {
         val suite = msg.flags and 0x07
         val mid = uuid16(msg.id)
         val originNum = msg.originNodeId.toNodeNum32()
         val destNum = msg.destinationNodeId.toNodeNum32()
         val aad = DtnWireCodec.aadHeader(msg)
         return when (suite) {
-            DtnCrypto.SUITE_PLAIN -> runCatching { String(msg.payloadBytes, Charsets.UTF_8) }.getOrNull()
+            DtnCrypto.SUITE_PLAIN -> msg.payloadBytes
             DtnCrypto.SUITE_DM -> {
                 if (msg.destinationNodeId != identity.nodeId) return null
                 val peerX = contactDao.getByNodeId(msg.originNodeId.value)?.xPub ?: return null
                 val root = DtnCrypto.x25519(identity.xPriv, peerX)
                 DtnCrypto.open(root, mid, originNum, destNum, DtnCrypto.SUITE_DM, msg.fragmentIndex, aad, msg.payloadBytes)
-                    ?.let { String(it, Charsets.UTF_8) }
             }
             DtnCrypto.SUITE_CHANNEL -> {
                 val key = groupKeyStore.key(msg.channel) ?: return null
                 DtnCrypto.open(key, mid, originNum, destNum, DtnCrypto.SUITE_CHANNEL, msg.fragmentIndex, aad, msg.payloadBytes)
-                    ?.let { String(it, Charsets.UTF_8) }
             }
             else -> null
         }
     }
 
-    /** AAD = masked header for a to-be-sent DATA bundle (ttl/hop zeroed by [DtnWireCodec.aadHeader]). */
-    private fun aad(messageId: String, origin: NodeId, dest: NodeId, channel: Int, flags: Int): ByteArray {
+    /** AAD = masked header for a DATA bundle/fragment (ttl/hop zeroed by [DtnWireCodec.aadHeader]). */
+    private fun aad(messageId: String, origin: NodeId, dest: NodeId, channel: Int, flags: Int, fragIndex: Int, fragTotal: Int): ByteArray {
         val template = DtnMessage(
             id = messageId, originNodeId = origin, destinationNodeId = dest,
             payloadBytes = ByteArray(0), createdAtMs = 0L, ttlMs = 0L,
-            messageType = DtnMessageType.DATA, channel = channel, flags = flags,
+            messageType = DtnMessageType.DATA, channel = channel,
+            fragmentIndex = fragIndex, fragmentTotal = fragTotal, flags = flags,
         )
         return DtnWireCodec.aadHeader(template)
     }

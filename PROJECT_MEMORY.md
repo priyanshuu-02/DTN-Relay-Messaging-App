@@ -667,3 +667,77 @@ and the "no destructive migrations / no secrets in source / TTL counts down" rul
 - Foreground-service permission-before-start ordering; edge-to-edge insets on the chat screen; dark theme;
   split `MainScreen.kt`; targetSdk 36 (needs AGP ≥ 8.9) for a Play release.
 - Firmware link-layer AES-CMAC MIC (network key) — deferred (would cut the 223-byte LoRa payload budget).
+
+
+---
+
+# PART F — 2026-10-16 (cont.): correctness / transport / fragmentation hardening
+
+Second pass after the "Intermediate half" commit. Build green (`:app:assembleDebug`); all JVM unit
+tests pass (59: the prior 55 + 3 `FragmenterTest` + the fragment crypto round-trip). Committed as a
+second "Intermediate half" checkpoint.
+
+## F.1 Transport robustness (Wave 1)
+- `viaPeer` now set on LoRa-hub inbound (= hub id) and WiFi Direct inbound (= sender), so reverse-echo
+  suppression and the 1-hop routing-summary trust check apply on those transports too.
+- WiFi Direct: `soTimeout = 5 s` on accepted sockets (no more pinned IO threads); periodic
+  re-discovery every 15 s in the sweeper (P2P discovery otherwise stops after ~2 min).
+- BLE: reassembly buffer resets on GATT-server disconnect and rejects bogus frame lengths
+  (re-syncs instead of buffering junk / swallowing good traffic).
+
+## F.2 Concurrency (Wave 1)
+- PRoPHET, MaxProp and the Q-tables now back their maps with `ConcurrentHashMap` (outer + inner),
+  removing the ConcurrentModificationException risk when the flush/selection coroutines read while
+  the event loop / WorkManager mutates — which previously could crash or silently fall back to
+  approve-all (epidemic) flooding.
+
+## F.3 Foreground-service ordering (Wave 1)
+- `DtnViewModel.connect()` now connects the transports FIRST and starts the foreground service only
+  on success, and logs any missing runtime permissions up front — no more zombie service + orchestrator
+  when permissions are denied or Bluetooth is off.
+
+## F.4 Resurrection tombstones (Wave 2)
+- New use of the `seen_bundles` table: the orchestrator writes a tombstone when a message is
+  DELIVERED (to us), EXPIRED, or user-CLEARED, and checks it before accepting any inbound DATA — so a
+  late or re-flooded copy can't resurrect a message after the 1-hour buffer purge. A delivered DM
+  still re-pushes its receipt. Pressure drops are intentionally NOT tombstoned (still re-acceptable).
+  `ForwardingWorker` purges expired tombstones each cycle.
+
+## F.5 LoRa-hub reconnect (Wave 2)
+- `LoRaHubTransportAdapter` now runs one supervised reconnect loop with exponential backoff (1→30 s):
+  it waits for the hub WiFi, connects, registers, pumps the read loop, and reconnects on any drop
+  while connected is desired. The old one-shot `openSocketAndRun` is gone.
+
+## F.6 Real Room migration (Wave 3)
+- `AppDatabase` declares `autoMigrations = [AutoMigration(2, 3)]` (v2→v3 is purely additive: new
+  contact key columns + `messages.flags` + the `chat_messages` / `seen_bundles` / `groups` tables).
+  Added `@ColumnInfo(defaultValue = "0")` to the NOT NULL added columns so Room can generate it. The
+  destructive fallback stays only as a safety net for unknown version jumps. Schemas committed under
+  `app/schemas/`.
+
+## F.7 Chat-screen insets (Wave 3)
+- The chat header now uses `statusBarsPadding()` (gradient fills behind the status bar) and the chat
+  column uses `imePadding()` so the keyboard no longer covers the composer under edge-to-edge.
+
+## F.8 Message fragmentation (Wave 4) — the former #1 TODO
+- Messages larger than one LoRa frame are now split across up to `Fragmenter.MAX_FRAGMENTS` (16)
+  bundles. All fragments share a **canonical parent id** (UUID, last byte 0) but each carries a
+  **distinct wire id** (last byte = index+1), so the existing id-based dedup on phones and hubs treats
+  them as independent bundles (every fragment propagates) while the receiver recovers the parent by
+  zeroing the last byte. Fragment index/total travel in the header; each fragment is sealed
+  independently (its index feeds the AEAD nonce + AAD).
+- `EnvelopeService` gained `sealBytes(...fragIndex, fragTotal)` and `openBytes(...)`. Reassembly joins
+  the raw plaintext BYTES and decodes to text only once, so a multi-byte UTF-8 character that straddles
+  a fragment boundary stays intact. Reassembly is in-memory, keyed by parent id, pruned after 10 min.
+- Limitation: a fragmented message shows status "sent" (acknowledged per fragment, not tracked as one
+  end-to-end delivery). Single-frame DMs still show the full SENDING → DELIVERED flow.
+- `FragmenterTest` covers id derivation/recovery and a byte-exact multi-fragment crypto round-trip with
+  a deliberately split multi-byte string.
+
+## F.9 Still deferred (unchanged from E.10 unless noted)
+- Hash-locked receipts (forged-ACK custody-drop protection) — cross-cuts phone + firmware + wire.
+- Hub as an internet gateway (AP+STA) + a server-side offline mailbox for the relay.
+- Firmware hub-to-hub link MIC (would cut the 223-byte LoRa payload budget).
+- targetSdk 36 / AGP upgrade (only for a Play release); split `MainScreen.kt`; full dark theme.
+- On-device end-to-end test (needs the user: tap Connect, approve the WiFi dialog, a second phone).
+- Tombstones (F.4), reconnect (F.5), migration (F.6), fragmentation (F.8) are now DONE.

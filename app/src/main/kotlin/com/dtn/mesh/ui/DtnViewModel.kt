@@ -286,19 +286,18 @@ class DtnViewModel @Inject constructor(
 
     fun connect() {
         viewModelScope.launch {
+            val missing = missingPermissions()
+            if (missing.isNotEmpty()) {
+                addLog("WARNING: missing permissions (${missing.joinToString { it.substringAfterLast('.') }}) — " +
+                    "grant them in system settings or transports may not work")
+            }
             addLog("Starting all transports (BLE + WiFi Direct + LoRa hub)...")
-            com.dtn.mesh.service.DtnForegroundService.start(getApplication())
             val success = transport.connect()
             if (success) {
-                // Start the orchestrator directly rather than relying solely on the
-                // foreground service's onCreate. The service start is async and can be
-                // delayed (or fail before reaching orchestrator.start() if startForeground
-                // throws), which left the orchestrator's encounter->contacts persistence
-                // never running: peers showed up in the raw NODE log (this ViewModel
-                // collects transport.nodeEvents directly) but never appeared in the chat /
-                // peer list, which is driven by the Room contacts table written only in
-                // DtnOrchestrator.onPeerEvent. start() is idempotent, so the service
-                // calling it too is a harmless no-op.
+                // Start the foreground service + orchestrator only AFTER transports come up, so a
+                // permission failure can't leave a zombie service running with no radios.
+                // start() is idempotent (the service's onCreate also calls it), so this is safe.
+                com.dtn.mesh.service.DtnForegroundService.start(getApplication())
                 orchestrator.start()
                 addLog("Transports initiated — foreground service running")
                 _localNodeId.value = identity.nodeId.value
@@ -309,8 +308,16 @@ class DtnViewModel @Inject constructor(
                     (transport as? com.dtn.mesh.receiver.MultiTransportManager)?.connectInternet()
                 }
             } else {
-                addLog("ERROR: Connection failed")
+                addLog("ERROR: Connection failed — check Bluetooth is on and permissions are granted")
             }
+        }
+    }
+
+    /** Transport permissions that are not currently granted (for a clear warning before connect). */
+    private fun missingPermissions(): List<String> {
+        val ctx = getApplication<Application>()
+        return PermissionHelper.requiredPermissions().filter {
+            ctx.checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
         }
     }
 
