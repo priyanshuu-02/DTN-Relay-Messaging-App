@@ -2,6 +2,21 @@ package com.dtn.mesh.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.TextField
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,17 +38,26 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -104,6 +128,11 @@ internal object Palette {
     val TextSecondary = Color(0xFF6A737D)
     val TextMuted = Color(0xFF959DA5)
 
+    // Small text on chat bubbles: darker tones keep ≥4.5:1 contrast on the green sent bubble.
+    val BubbleMeta = Color(0xFF5A6169)
+    val DeliveredText = Color(0xFF1B5E20)
+    val QueuedText = Color(0xFF7A5C00)
+
     // Soft status tints — used for subtle card accents / pills (backgrounds behind status text).
     val AccentSoft = Color(0xFFE7F4EA)
     val WarningSoft = Color(0xFFFDF3DD)
@@ -147,23 +176,33 @@ fun MainScreen(viewModel: DtnViewModel) {
  *  Home screen — chats / network / lifecycle / log
  * ========================================================================== */
 
+/** Show the ViewModel's one-shot notices (joined group, invalid QR, …) as snackbars. */
+@Composable
+private fun UserMessageSnackbars(viewModel: DtnViewModel, host: SnackbarHostState) {
+    LaunchedEffect(viewModel, host) {
+        viewModel.userMessages.collect { msg ->
+            host.currentSnackbarData?.dismiss()
+            host.showSnackbar(msg)
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun HomeScreen(viewModel: DtnViewModel) {
-    val connectionState by viewModel.connectionState.collectAsState()
-    val localNodeId by viewModel.localNodeId.collectAsState()
     val logEntries by viewModel.logEntries.collectAsState()
-    val bufferedCount by viewModel.bufferedCount.collectAsState()
-    val activeStrategy by viewModel.activeStrategy.collectAsState()
 
-    var selectedTab by remember { mutableIntStateOf(0) }
-    var overlay by remember { mutableStateOf<String?>(null) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var overlay by rememberSaveable { mutableStateOf<String?>(null) }
+    val snackbars = remember { SnackbarHostState() }
+    UserMessageSnackbars(viewModel, snackbars)
 
     // System back: if we're on a non-Chats tab, return to Chats. Only exit from Chats tab.
     BackHandler(enabled = selectedTab != 0) { selectedTab = 0 }
 
     Scaffold(
         containerColor = Palette.Surface,
+        snackbarHost = { SnackbarHost(snackbars) },
         topBar = {
             CenterAlignedTopAppBar(
                 modifier = Modifier.background(Palette.TopBarGradient),
@@ -187,8 +226,7 @@ private fun HomeScreen(viewModel: DtnViewModel) {
         },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            ConnectionCard(connectionState, localNodeId, activeStrategy, bufferedCount)
-            ControlRow(connectionState, viewModel)
+            ConnectionPanel(viewModel)
 
             TabRow(
                 selectedTabIndex = selectedTab,
@@ -205,7 +243,7 @@ private fun HomeScreen(viewModel: DtnViewModel) {
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when (selectedTab) {
                     0 -> ChatListTab(viewModel)
-                    1 -> NetworkTab(viewModel)
+                    1 -> NetworkTab(viewModel, onOpenChat = { viewModel.openChat(it) })
                     2 -> LifecycleTab(viewModel)
                     3 -> LogTab(viewModel, logEntries)
                 }
@@ -238,78 +276,6 @@ private fun TabItem(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 /* ==========================================================================
- *  Connection card + controls
- * ========================================================================== */
-
-@Composable
-private fun ConnectionCard(
-    state: MeshConnectionState, nodeId: String?, strategy: String, buffered: Int,
-) {
-    val (statusColor, statusText, statusSoft) = when (state) {
-        MeshConnectionState.CONNECTED -> Triple(Palette.Accent, "Connected", Palette.AccentSoft)
-        MeshConnectionState.CONNECTING -> Triple(Palette.Warning, "Connecting…", Palette.WarningSoft)
-        MeshConnectionState.DEVICE_SLEEP -> Triple(Palette.Warning, "Device sleep", Palette.WarningSoft)
-        MeshConnectionState.DISCONNECTED -> Triple(Palette.Error, "Disconnected", Palette.ErrorSoft)
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-        colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
-        shape = RoundedCornerShape(16.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(14.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // Status dot nested in a soft-tinted badge for a bit more presence than a bare dot.
-            Box(
-                modifier = Modifier.size(38.dp).clip(CircleShape).background(statusSoft),
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(modifier = Modifier.size(13.dp).clip(CircleShape).background(statusColor))
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(statusText, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
-                    color = Palette.TextPrimary)
-                Text(
-                    "Node ${nodeId?.takeLast(8) ?: "—"}   ·   $strategy   ·   Buffer $buffered",
-                    fontSize = 11.sp, color = Palette.TextSecondary,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ControlRow(state: MeshConnectionState, viewModel: DtnViewModel) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        if (state == MeshConnectionState.DISCONNECTED) {
-            Button(
-                onClick = { viewModel.connect() },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = Palette.Primary),
-                shape = RoundedCornerShape(10.dp),
-            ) { Text("Connect", fontWeight = FontWeight.SemiBold) }
-        } else {
-            OutlinedButton(
-                onClick = { viewModel.disconnect() },
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Palette.Error),
-                shape = RoundedCornerShape(10.dp),
-            ) { Text("Disconnect", fontWeight = FontWeight.SemiBold) }
-        }
-        FilledTonalButton(onClick = { viewModel.syncBuffer() },
-            shape = RoundedCornerShape(10.dp)) { Text("Sync") }
-        FilledTonalButton(onClick = { viewModel.clearBuffer() },
-            shape = RoundedCornerShape(10.dp)) { Text("Clear") }
-    }
-}
-
-/* ==========================================================================
  *  Chats tab
  * ========================================================================== */
 
@@ -320,34 +286,58 @@ private fun ChatListTab(viewModel: DtnViewModel) {
     val groups by viewModel.groups.collectAsState()
     var renameTarget by remember { mutableStateOf<PeerInfo?>(null) }
 
+    val nameOf = rememberSenderNames(peers)
+    // One pass over the history → latest message per conversation; chats with recent messages
+    // come first (like any messenger), the rest by who's reachable now.
+    val summaries = remember(messages, nameOf) { summarizeChats(messages, nameOf) }
+    val sortedGroups = remember(groups, summaries) {
+        groups.sortedByDescending { summaries["grp:${it.channel}"]?.atMs ?: 0L }
+    }
+    val sortedPeers = remember(peers, summaries) {
+        peers.sortedWith(
+            compareByDescending<PeerInfo> { summaries[it.nodeId]?.atMs ?: 0L }
+                .thenByDescending { it.reachable }
+                .thenByDescending { it.lastSeenMs },
+        )
+    }
+
     LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         item { Spacer(Modifier.height(8.dp)) }
         item {
+            val s = summaries[BROADCAST_CHAT_KEY]
             BroadcastCard(
-                lastPreview = lastPreview(messages, chatKey = null),
+                lastPreview = s?.preview,
+                time = s?.let { UiText.listTime(it.atMs) }.orEmpty(),
                 onClick = { viewModel.openChat(DtnViewModel.BROADCAST_CHAT_ID) },
             )
         }
         item { Spacer(Modifier.height(4.dp)) }
-        if (groups.isNotEmpty()) {
-            items(groups, key = { "grp-${it.channel}" }) { g ->
+        if (sortedGroups.isNotEmpty()) {
+            items(sortedGroups, key = { "grp-${it.channel}" }) { g ->
+                val s = summaries["grp:${g.channel}"]
                 GroupCard(
                     name = g.name,
-                    subtitle = lastPreview(messages, chatKey = "grp:${g.channel}")
-                        ?: "Encrypted group · channel ${g.channel}",
+                    subtitle = s?.preview ?: "Encrypted group · no messages yet",
+                    time = s?.let { UiText.listTime(it.atMs) }.orEmpty(),
                     onClick = { viewModel.openChat("grp:${g.channel}") },
                 )
             }
             item { Spacer(Modifier.height(4.dp)) }
         }
-        if (peers.isEmpty()) {
-            item { EmptyState("No peers seen yet.", "Connect and wait for discovery.") }
+        if (sortedPeers.isEmpty()) {
+            item {
+                EmptyState(
+                    "No contacts yet.",
+                    "Connect to discover nearby phones, or scan a contact's QR (🔑) to reach them over the internet relay.",
+                )
+            }
         } else {
-            items(peers, key = { it.nodeId }) { peer ->
+            items(sortedPeers, key = { it.nodeId }) { peer ->
+                val s = summaries[peer.nodeId]
                 PeerCard(
                     peer = peer,
-                    subtitle = lastPreview(messages, chatKey = peer.nodeId)
-                        ?: peer.nodeId.takeLast(8),
+                    subtitle = s?.preview ?: reachabilityText(peer),
+                    time = s?.let { UiText.listTime(it.atMs) }.orEmpty(),
                     onClick = { viewModel.openChat(peer.nodeId) },
                     onEdit = { renameTarget = peer },
                 )
@@ -362,18 +352,66 @@ private fun ChatListTab(viewModel: DtnViewModel) {
     }
 }
 
-private fun lastPreview(all: List<ChatMessage>, chatKey: String?): String? {
-    val filtered = when (chatKey) {
-        null -> all.filter { it.toNodeId == null }
-        else -> all.filter { it.toNodeId == chatKey }
+/** Resolve a sender node id to a friendly name (contact name, else short id). */
+@Composable
+private fun rememberSenderNames(peers: List<PeerInfo>): (String) -> String =
+    remember(peers) {
+        val byId = peers.associateBy { it.nodeId }
+        val fn: (String) -> String = { id ->
+            when {
+                id.isBlank() || id.startsWith("grp:") || UiText.isBroadcastId(id) -> "Unknown sender"
+                else -> byId[id]?.displayName() ?: id.takeLast(8)
+            }
+        }
+        fn
     }
-    val last = filtered.lastOrNull() ?: return null
-    val prefix = if (last.isOutgoing) "You: " else ""
-    return prefix + last.text.take(50)
+
+private fun reachabilityText(peer: PeerInfo): String = when {
+    peer.isOnline && peer.hubOnly -> "📡 Online via LoRa hub"
+    peer.isOnline -> "Nearby · ${peer.nodeId.takeLast(8)}"
+    peer.internetOnline -> "🌐 Online via internet relay"
+    else -> "Offline · last seen ${relativeSince(peer.lastSeenMs)}"
+}
+
+/** Conversation key of the broadcast chat in [summarizeChats] (broadcast rows have no toNodeId). */
+private const val BROADCAST_CHAT_KEY = "__broadcast__"
+
+/** The latest message of one conversation, ready for the chat list. */
+private data class ChatSummary(val preview: String, val atMs: Long)
+
+/**
+ * Latest message per conversation (key: peer node id, "grp:<ch>", or [BROADCAST_CHAT_KEY]).
+ * [all] is oldest-first, so the last write per key wins. Outgoing previews carry their tick.
+ */
+private fun summarizeChats(all: List<ChatMessage>, nameOf: (String) -> String): Map<String, ChatSummary> {
+    val latest = HashMap<String, ChatMessage>()
+    for (m in all) latest[m.toNodeId ?: BROADCAST_CHAT_KEY] = m
+    return latest.mapValues { (key, m) ->
+        val multiParty = key == BROADCAST_CHAT_KEY || key.startsWith("grp:")
+        val prefix = when {
+            m.isOutgoing -> m.state.tick.takeIf { it.isNotBlank() }?.let { "$it You: " } ?: "You: "
+            multiParty -> nameOf(m.from) + ": "
+            else -> ""
+        }
+        ChatSummary(prefix + m.text.replace('\n', ' ').take(60), m.createdAtMs)
+    }
+}
+
+/** Title row shared by the chat-list cards: name on the left, last-message time on the right. */
+@Composable
+private fun ChatTitleRow(title: String, time: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(title, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Palette.TextPrimary,
+            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        if (time.isNotBlank()) {
+            Spacer(Modifier.width(8.dp))
+            Text(time, fontSize = 11.sp, color = Palette.TextSecondary)
+        }
+    }
 }
 
 @Composable
-private fun BroadcastCard(lastPreview: String?, onClick: () -> Unit) {
+private fun BroadcastCard(lastPreview: String?, time: String, onClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
@@ -393,11 +431,10 @@ private fun BroadcastCard(lastPreview: String?, onClick: () -> Unit) {
             }
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text("Broadcast to All", fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
-                    color = Palette.TextPrimary)
+                ChatTitleRow("Broadcast to All", time)
                 Text(
                     lastPreview ?: "Send to every peer in range",
-                    fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1,
+                    fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
         }
@@ -405,7 +442,7 @@ private fun BroadcastCard(lastPreview: String?, onClick: () -> Unit) {
 }
 
 @Composable
-private fun GroupCard(name: String, subtitle: String, onClick: () -> Unit) {
+private fun GroupCard(name: String, subtitle: String, time: String, onClick: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
@@ -422,8 +459,8 @@ private fun GroupCard(name: String, subtitle: String, onClick: () -> Unit) {
             ) { Text("👥", fontSize = 20.sp) }
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(name, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, color = Palette.TextPrimary)
-                Text(subtitle, fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1)
+                ChatTitleRow(name, time)
+                Text(subtitle, fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -433,6 +470,7 @@ private fun GroupCard(name: String, subtitle: String, onClick: () -> Unit) {
 private fun PeerCard(
     peer: PeerInfo,
     subtitle: String,
+    time: String,
     onClick: () -> Unit,
     onEdit: () -> Unit,
 ) {
@@ -443,41 +481,56 @@ private fun PeerCard(
         shape = RoundedCornerShape(16.dp),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             PeerAvatar(peer = peer, size = 46.dp)
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(peer.displayName(), fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
-                    color = Palette.TextPrimary, maxLines = 1)
-                Text(subtitle, fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1)
-            }
-            Column(horizontalAlignment = Alignment.End) {
-                SignalBars(rssi = peer.lastRssi, isOnline = peer.isOnline)
-                Spacer(Modifier.height(2.dp))
-                IconButton(
-                    onClick = onEdit,
-                    modifier = Modifier.size(30.dp),
-                ) {
-                    Icon(
-                        Icons.Default.Edit, contentDescription = "Rename",
-                        modifier = Modifier.size(16.dp),
-                        tint = Palette.TextMuted,
-                    )
+                ChatTitleRow(peer.displayName(), time)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(subtitle, fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    Spacer(Modifier.width(6.dp))
+                    ReachIndicator(peer)
                 }
+            }
+            IconButton(onClick = onEdit, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    Icons.Default.Edit, contentDescription = "Rename ${peer.displayName()}",
+                    modifier = Modifier.size(16.dp),
+                    tint = Palette.TextMuted,
+                )
             }
         }
     }
 }
 
-/** Circular colored avatar with the first letter of the display name. Online peers get
- *  a subtle green ring; offline peers a red ring. */
+/** Signal bars for a radio-online peer, a globe for one reachable only over the internet relay. */
+@Composable
+private fun ReachIndicator(peer: PeerInfo) {
+    if (peer.isOnline && peer.hubOnly) {
+        // Reached through the hub: there's no radio signal of our own to show as bars.
+        Text("📡", fontSize = 14.sp, modifier = Modifier.semantics { contentDescription = "Online via LoRa hub" })
+    } else if (!peer.isOnline && peer.internetOnline) {
+        Text("🌐", fontSize = 14.sp, modifier = Modifier.semantics { contentDescription = "Online via internet relay" })
+    } else {
+        SignalBars(rssi = peer.lastRssi, isOnline = peer.isOnline)
+    }
+}
+
+/** Circular colored avatar with the first character of the display name. Ring: green = nearby
+ *  over radio, blue = online via the internet relay, red = not reachable. */
 @Composable
 private fun PeerAvatar(peer: PeerInfo, size: androidx.compose.ui.unit.Dp) {
     val name = peer.displayName()
-    val initial = name.firstOrNull()?.uppercaseChar()?.toString() ?: "?"
-    val ringColor = if (peer.isOnline) Palette.Accent else Palette.Error
+    // Grapheme-safe: an emoji nickname ("🚗 Car Mule") keeps its emoji instead of turning into "?".
+    val initial = UiText.avatarInitial(name)
+    val ringColor = when {
+        peer.isOnline -> Palette.Accent
+        peer.internetOnline -> Palette.PrimaryLight
+        else -> Palette.Error
+    }
     Box(
         modifier = Modifier
             .size(size)
@@ -570,23 +623,65 @@ private fun EmptyState(title: String, subtitle: String) {
 private fun ChatDetailScreen(viewModel: DtnViewModel, chatKey: String) {
     val messages by viewModel.filteredMessages.collectAsState()
     val peers by viewModel.peerList.collectAsState()
+    val groups by viewModel.groups.collectAsState()
     val isBroadcast = chatKey == DtnViewModel.BROADCAST_CHAT_ID
+    val groupChannel = chatKey.takeIf { it.startsWith("grp:") }?.removePrefix("grp:")?.toIntOrNull()
+    val group = groupChannel?.let { ch -> groups.firstOrNull { it.channel == ch } }
+    val isGroup = groupChannel != null
     val peer = peers.firstOrNull { it.nodeId == chatKey }
+    val nameOf = rememberSenderNames(peers)
+    // Distinct senders seen in this group (there's no server-side member list).
+    val membersSeen = remember(messages, peers) {
+        if (!isGroup) emptyList()
+        else messages.filter { !it.isOutgoing && it.from.isNotBlank() }.map { nameOf(it.from) }.distinct()
+    }
+    var showInfo by rememberSaveable { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
+    var infoFor by rememberSaveable { mutableStateOf<String?>(null) }
+    val snackbars = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    UserMessageSnackbars(viewModel, snackbars)
 
     val title = when {
         isBroadcast -> "Broadcast to All"
+        group != null -> group.name
+        isGroup -> "Group (left)"
         peer != null -> peer.displayName()
         else -> chatKey.takeLast(8)
     }
     val subtitle = when {
-        isBroadcast -> "Fans out to every peer in range"
-        peer?.isOnline == true -> "Online"
-        peer != null -> "Offline · message will be buffered"
+        isBroadcast -> "Fans out to every peer in range (not encrypted)"
+        group != null -> "Encrypted group · " +
+            if (membersSeen.isEmpty()) "tap for invite" else "you + ${membersSeen.size} seen · tap for info"
+        isGroup -> "You left this group — its key is gone"
+        peer?.isOnline == true && peer.hubOnly -> "Online · via LoRa hub"
+        peer?.isOnline == true -> "Online · nearby"
+        peer?.internetOnline == true -> "Online · via internet relay"
+        peer != null -> "Offline · messages wait in the buffer"
         else -> ""
+    }
+    val placeholder = when {
+        isBroadcast -> "Broadcast to everyone in range…"
+        group != null -> "Message ${group.name}…"
+        peer != null -> "Message ${peer.displayName()}…"
+        else -> "Message…"
+    }
+
+    // Day separators + sender grouping, newest first for the bottom-anchored (reversed) list.
+    val rows = remember(messages) { buildChatRows(messages, System.currentTimeMillis()).asReversed() }
+    val listState = rememberLazyListState()
+    val newest = messages.lastOrNull()
+    // Follow new messages: always for our own, and for incoming ones while we're at the bottom.
+    LaunchedEffect(newest?.msgId) {
+        if (newest != null && (newest.isOutgoing || listState.firstVisibleItemIndex <= 2)) {
+            listState.animateScrollToItem(0)
+        }
     }
 
     Scaffold(
         containerColor = Palette.Surface,
+        snackbarHost = { SnackbarHost(snackbars) },
         topBar = {
             Surface(
                 color = Palette.Primary,
@@ -600,150 +695,341 @@ private fun ChatDetailScreen(viewModel: DtnViewModel, chatKey: String) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     IconButton(onClick = { viewModel.openChat(null) }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back",
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back",
                             tint = Color.White)
                     }
-                    if (isBroadcast) {
-                        Box(
-                            modifier = Modifier.size(38.dp).clip(CircleShape)
-                                .background(Palette.Broadcast),
-                            contentAlignment = Alignment.Center,
-                        ) { Text("📢", fontSize = 18.sp) }
-                    } else if (peer != null) {
-                        PeerAvatar(peer = peer, size = 38.dp)
+                    // Tapping the avatar/title opens group or contact info.
+                    val canShowInfo = group != null || peer != null
+                    Row(
+                        modifier = Modifier.weight(1f)
+                            .then(if (canShowInfo) Modifier.clickable(onClickLabel = "Show details") { showInfo = true } else Modifier),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (isBroadcast || isGroup) {
+                            Box(
+                                modifier = Modifier.size(38.dp).clip(CircleShape)
+                                    .background(Palette.Broadcast),
+                                contentAlignment = Alignment.Center,
+                            ) { Text(if (isBroadcast) "📢" else "👥", fontSize = 18.sp) }
+                        } else if (peer != null) {
+                            PeerAvatar(peer = peer, size = 38.dp)
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(title, color = Color.White, fontWeight = FontWeight.SemiBold,
+                                fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(subtitle, color = Color.White.copy(alpha = 0.75f), fontSize = 11.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
                     }
-                    Spacer(Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(title, color = Color.White, fontWeight = FontWeight.SemiBold,
-                            fontSize = 16.sp, maxLines = 1)
-                        Text(subtitle, color = Color.White.copy(alpha = 0.75f), fontSize = 11.sp,
-                            maxLines = 1)
-                    }
-                    if (!isBroadcast && peer != null) {
-                        SignalBars(rssi = peer.lastRssi, isOnline = peer.isOnline)
+                    if (peer != null) {
+                        ReachIndicator(peer)
                         Spacer(Modifier.width(8.dp))
                     }
                 }
             }
         },
     ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding).imePadding()) {
+        // consumeWindowInsets: the Scaffold padding already holds the navigation bar, so
+        // imePadding must only add what the keyboard covers beyond it (no double gap).
+        Column(modifier = Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
+            if (peer != null) ReachabilityBanner(viewModel, peer)
             LazyColumn(
+                state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 10.dp),
                 reverseLayout = true,
             ) {
-                items(messages.reversed(), key = { it.msgId }) { msg ->
-                    MessageBubble(msg)
-                    Spacer(Modifier.height(4.dp))
+                item(key = "bottom-gap") { Spacer(Modifier.height(8.dp)) }
+                if (rows.isEmpty()) {
+                    item(key = "empty") {
+                        Box(Modifier.fillParentMaxSize(), contentAlignment = Alignment.Center) {
+                            when {
+                                isBroadcast -> ChatEmptyState("📢", "Broadcast to everyone in range",
+                                    "Every phone that receives it passes it on, hop by hop. Broadcasts are not " +
+                                        "encrypted — anyone in reach can read them.")
+                                isGroup -> ChatEmptyState("👥", "Encrypted group",
+                                    "Only phones holding this group's invite can read its messages. Share the " +
+                                        "invite from the group info (tap the title).")
+                                peer?.hasKeys == false -> ChatEmptyState("🔑", "No keys yet",
+                                    "Scan each other's QR (🔑 on the home screen) or wait until ${peer.displayName()}'s " +
+                                        "phone announces itself, so messages can be end-to-end encrypted.")
+                                else -> ChatEmptyState("🔒", "End-to-end encrypted",
+                                    "Messages are sealed on this phone and can only be opened on " +
+                                        "${peer?.displayName() ?: "theirs"}'s. They travel phone to phone, through " +
+                                        "LoRa hubs or the internet relay, and wait in the buffer until a path appears.")
+                            }
+                        }
+                    }
                 }
-                item { Spacer(Modifier.height(8.dp)) }
+                items(rows, key = { it.key }) { row ->
+                    when (row) {
+                        is ChatRow.Day -> DaySeparator(row.label)
+                        is ChatRow.Bubble -> MessageBubble(
+                            msg = row.msg,
+                            // Multi-party chats label incoming bubbles with their sender (once per run).
+                            senderLabel = if ((isBroadcast || isGroup) && !row.continued) nameOf(row.msg.from) else null,
+                            continued = row.continued,
+                            onInfo = { infoFor = row.msg.msgId.take(8) },
+                            onCopy = {
+                                clipboard.setText(AnnotatedString(row.msg.text))
+                                // Android 13+ confirms clipboard writes itself.
+                                if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) {
+                                    scope.launch { snackbars.showSnackbar("Copied") }
+                                }
+                            },
+                        )
+                    }
+                }
             }
             val composerError by viewModel.composerError.collectAsState()
             composerError?.let { err ->
                 Text(
                     err,
                     color = Palette.Error,
-                    fontSize = 11.sp,
+                    fontSize = 12.sp,
                     modifier = Modifier.fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clickable { viewModel.clearComposerError() },
+                        .background(Palette.ErrorSoft)
+                        .clickable(onClickLabel = "Dismiss") { viewModel.clearComposerError() }
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
                 )
             }
-            MessageComposer(onSend = { viewModel.sendTestMessage(it) })
+            if (isGroup && group == null) {
+                Surface(color = Palette.CardSurface, shadowElevation = 4.dp) {
+                    Text("You left this group, so you can't send to it any more. Rejoin with an invite (👥).",
+                        fontSize = 12.sp, color = Palette.TextSecondary, textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(16.dp))
+                }
+            } else {
+                MessageComposer(placeholder = placeholder, onSend = { viewModel.sendTestMessage(it) })
+            }
+        }
+    }
+
+    if (showInfo) {
+        when {
+            group != null -> GroupInfoDialog(viewModel, group, membersSeen) { showInfo = false }
+            peer != null -> ContactInfoDialog(
+                viewModel, peer,
+                onRename = { showInfo = false; renaming = true },
+                onDismiss = { showInfo = false },
+            )
+            else -> showInfo = false
+        }
+    }
+    if (renaming && peer != null) {
+        RenameDialog(peer = peer, onDismiss = { renaming = false },
+            onSave = { name -> viewModel.renamePeer(peer.nodeId, name); renaming = false })
+    }
+    infoFor?.let { id -> MessageInfoDialog(viewModel, id) { infoFor = null } }
+}
+
+/** A row of the conversation: a date separator or a message bubble. */
+private sealed interface ChatRow {
+    val key: String
+
+    data class Day(val label: String, override val key: String) : ChatRow
+
+    /** @param continued same sender as the bubble above within a few minutes (tighter, unlabeled). */
+    data class Bubble(val msg: ChatMessage, val continued: Boolean) : ChatRow {
+        override val key: String get() = msg.msgId
+    }
+}
+
+/** Oldest-first rows: a date separator before each new day, and sender runs marked as continued. */
+private fun buildChatRows(messages: List<ChatMessage>, nowMs: Long): List<ChatRow> {
+    val rows = ArrayList<ChatRow>(messages.size + 4)
+    var lastDay = Long.MIN_VALUE
+    var prev: ChatMessage? = null
+    for (m in messages) {
+        val day = UiText.dayKey(m.createdAtMs)
+        if (day != lastDay) {
+            rows += ChatRow.Day(UiText.dayLabel(m.createdAtMs, nowMs), "day-$day")
+            lastDay = day
+            prev = null
+        }
+        val p = prev
+        val continued = p != null && p.isOutgoing == m.isOutgoing && p.from == m.from &&
+            m.createdAtMs - p.createdAtMs < 5 * 60_000L
+        rows += ChatRow.Bubble(m, continued)
+        prev = m
+    }
+    return rows
+}
+
+@Composable
+private fun DaySeparator(label: String) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 10.dp), contentAlignment = Alignment.Center) {
+        Surface(shape = RoundedCornerShape(10.dp), color = Palette.CardSurface, shadowElevation = 1.dp) {
+            Text(label, fontSize = 11.sp, color = Palette.TextSecondary, fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
         }
     }
 }
 
 @Composable
-private fun MessageBubble(msg: ChatMessage) {
+private fun ChatEmptyState(icon: String, title: String, body: String) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Palette.CardSurface,
+        shadowElevation = 1.dp,
+        modifier = Modifier.padding(horizontal = 24.dp),
+    ) {
+        Column(modifier = Modifier.padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(icon, fontSize = 28.sp)
+            Spacer(Modifier.height(6.dp))
+            Text(title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.TextPrimary,
+                textAlign = TextAlign.Center)
+            Spacer(Modifier.height(4.dp))
+            Text(body, fontSize = 12.sp, color = Palette.TextSecondary, textAlign = TextAlign.Center)
+        }
+    }
+}
+
+/**
+ * One chat bubble. Tap or long-press opens Message info / Copy. Outgoing bubbles show the unified
+ * delivery state (🕓 Queued · ✓ Sent · ✓✓ Delivered · ! Expired); incoming ones show the link the
+ * message arrived over.
+ *
+ * @param senderLabel shown above incoming bubbles in group / broadcast chats (null in 1:1).
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MessageBubble(
+    msg: ChatMessage,
+    senderLabel: String?,
+    continued: Boolean,
+    onInfo: () -> Unit,
+    onCopy: () -> Unit,
+) {
     val isOutgoing = msg.isOutgoing
-    val align = if (isOutgoing) Alignment.End else Alignment.Start
     val bgColor = if (isOutgoing) Palette.BubbleOut else Palette.BubbleIn
     val shape = if (isOutgoing) {
-        RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp, bottomStart = 14.dp, bottomEnd = 4.dp)
+        RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp)
     } else {
-        RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp, bottomStart = 4.dp, bottomEnd = 14.dp)
+        RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp)
     }
-    val statusColor = when {
-        msg.status.contains("delivered") -> Palette.Accent
-        msg.status.contains("received") -> Palette.Accent
-        msg.status.contains("buffered") -> Palette.Warning
-        msg.status.contains("expired") || msg.status.contains("dropped") -> Palette.Error
-        else -> Palette.TextMuted
+    // Darker-than-palette tones so the small status text stays readable on the green bubble.
+    val stateTone = when (msg.state) {
+        DeliveryState.DELIVERED -> Palette.DeliveredText
+        DeliveryState.QUEUED -> Palette.QueuedText
+        DeliveryState.EXPIRED, DeliveryState.DROPPED -> Palette.Error
+        else -> Palette.BubbleMeta
     }
+    var menuOpen by remember { mutableStateOf(false) }
+    val haptics = LocalHapticFeedback.current
 
-    Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = align) {
-        Surface(
-            shape = shape,
-            color = bgColor,
-            shadowElevation = 1.dp,
-            modifier = Modifier.widthIn(max = 300.dp).padding(vertical = 2.dp),
-        ) {
-            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                if (!isOutgoing) {
-                    Text(msg.from.takeLast(8), fontSize = 10.sp, color = Palette.TextMuted,
-                        fontWeight = FontWeight.SemiBold)
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth().padding(top = if (continued) 2.dp else 6.dp)) {
+        val maxBubble = maxWidth * 0.8f
+        Box(modifier = Modifier.align(if (isOutgoing) Alignment.CenterEnd else Alignment.CenterStart)) {
+            Surface(
+                shape = shape,
+                color = bgColor,
+                shadowElevation = 1.dp,
+                modifier = Modifier.widthIn(max = maxBubble)
+                    .clip(shape)
+                    .combinedClickable(
+                        onClickLabel = "Message options",
+                        onLongClickLabel = "Message options",
+                        onClick = { menuOpen = true },
+                        onLongClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            menuOpen = true
+                        },
+                    ),
+            ) {
+                Column(modifier = Modifier.padding(start = 12.dp, end = 10.dp, top = 7.dp, bottom = 5.dp)) {
+                    if (!isOutgoing && senderLabel != null) {
+                        Text(senderLabel, fontSize = 12.sp, color = Palette.PrimaryDark,
+                            fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Text(msg.text, fontSize = 15.sp, color = Palette.TextPrimary, lineHeight = 20.sp)
+                    Row(
+                        modifier = Modifier.align(Alignment.End).padding(top = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(msg.time, fontSize = 11.sp, color = Palette.BubbleMeta)
+                        if (isOutgoing) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                listOf(msg.state.short, msg.state.tick).filter { it.isNotBlank() }.joinToString(" "),
+                                fontSize = 11.sp, color = stateTone, fontWeight = FontWeight.Medium,
+                            )
+                        } else if (msg.via.isNotBlank()) {
+                            Text(" · via ${msg.via}", fontSize = 11.sp, color = Palette.BubbleMeta)
+                        }
+                    }
                 }
-                Text(msg.text, fontSize = 14.sp, color = Palette.TextPrimary)
-                Row(modifier = Modifier.padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Text(msg.time, fontSize = 9.sp, color = Palette.TextMuted)
-                    Spacer(Modifier.width(6.dp))
-                    Text(msg.status, fontSize = 9.sp, color = statusColor,
-                        fontWeight = FontWeight.Medium)
-                }
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(text = { Text("Message info") }, onClick = { menuOpen = false; onInfo() })
+                DropdownMenuItem(text = { Text("Copy text") }, onClick = { menuOpen = false; onCopy() })
             }
         }
     }
 }
 
+/**
+ * Multi-line composer. Send is disabled while the text is blank or over the single-frame byte
+ * budget; the counter only appears once the budget starts to matter.
+ */
 @Composable
-private fun MessageComposer(onSend: (String) -> Unit) {
-    var text by remember { mutableStateOf("") }
+private fun MessageComposer(placeholder: String, onSend: (String) -> Unit) {
+    var text by rememberSaveable { mutableStateOf("") }
     val byteLen = remember(text) { text.toByteArray(Charsets.UTF_8).size }
-    val over = byteLen > DtnViewModel.MAX_MSG_BYTES
+    val max = DtnViewModel.MAX_MSG_BYTES
+    val over = byteLen > max
+    val canSend = text.isNotBlank() && !over
     Surface(
         color = Palette.CardSurface,
         shadowElevation = 4.dp,
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp)) {
-            if (text.isNotEmpty()) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
+            if (byteLen >= max * 3 / 4) {
                 Text(
-                    "$byteLen/${DtnViewModel.MAX_MSG_BYTES} bytes",
-                    fontSize = 10.sp,
-                    color = if (over) Palette.Error else Palette.TextMuted,
-                    modifier = Modifier.padding(start = 12.dp, bottom = 2.dp),
+                    if (over) "Too long — $byteLen/$max bytes. Messages travel in one radio frame; shorten it to send."
+                    else "$byteLen/$max bytes",
+                    fontSize = 11.sp,
+                    color = if (over) Palette.Error else Palette.TextSecondary,
+                    modifier = Modifier.padding(start = 14.dp, bottom = 4.dp),
                 )
             }
             Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Bottom,
             ) {
-                OutlinedTextField(
+                TextField(
                     value = text,
                     onValueChange = { text = it },
                     modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message…", fontSize = 14.sp) },
-                    singleLine = true,
+                    placeholder = {
+                        Text(placeholder, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 15.sp),
+                    minLines = 1,
+                    maxLines = 5,
                     isError = over,
                     shape = RoundedCornerShape(22.dp),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = Palette.Surface,
                         unfocusedContainerColor = Palette.Surface,
+                        errorContainerColor = Palette.ErrorSoft,
                         focusedIndicatorColor = Color.Transparent,
                         unfocusedIndicatorColor = Color.Transparent,
+                        errorIndicatorColor = Color.Transparent,
                     ),
                 )
                 Spacer(Modifier.width(6.dp))
                 FilledIconButton(
-                    onClick = {
-                        if (text.isNotBlank() && !over) { onSend(text); text = "" }
-                    },
+                    onClick = { if (canSend) { onSend(text); text = "" } },
+                    enabled = canSend,
                     colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = Palette.Primary, contentColor = Color.White,
+                        disabledContainerColor = Palette.Primary.copy(alpha = 0.35f),
+                        disabledContentColor = Color.White,
                     ),
-                    modifier = Modifier.size(46.dp),
-                ) { Icon(Icons.Default.Send, contentDescription = "Send") }
+                    modifier = Modifier.size(52.dp).padding(bottom = 2.dp),
+                ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send") }
             }
         }
     }
@@ -754,7 +1040,7 @@ private fun MessageComposer(onSend: (String) -> Unit) {
  * ========================================================================== */
 
 @Composable
-private fun NetworkTab(viewModel: DtnViewModel) {
+private fun NetworkTab(viewModel: DtnViewModel, onOpenChat: (String) -> Unit) {
     val peers by viewModel.peerList.collectAsState()
     val messages by viewModel.receivedMessages.collectAsState()
     val buffered by viewModel.bufferedMessages.collectAsState()
@@ -763,17 +1049,26 @@ private fun NetworkTab(viewModel: DtnViewModel) {
     val routes by viewModel.messageRoutes.collectAsState()
     val activeStrategy by viewModel.activeStrategy.collectAsState()
     val benchmarks by viewModel.benchmarks.collectAsState()
-    val pValues = viewModel.getProbabilities()
-    val onlinePeers = peers.count { it.isOnline }
+    val metrics by viewModel.peerMetrics.collectAsState()
+    val groups by viewModel.groups.collectAsState()
+    val onlinePeers = peers.count { it.reachable }
+    val viaInternet = peers.count { !it.isOnline && it.internetOnline }
     val myId8 = localNodeId?.takeLast(8)
-    // A resolved route reached its destination. Split by whether WE were that destination
-    // (received) or we handed it onward to the final destination (delivered).
+    // A resolved route reached its destination. Split three ways so our OWN delivered messages
+    // aren't counted as relays: sent-by-me ✓, relayed-for-others ✓, and received-for-me.
     val resolvedRoutes = routes.count { it.delivered }
     val receivedRoutes = routes.count { it.delivered && it.destination == myId8 }
-    val deliveredRoutes = resolvedRoutes - receivedRoutes
-    var selectedRoute by remember {
-        mutableStateOf<com.dtn.mesh.service.MessageLifecycleLog.RouteRecord?>(null)
+    val sentDelivered = routes.count { it.delivered && it.destination != myId8 && it.source == myId8 }
+    val relayedDelivered = routes.count { it.delivered && it.destination != myId8 && it.source != myId8 }
+    // Group messages travel as broadcasts; resolve their destination to the group name.
+    val groupLabelFor: (String) -> String? = { msgId8 ->
+        messages.firstOrNull { it.msgId.take(8) == msgId8 }?.toNodeId
+            ?.takeIf { it.startsWith("grp:") }
+            ?.let { key -> groups.firstOrNull { "grp:${it.channel}" == key }?.let { "Group · ${it.name}" } ?: "Group" }
     }
+    // Route rows show the same unified state as the chat bubble (chat row + journal).
+    val chatById = remember(messages) { messages.associateBy { it.msgId.take(8) } }
+    var selectedMsg by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedBuffer by remember { mutableStateOf<BufferedMsgInfo?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -805,7 +1100,8 @@ private fun NetworkTab(viewModel: DtnViewModel) {
                     onlinePeers = onlinePeers,
                     totalPeers = peers.size,
                     bufferedCount = bufferedCount,
-                    deliveredRoutes = deliveredRoutes,
+                    sentDelivered = sentDelivered,
+                    relayedDelivered = relayedDelivered,
                     receivedRoutes = receivedRoutes,
                 )
             }
@@ -822,7 +1118,12 @@ private fun NetworkTab(viewModel: DtnViewModel) {
             }
             item {
                 Spacer(Modifier.height(14.dp))
-                AnalyticsSectionHeader("Peers", "${peers.size} known · $onlinePeers active")
+                AnalyticsSectionHeader(
+                    "Peers",
+                    "${peers.size} known · $onlinePeers active" + if (viaInternet > 0) " ($viaInternet via internet)" else "",
+                )
+                Text("Tap a peer to open the chat.", fontSize = 11.sp, color = Palette.TextMuted,
+                    modifier = Modifier.padding(bottom = 4.dp))
             }
             if (peers.isEmpty()) {
                 item { EmptyState("No peers seen yet", "Connect to start discovery") }
@@ -831,7 +1132,9 @@ private fun NetworkTab(viewModel: DtnViewModel) {
                 // LazyColumn requires globally-unique keys: a message can be BOTH buffered and
                 // present in route observations, and both use the same 8-char msgId — an
                 // un-namespaced key would collide across the two items() blocks and crash the tab.
-                items(peers, key = { "peer-${it.nodeId}" }) { peer -> NetworkPeerRow(peer, pValues[peer.nodeId]) }
+                items(peers, key = { "peer-${it.nodeId}" }) { peer ->
+                    NetworkPeerRow(peer, metrics[peer.nodeId], onClick = { onOpenChat(peer.nodeId) })
+                }
             }
 
             item {
@@ -846,7 +1149,8 @@ private fun NetworkTab(viewModel: DtnViewModel) {
                 // distinctBy guards against duplicate route records; the "route-" prefix keeps
                 // these keys distinct from the buffered section (same msgId, different section).
                 items(routes.distinctBy { it.msgId }, key = { "route-${it.msgId}" }) { r ->
-                    RouteRow(r, peers, myId8) { selectedRoute = r }
+                    val state = chatById[r.msgId]?.state ?: deliveryState(null, null, r.isBroadcast, r)
+                    RouteRow(r, peers, myId8, state, destOverride = groupLabelFor(r.msgId)) { selectedMsg = r.msgId }
                 }
             }
 
@@ -873,32 +1177,8 @@ private fun NetworkTab(viewModel: DtnViewModel) {
             item { Spacer(Modifier.height(24.dp)) }
         }
 
-        selectedRoute?.let { route ->
-            val chat = messages.firstOrNull { it.msgId.take(8) == route.msgId }
-            // Resolve the full destination node id from the peer list (route stores only the
-            // last 8 chars) or from the matched chat message, then ask the ViewModel for the
-            // routing-math breakdown toward it.
-            val fullDest = peers.firstOrNull { it.nodeId.takeLast(8) == route.destination }?.nodeId
-                ?: chat?.toNodeId
-            // Routing-math (path map + candidate carriers) applies to any message WE route
-            // onward — including ones we've already relayed or delivered, shown retrospectively
-            // so you can still inspect how the path was scored. It's hidden ONLY for messages
-            // addressed to THIS node (received), where there was never an onward hop decision.
-            val isForUs = myId8 != null && route.destination == myId8
-            val explanation = if (!isForUs) {
-                fullDest?.let { viewModel.explainRoute(it) }
-            } else {
-                null
-            }
-            RouteDetailDialog(
-                route = route,
-                chat = chat,
-                peers = peers,
-                myId8 = myId8,
-                explanation = explanation,
-                onDismiss = { selectedRoute = null },
-            )
-        }
+        // Live "Message info" — the same dialog the chat bubble opens.
+        selectedMsg?.let { id -> MessageInfoDialog(viewModel, id) { selectedMsg = null } }
 
         selectedBuffer?.let { buf ->
             // A buffered message is one still awaiting an onward forwarding decision, so the
@@ -968,34 +1248,55 @@ private fun BenchmarksCard(
             if (stats.isEmpty()) {
                 Text("No data yet — send/relay some messages.", fontSize = 11.sp, color = Palette.TextMuted)
             } else {
-                // Header row.
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    Text("STRAT", modifier = Modifier.weight(1.4f), fontSize = 9.sp, color = Palette.TextMuted)
-                    Text("FWD", modifier = Modifier.weight(1f), fontSize = 9.sp, color = Palette.TextMuted)
-                    Text("DELIV", modifier = Modifier.weight(1f), fontSize = 9.sp, color = Palette.TextMuted)
-                    Text("HOPS", modifier = Modifier.weight(1f), fontSize = 9.sp, color = Palette.TextMuted)
-                    Text("LAT(s)", modifier = Modifier.weight(1f), fontSize = 9.sp, color = Palette.TextMuted)
-                    Text("EFF", modifier = Modifier.weight(1f), fontSize = 9.sp, color = Palette.TextMuted)
-                }
-                stats.forEach { s ->
-                    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                        Text(s.strategy, modifier = Modifier.weight(1.4f), fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold, color = Palette.TextPrimary, maxLines = 1)
-                        Text("${s.forwards}", modifier = Modifier.weight(1f), fontSize = 10.sp,
-                            color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
-                        Text("${s.deliveries}", modifier = Modifier.weight(1f), fontSize = 10.sp,
-                            color = Palette.Accent, fontFamily = FontFamily.Monospace)
-                        Text("%.1f".format(s.avgHops), modifier = Modifier.weight(1f), fontSize = 10.sp,
-                            color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
-                        Text("%.1f".format(s.avgLatencyMs / 1000.0), modifier = Modifier.weight(1f),
-                            fontSize = 10.sp, color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
-                        Text("%.2f".format(s.efficiency), modifier = Modifier.weight(1f), fontSize = 10.sp,
-                            color = Palette.Primary, fontFamily = FontFamily.Monospace)
+                // Fixed column widths inside a horizontal scroller: full strategy names
+                // (STABLE-PROPHET, Q-LEARNING) never truncate and numbers never collide with
+                // headers, whatever the screen width or font scale.
+                val strategyCol = 124.dp
+                val numCol = 58.dp
+                Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                    Column {
+                        Row {
+                            BenchCell("STRATEGY", strategyCol, header = true)
+                            listOf("FWD", "DELIV", "HOPS", "LAT (s)", "EFF").forEach { BenchCell(it, numCol, header = true) }
+                        }
+                        HorizontalDivider(color = Palette.Divider, modifier = Modifier.width(strategyCol + numCol * 5))
+                        stats.forEach { s ->
+                            Row(modifier = Modifier.padding(vertical = 3.dp)) {
+                                BenchCell(s.strategy, strategyCol, bold = true)
+                                BenchCell("${s.forwards}", numCol, mono = true)
+                                BenchCell("${s.deliveries}", numCol, mono = true, color = Palette.Accent)
+                                BenchCell("%.1f".format(s.avgHops), numCol, mono = true)
+                                BenchCell("%.1f".format(s.avgLatencyMs / 1000.0), numCol, mono = true)
+                                BenchCell("%.2f".format(s.efficiency), numCol, mono = true, color = Palette.Primary)
+                            }
+                        }
                     }
                 }
+                Text("Swipe sideways if columns don't fit.", fontSize = 9.sp, color = Palette.TextMuted,
+                    modifier = Modifier.padding(top = 4.dp))
             }
         }
     }
+}
+
+@Composable
+private fun BenchCell(
+    text: String,
+    width: androidx.compose.ui.unit.Dp,
+    header: Boolean = false,
+    bold: Boolean = false,
+    mono: Boolean = false,
+    color: Color = if (header) Palette.TextMuted else Palette.TextSecondary,
+) {
+    Text(
+        text,
+        modifier = Modifier.width(width).padding(end = 6.dp),
+        fontSize = if (header) 9.sp else 11.sp,
+        fontWeight = if (bold) FontWeight.SemiBold else FontWeight.Normal,
+        color = if (bold) Palette.TextPrimary else color,
+        fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+        maxLines = 1,
+    )
 }
 
 @Composable
@@ -1045,7 +1346,8 @@ private fun NetworkSummaryCard(
     onlinePeers: Int,
     totalPeers: Int,
     bufferedCount: Int,
-    deliveredRoutes: Int,
+    sentDelivered: Int,
+    relayedDelivered: Int,
     receivedRoutes: Int,
 ) {
     Card(
@@ -1062,7 +1364,8 @@ private fun NetworkSummaryCard(
         ) {
             SummaryMetric("ACTIVE", "$onlinePeers/$totalPeers", "peers", Color.White)
             SummaryMetric("BUFFER", "$bufferedCount", "waiting", if (bufferedCount == 0) Color.White else Color(0xFFFFE082))
-            SummaryMetric("DELIVERED", "$deliveredRoutes", "relayed on", Color.White)
+            SummaryMetric("SENT ✓", "$sentDelivered", "my msgs", Color.White)
+            SummaryMetric("RELAYED", "$relayedDelivered", "for others", Color.White)
             SummaryMetric("RECEIVED", "$receivedRoutes", "for me", Color.White)
         }
     }
@@ -1101,9 +1404,10 @@ private fun SectionTitle(text: String) {
 }
 
 @Composable
-private fun NetworkPeerRow(peer: PeerInfo, p: Double?) {
+private fun NetworkPeerRow(peer: PeerInfo, metric: PeerMetric?, onClick: () -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
+            .clickable(onClickLabel = "Open chat with ${peer.displayName()}", onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
         shape = RoundedCornerShape(12.dp),
@@ -1123,28 +1427,40 @@ private fun NetworkPeerRow(peer: PeerInfo, p: Double?) {
                     fontFamily = FontFamily.Monospace,
                 )
                 Text(
-                    if (peer.isOnline) "active now" else "last seen ${relativeSince(peer.lastSeenMs)}",
+                    when {
+                        peer.isOnline && peer.hubOnly -> "active now · via LoRa hub"
+                        peer.isOnline -> "active now · nearby"
+                        peer.internetOnline -> "online via internet relay"
+                        else -> "last seen ${relativeSince(peer.lastSeenMs)}"
+                    },
                     fontSize = 10.sp,
-                    color = if (peer.isOnline) Palette.Accent else Palette.TextMuted,
+                    color = when {
+                        peer.isOnline -> Palette.Accent
+                        peer.internetOnline -> Palette.Primary
+                        else -> Palette.TextMuted
+                    },
                 )
             }
             Column(horizontalAlignment = Alignment.End) {
-                AssistChip(
-                    onClick = {},
-                    label = { Text(if (peer.isOnline) "ACTIVE" else "INACTIVE", fontSize = 10.sp) },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (peer.isOnline)
-                            Palette.Accent.copy(alpha = 0.15f)
-                        else Palette.Error.copy(alpha = 0.15f),
-                        labelColor = if (peer.isOnline) Palette.Accent else Palette.Error,
-                    ),
-                )
-                Spacer(Modifier.height(2.dp))
+                val (chipText, chipColor) = when {
+                    peer.isOnline -> "ACTIVE" to Palette.Accent
+                    peer.internetOnline -> "INTERNET" to Palette.Primary
+                    else -> "INACTIVE" to Palette.Error
+                }
+                Surface(shape = RoundedCornerShape(8.dp), color = chipColor.copy(alpha = 0.15f)) {
+                    Text(chipText, fontSize = 10.sp, color = chipColor, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                }
+                Spacer(Modifier.height(4.dp))
+                // The ACTIVE strategy's own score: P (PRoPHET), f (MaxProp), Q fwd/wait (Q-learning).
                 Text(
-                    "P = ${p?.let { "%.2f".format(it) } ?: "—"}   ${estimateDistStr(peer.lastRssi)}",
+                    "${metric?.label ?: "P"} = ${metric?.value ?: "—"}   ${estimateDistStr(peer.lastRssi)}",
                     fontSize = 10.sp, color = Palette.TextMuted,
                     fontFamily = FontFamily.Monospace,
                 )
+                if (metric != null && metric.hint.isNotBlank()) {
+                    Text(metric.hint, fontSize = 9.sp, color = Palette.TextMuted)
+                }
             }
         }
     }
@@ -1155,12 +1471,15 @@ private fun RouteRow(
     r: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
     peers: List<PeerInfo>,
     myId8: String?,
+    state: DeliveryState,
+    destOverride: String? = null,
     onClick: () -> Unit,
 ) {
-    val statusColor = if (r.delivered) Palette.Accent else Palette.Warning
-    val statusText = if (r.delivered) "RESOLVED" else "IN TRANSIT"
+    // Same state (and colour) as the chat bubble and Message info.
+    val statusColor = stateColor(state)
+    val statusText = state.pill
     val fromLabel = peerLabelFor(r.source, peers, myId8)
-    val toLabel = peerLabelFor(r.destination, peers, myId8)
+    val toLabel = destOverride ?: peerLabelFor(r.destination, peers, myId8)
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
@@ -1192,8 +1511,15 @@ private fun RouteRow(
                     letterSpacing = 0.6.sp, modifier = Modifier.padding(top = 6.dp))
                 Text(formatObservedPath(r, peers, myId8), fontSize = 12.sp, color = Palette.Primary,
                     fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
-                Text("Tap for details", fontSize = 9.sp, color = Palette.Primary.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 4.dp))
+                Text(
+                    buildString {
+                        if (r.lastPath.isNotBlank()) append("via ${r.lastPath} · ")
+                        append("updated ${relativeSince(r.timestampMs)}")
+                        append(" · tap for message info")
+                    },
+                    fontSize = 9.sp, color = Palette.Primary.copy(alpha = 0.7f),
+                    modifier = Modifier.padding(top = 4.dp),
+                )
             }
         }
     }
@@ -1204,9 +1530,10 @@ private fun RouteRow(
  * peer's saved nickname / long name for display. Returns null when there's no match so
  * callers can fall back to the raw id.
  */
-private fun peerLabelFor(idSuffix: String?, peers: List<PeerInfo>, myId8: String? = null): String? {
+internal fun peerLabelFor(idSuffix: String?, peers: List<PeerInfo>, myId8: String? = null): String? {
     if (idSuffix.isNullOrBlank()) return null
-    if (idSuffix == "BROADCAST") return "Broadcast"
+    // Every broadcast form ("BROADCAST", "^all", "!ffffffff", its last-8 "ffffffff") reads the same.
+    if (UiText.isBroadcastId(idSuffix)) return "Broadcast"
     if (myId8 != null && idSuffix == myId8) return "YOU"
     val match = peers.firstOrNull { it.nodeId.takeLast(8) == idSuffix } ?: return null
     val label = match.displayName()
@@ -1225,7 +1552,7 @@ private fun peerLabelFor(idSuffix: String?, peers: List<PeerInfo>, myId8: String
  *            `vrishank ⋯ priya → YOU`    (originated at vrishank, reached us via priya)
  *            `YOU → priya`               (we forwarded onward)
  */
-private fun formatObservedPath(
+internal fun formatObservedPath(
     r: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
     peers: List<PeerInfo>,
     myId8: String?,
@@ -1243,6 +1570,8 @@ private fun formatObservedPath(
     if (r.me.isNotBlank() && r.me != r.source) sb.append("  →  ").append("YOU")
     val next = r.nextHop
     if (!next.isNullOrBlank() && next != r.me) sb.append("  →  ").append(lbl(next))
+    // Published to every relay subscriber at once: there's no single next hop to name.
+    else if (r.isBroadcast && r.lastPath.isNotBlank()) sb.append("  →  everyone (").append(r.lastPath).append(")")
     return sb.toString()
 }
 
@@ -1256,132 +1585,6 @@ private fun relativeSince(ms: Long): String {
         delta < 3_600_000L -> "${delta / 60_000}m ago"
         delta < 86_400_000L -> "${delta / 3_600_000}h ago"
         else -> "${delta / 86_400_000}d ago"
-    }
-}
-
-@Composable
-private fun RouteDetailDialog(
-    route: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
-    chat: ChatMessage?,
-    peers: List<PeerInfo>,
-    myId8: String?,
-    explanation: RoutingExplanation?,
-    onDismiss: () -> Unit,
-) {
-    val fromLabel = peerLabelFor(route.source, peers, myId8)
-    val toLabel = peerLabelFor(route.destination, peers, myId8)
-    val prevLabel = peerLabelFor(route.prevHop, peers, myId8)
-    val nextLabel = peerLabelFor(route.nextHop, peers, myId8)
-    val time = java.text.SimpleDateFormat("MMM d, HH:mm:ss", java.util.Locale.US)
-        .format(java.util.Date(route.timestampMs))
-    val statusColor = if (route.delivered) Palette.Accent else Palette.Warning
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
-        title = {
-            Column {
-                Text("Message details", fontWeight = FontWeight.SemiBold, fontSize = 16.sp,
-                    color = Palette.TextPrimary)
-                Text("MSG ${route.msgId}", fontSize = 11.sp, color = Palette.TextMuted,
-                    fontFamily = FontFamily.Monospace)
-            }
-        },
-        text = {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Surface(shape = RoundedCornerShape(8.dp), color = statusColor.copy(alpha = 0.15f)) {
-                    Text(if (route.delivered) "DELIVERED" else "IN TRANSIT",
-                        fontSize = 10.sp, color = statusColor, fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
-                }
-                Spacer(Modifier.height(10.dp))
-
-                DetailRow("Content", chat?.text ?: "Not available on this device")
-                DetailRow("From", labelWithId(fromLabel, route.source))
-                DetailRow("To", labelWithId(toLabel, route.destination))
-                if (!route.prevHop.isNullOrBlank())
-                    DetailRow("Received from (prev hop)", labelWithId(prevLabel, route.prevHop))
-                DetailRow("This node", if (route.me == myId8) "YOU (${route.me})" else route.me)
-                if (!route.nextHop.isNullOrBlank())
-                    DetailRow("Forwarded to (next hop)", labelWithId(nextLabel, route.nextHop))
-                DetailRow("Observed path", formatObservedPath(route, peers, myId8), mono = true)
-                if (route.strategy.isNotBlank()) DetailRow("Routed by", route.strategy)
-                DetailRow("Last update", time)
-                if (chat != null) {
-                    DetailRow("Direction", if (chat.isOutgoing) "Outgoing" else "Incoming")
-                    DetailRow("Chat status", chat.status)
-                }
-
-                // Message addressed to THIS node was delivered here — there is no onward
-                // forwarding decision, so a "candidate carriers / best next hop" map would be
-                // misleading. Show a delivery summary (how it reached us) instead. For messages
-                // we route onward, show the forward-scoring breakdown.
-                val isForUs = myId8 != null && route.destination == myId8
-                HorizontalDivider(color = Palette.Divider, modifier = Modifier.padding(vertical = 6.dp))
-                when {
-                    isForUs -> ReceivedDeliverySection(route, peers, myId8)
-                    explanation != null -> RoutingMathSection(
-                        exp = explanation,
-                        destLabel = route.destination,
-                        retrospective = route.delivered,
-                        prevHop = route.prevHop,
-                        nextHop = route.nextHop,
-                    )
-                    else -> Text(
-                        "No forwarding breakdown for this message (broadcast, or a strategy " +
-                            "without a per-hop probability score).",
-                        fontSize = 11.sp, color = Palette.TextMuted,
-                        modifier = Modifier.padding(vertical = 4.dp),
-                    )
-                }
-            }
-        },
-    )
-}
-
-/**
- * Delivery summary for a message whose destination is THIS node (received). There was no
- * onward forwarding decision to make, so instead of the forward-candidate map we explain how the
- * message reached us: origin, the immediate hop that handed it over, the observed path, and which
- * routing algorithm delivered it.
- */
-@Composable
-private fun ReceivedDeliverySection(
-    route: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
-    peers: List<PeerInfo>,
-    myId8: String?,
-) {
-    val fromLabel = peerLabelFor(route.source, peers, myId8) ?: route.source
-    val viaId = route.prevHop
-    val viaLabel = when {
-        viaId.isNullOrBlank() || viaId == route.source -> "direct from origin"
-        else -> peerLabelFor(viaId, peers, myId8) ?: viaId
-    }
-    Column {
-        Text("DELIVERY · RECEIVED HERE", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-            color = Palette.Accent, letterSpacing = 0.8.sp)
-        Text(
-            "This message is addressed to this node, so it terminated here — there was no next-hop " +
-                "forwarding decision. Here's how it reached you.",
-            fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp),
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            StatTile(modifier = Modifier.weight(1f), label = "ORIGIN", value = fromLabel, tint = Palette.Primary)
-            StatTile(modifier = Modifier.weight(1f), label = "ARRIVED VIA", value = viaLabel, tint = Palette.Accent)
-        }
-        Spacer(Modifier.height(10.dp))
-        Text("PATH", fontSize = 10.sp, fontWeight = FontWeight.Bold,
-            color = Palette.TextSecondary, letterSpacing = 0.8.sp)
-        Surface(shape = RoundedCornerShape(8.dp), color = Palette.Surface,
-            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
-            Text(formatObservedPath(route, peers, myId8), fontSize = 12.sp, color = Palette.TextPrimary,
-                fontFamily = FontFamily.Monospace, modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp))
-        }
-        if (route.strategy.isNotBlank()) {
-            Spacer(Modifier.height(8.dp))
-            Text("Delivered under the ${route.strategy} routing strategy.",
-                fontSize = 11.sp, color = Palette.TextMuted)
-        }
     }
 }
 
@@ -1473,7 +1676,7 @@ private fun BufferDetailDialog(
  * likelihood, and the transitive gain — annotating the previous/next hop on this route.
  */
 @Composable
-private fun RoutingMathSection(
+internal fun RoutingMathSection(
     exp: RoutingExplanation,
     destLabel: String,
     retrospective: Boolean = false,
@@ -1585,61 +1788,56 @@ private fun RoutingMapView(exp: RoutingExplanation) {
             color = Palette.TextMuted, modifier = Modifier.padding(vertical = 8.dp))
         return
     }
-    val density = LocalDensity.current
     val chosenColor = Palette.Accent
     val greyColor = Color(0xFFBDBDBD)
     val youColor = Palette.Primary
-    val labelArgb = Palette.TextPrimary.toArgb()
-    val subArgb = Palette.TextMuted.toArgb()
-    val chosenArgb = chosenColor.toArgb()
-    val youArgb = youColor.toArgb()
+    // Rows grow with the user's font scale so two lines of label always fit.
+    val rowHeight = with(LocalDensity.current) { 22.sp.toDp() * 2 }.coerceAtLeast(40.dp)
 
-    val namePaint = remember {
-        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = with(density) { 12.sp.toPx() }
-        }
-    }
-    val scorePaint = remember {
-        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = with(density) { 10.sp.toPx() }
-        }
-    }
-
-    val canvasHeight = 40.dp * online.size + 12.dp
-    Canvas(modifier = Modifier.fillMaxWidth().height(canvasHeight)) {
-        val leftX = 26.dp.toPx()
-        val rightX = size.width - 132.dp.toPx()
-        val nodeR = 7.dp.toPx()
-        val youCenter = Offset(leftX, size.height / 2f)
-        val rowPx = size.height / online.size
-
-        online.forEachIndexed { i, b ->
-            val target = Offset(rightX, rowPx * (i + 0.5f))
-            val chosen = b.nodeId == exp.bestNextHop
-            drawLine(
-                color = if (chosen) chosenColor else greyColor,
-                start = youCenter, end = target,
-                strokeWidth = if (chosen) 3.dp.toPx() else 1.dp.toPx(),
-            )
-            drawCircle(if (chosen) chosenColor else greyColor, radius = nodeR, center = target)
-            drawContext.canvas.nativeCanvas.apply {
-                namePaint.color = if (chosen) chosenArgb else labelArgb
-                drawText(
-                    b.displayName.take(10) + if (chosen) "  ✓" else "",
-                    target.x + nodeR + 8.dp.toPx(), target.y - 2.dp.toPx(), namePaint,
+    // Lines and dots are drawn on a canvas; every label is real Compose text in its own row
+    // (ellipsized), so nothing clips or overlaps on narrow screens or with large text.
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth().height(rowHeight * online.size + 8.dp)) {
+        // Keep the carrier dots at ~40% of the width (bounded) so the labels get the rest.
+        val dotX = (maxWidth * 0.40f).coerceIn(72.dp, 150.dp)
+        val leftX = 22.dp
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val nodeR = 7.dp.toPx()
+            val rowPx = rowHeight.toPx()
+            val youCenter = Offset(leftX.toPx(), (rowPx * online.size) / 2f + 4.dp.toPx())
+            online.forEachIndexed { i, b ->
+                val target = Offset(dotX.toPx(), 4.dp.toPx() + rowPx * (i + 0.5f))
+                val chosen = b.nodeId == exp.bestNextHop
+                drawLine(
+                    color = if (chosen) chosenColor else greyColor,
+                    start = youCenter, end = target,
+                    strokeWidth = if (chosen) 3.dp.toPx() else 1.dp.toPx(),
                 )
-                scorePaint.color = subArgb
-                drawText(
-                    "${exp.bestScoreLabel} %.2f".format(b.score),
-                    target.x + nodeR + 8.dp.toPx(), target.y + 12.dp.toPx(), scorePaint,
-                )
+                drawCircle(if (chosen) chosenColor else greyColor, radius = nodeR, center = target)
             }
+            drawCircle(youColor, radius = nodeR + 2.dp.toPx(), center = youCenter)
         }
-
-        drawCircle(youColor, radius = nodeR + 2.dp.toPx(), center = youCenter)
-        drawContext.canvas.nativeCanvas.apply {
-            namePaint.color = youArgb
-            drawText("YOU", youCenter.x - 12.dp.toPx(), youCenter.y - nodeR - 6.dp.toPx(), namePaint)
+        Text(
+            "YOU", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = youColor,
+            modifier = Modifier.padding(start = 6.dp, top = (rowHeight * online.size) / 2f - 18.dp),
+        )
+        Column(modifier = Modifier.fillMaxSize().padding(start = dotX + 14.dp, top = 4.dp)) {
+            online.forEach { b ->
+                val chosen = b.nodeId == exp.bestNextHop
+                Column(modifier = Modifier.height(rowHeight), verticalArrangement = Arrangement.Center) {
+                    Text(
+                        b.displayName + if (chosen) "  ✓" else "",
+                        fontSize = 12.sp,
+                        fontWeight = if (chosen) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (chosen) chosenColor else Palette.TextPrimary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${exp.bestScoreLabel} %.2f".format(b.score),
+                        fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
     }
 }
@@ -1690,14 +1888,14 @@ private fun FormulaLine(label: String, formula: String) {
 }
 
 /** Prefer the friendly label, then append the raw id in parentheses for traceability. */
-private fun labelWithId(label: String?, id: String?): String = when {
+internal fun labelWithId(label: String?, id: String?): String = when {
     id.isNullOrBlank() -> "—"
     label == null -> id
     else -> "$label ($id)"
 }
 
 @Composable
-private fun DetailRow(label: String, value: String, mono: Boolean = false) {
+internal fun DetailRow(label: String, value: String, mono: Boolean = false) {
     Column(modifier = Modifier.padding(bottom = 8.dp)) {
         Text(label.uppercase(), fontSize = 9.sp, color = Palette.TextMuted, letterSpacing = 0.6.sp)
         Text(
@@ -1795,6 +1993,7 @@ private fun LifecycleFilterChip(
 private fun LifecycleTab(viewModel: DtnViewModel) {
     val entries by viewModel.lifecycleEntries.collectAsState()
     var filter by remember { mutableStateOf(LifecycleFilter.ALL) }
+    var infoFor by rememberSaveable { mutableStateOf<String?>(null) }
     val visibleEntries = entries.filter { entry ->
         when (filter) {
             LifecycleFilter.ALL -> true
@@ -1831,7 +2030,7 @@ private fun LifecycleTab(viewModel: DtnViewModel) {
         if (bufferHistory.isEmpty()) {
             item { EmptyState("No buffered messages yet", "Carried messages will be tracked here") }
         } else {
-            items(bufferHistory, key = { "buf-${it.msgId}" }) { BufferHistoryRow(it) }
+            items(bufferHistory, key = { "buf-${it.msgId}" }) { BufferHistoryRow(it) { infoFor = it.msgId } }
         }
 
         // ── Live event log with filters ──
@@ -1861,10 +2060,12 @@ private fun LifecycleTab(viewModel: DtnViewModel) {
             itemsIndexed(
                 visibleEntries,
                 key = { i, e -> "$i-${e.timestamp}-${e.msgId}-${e.event}" },
-            ) { _, e -> LifecycleEntryRow(e) }
+            ) { _, e -> LifecycleEntryRow(e) { infoFor = e.msgId } }
         }
         item { Spacer(Modifier.height(24.dp)) }
     }
+
+    infoFor?.let { id -> MessageInfoDialog(viewModel, id) { infoFor = null } }
 }
 
 /** One message's journey through the buffer, reconstructed from the lifecycle event feed. */
@@ -1900,6 +2101,10 @@ private fun deriveBufferHistory(
     for ((id, list) in byId) {
         // list is newest-first: lastOrNull match = earliest BUFFERED, firstOrNull = latest clear.
         val buffered = list.lastOrNull { it.event == com.dtn.mesh.service.LifecycleEvent.BUFFERED } ?: continue
+        // Broadcasts and group messages ride the buffer epidemically until their TTL by design;
+        // they never wait for anyone, so they're not store-and-forward records (the event log
+        // still shows them).
+        if (UiText.isBroadcastId(buffered.dest)) continue
         val cleared = list.firstOrNull { it.event in clearing }
         out.add(BufferHistoryItem(
             msgId = id,
@@ -1915,7 +2120,7 @@ private fun deriveBufferHistory(
 }
 
 @Composable
-private fun BufferHistoryRow(item: BufferHistoryItem) {
+private fun BufferHistoryRow(item: BufferHistoryItem, onInfo: () -> Unit) {
     val (accent, disposition) = when (item.clearEvent) {
         com.dtn.mesh.service.LifecycleEvent.DELIVERED -> Palette.Accent to "Delivered to destination"
         com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED -> Palette.Accent to "Cleared by delivery receipt"
@@ -1925,7 +2130,8 @@ private fun BufferHistoryRow(item: BufferHistoryItem) {
         else -> Palette.Warning to "Still buffered"
     }
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)
+            .clickable(onClickLabel = "Message info", onClick = onInfo),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.5.dp),
         shape = RoundedCornerShape(12.dp),
@@ -1962,7 +2168,7 @@ private fun BufferHistoryRow(item: BufferHistoryItem) {
 }
 
 @Composable
-private fun LifecycleEntryRow(entry: com.dtn.mesh.service.LifecycleEntry) {
+private fun LifecycleEntryRow(entry: com.dtn.mesh.service.LifecycleEntry, onInfo: () -> Unit) {
     val eventColor = lifecycleColor(entry.event)
     var expanded by remember(entry) { mutableStateOf(false) }
     Card(
@@ -2010,6 +2216,9 @@ private fun LifecycleEntryRow(entry: com.dtn.mesh.service.LifecycleEntry) {
                     if (entry.forwardCount >= 0) LifecycleDetail("Forward count", entry.forwardCount.toString())
                     if (entry.ttlRemainingMin >= 0) LifecycleDetail("TTL remaining", "${entry.ttlRemainingMin} min")
                     if (entry.extra.isNotEmpty()) LifecycleDetail("Detail", entry.extra)
+                    TextButton(onClick = onInfo, contentPadding = ButtonDefaults.TextButtonContentPadding) {
+                        Text("Message info →", fontSize = 12.sp)
+                    }
                 }
             }
         }
@@ -2024,7 +2233,7 @@ private fun LifecycleDetail(label: String, value: String) {
     }
 }
 
-private fun lifecycleColor(event: com.dtn.mesh.service.LifecycleEvent): Color = when (event) {
+internal fun lifecycleColor(event: com.dtn.mesh.service.LifecycleEvent): Color = when (event) {
     com.dtn.mesh.service.LifecycleEvent.CREATED -> Palette.Primary
     com.dtn.mesh.service.LifecycleEvent.BUFFERED, com.dtn.mesh.service.LifecycleEvent.DUPLICATE -> Palette.Warning
     com.dtn.mesh.service.LifecycleEvent.FORWARDED, com.dtn.mesh.service.LifecycleEvent.DELIVERED,
@@ -2035,7 +2244,7 @@ private fun lifecycleColor(event: com.dtn.mesh.service.LifecycleEvent): Color = 
     com.dtn.mesh.service.LifecycleEvent.DROPPED -> Palette.Error
 }
 
-private fun lifecycleLabel(event: com.dtn.mesh.service.LifecycleEvent): String = when (event) {
+internal fun lifecycleLabel(event: com.dtn.mesh.service.LifecycleEvent): String = when (event) {
     com.dtn.mesh.service.LifecycleEvent.CREATED -> "Created"
     com.dtn.mesh.service.LifecycleEvent.BUFFERED -> "Buffered"
     com.dtn.mesh.service.LifecycleEvent.DUPLICATE -> "Duplicate received"

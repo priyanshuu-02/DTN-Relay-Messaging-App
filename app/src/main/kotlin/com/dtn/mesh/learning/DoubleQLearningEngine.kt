@@ -79,6 +79,17 @@ class DoubleQLearningEngine(
         }
     }
 
+    /**
+     * Averaged `(Q_A + Q_B) / 2` for FORWARD and STORE in [state] — read-only, for explaining a
+     * decision in the UI. Unseen states return (0.0, 0.0).
+     */
+    fun qValues(state: ForwardingState): Pair<Double, Double> {
+        val key = discretise(state)
+        val forward = (tableA.get(key, ForwardingAction.FORWARD) + tableB.get(key, ForwardingAction.FORWARD)) / 2.0
+        val store = (tableA.get(key, ForwardingAction.STORE) + tableB.get(key, ForwardingAction.STORE)) / 2.0
+        return forward to store
+    }
+
     private fun bestActionByAverage(stateKey: String): ForwardingAction {
         var bestAction = ForwardingAction.STORE
         var bestValue = Double.NEGATIVE_INFINITY

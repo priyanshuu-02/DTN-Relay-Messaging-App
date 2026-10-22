@@ -29,6 +29,11 @@ class DtnIdentity @Inject constructor(
     val edPub: ByteArray
     val nodeId: NodeId
     val nodeNum32: Int
+    /**
+     * When this identity was generated (epoch ms, 0 = unknown). Clearing the app's data or
+     * reinstalling makes a new identity, so anything issued before this belongs to an older one.
+     */
+    val createdAtMs: Long
 
     init {
         val file = File(context.filesDir, IDENTITY_FILE)
@@ -39,6 +44,8 @@ class DtnIdentity @Inject constructor(
         edPub = material.copyOfRange(96, 128)
         nodeNum32 = DtnCrypto.deriveNodeNum(xPub, edPub)
         nodeId = NodeId.fromNodeNum(nodeNum32)
+        // The file is only ever written when the keys are generated, so its mtime is their birth.
+        createdAtMs = runCatching { file.lastModified() }.getOrDefault(0L)
         Log.i(TAG, "Identity ready: $nodeId")
     }
 

@@ -26,6 +26,8 @@ import com.dtn.mesh.receiver.DeliveryStatusEvent
 import com.dtn.mesh.receiver.InboundPacket
 import com.dtn.mesh.receiver.MeshTransport
 import com.dtn.mesh.receiver.NodeEncounterEvent
+import com.dtn.mesh.receiver.SendPath
+import com.dtn.mesh.receiver.journalLabel
 import com.dtn.mesh.routing.RadioDistanceEstimator
 import com.dtn.mesh.routing.RoutingSummary
 import com.dtn.mesh.routing.StrategySelector
@@ -75,6 +77,7 @@ class DtnOrchestrator @Inject constructor(
     private val strategySelector: StrategySelector,
     private val lifecycle: MessageLifecycleLog,
     private val benchmark: com.dtn.mesh.learning.BenchmarkTracker,
+    private val localIdentity: com.dtn.mesh.model.LocalNodeIdentity,
 ) {
     companion object {
         private const val TAG = "DtnOrchestrator"
@@ -186,6 +189,14 @@ class DtnOrchestrator @Inject constructor(
     private fun markSendFailed(peer: String) { connectBackoffUntil[peer] = System.currentTimeMillis() + CONNECT_BACKOFF_MS }
     private fun markSendOk(peer: String) { connectBackoffUntil.remove(peer) }
 
+    /**
+     * [peer] is another phone on our LoRa hub and no link of ours ends at it (no BLE / Wi-Fi
+     * Direct). The hub routes on the bundle's destination, so the only thing worth handing over
+     * "for" such a phone is a bundle addressed to it; broadcasts and receipts reach it through the
+     * hub's own fan-out, and custody for a third party would just be a hub flood.
+     */
+    private fun isHubOnly(peer: NodeId): Boolean = transport.isHubPeer(peer) && !transport.reachesDirectly(peer)
+
     /** Signal a flush without blocking the caller (event loop stays responsive). Coalesced. */
     private fun requestFlush() {
         scope?.launch { flushToOnlinePeers() }
@@ -254,6 +265,15 @@ class DtnOrchestrator @Inject constructor(
         sc.launch {
             queueManager.terminalEvents.collect { ev ->
                 forgetSentTo(ev.msgId)
+                // Keep the route record honest about how the message ended.
+                lifecycle.markRouteOutcome(ev.msgId,
+                    if (ev.reason == MessageQueueManager.REASON_EXPIRED) "EXPIRED" else "DROPPED")
+                // Expiry is journaled by the housekeeping worker and "Clear" by the UI; a buffer
+                // pressure drop had no journal entry at all, so the timeline just stopped.
+                if (ev.reason == MessageQueueManager.REASON_DROPPED && lifecycle.isTracked(ev.msgId)) {
+                    lifecycle.log(LifecycleEvent.DROPPED, ev.msgId,
+                        extra = "evicted — buffer full (lowest-priority bundles are dropped first)")
+                }
                 // Tombstone messages that reached a definitive end so a late re-flood can't
                 // resurrect them after the buffer row is purged. Pressure drops are transient
                 // (the message may still be deliverable elsewhere) so they get NO tombstone.
@@ -265,6 +285,24 @@ class DtnOrchestrator @Inject constructor(
                         rememberTombstone(ev.msgId, "", "", SeenBundleEntity.Status.DROPPED, now + TOMBSTONE_RETENTION_MS)
                     else -> { /* pressure drop — re-acceptable, no tombstone */ }
                 }
+            }
+        }
+        // Internet presence: a contact appearing on the relay gets a flush right away (DMs for it,
+        // receipts, and a one-time catch-up of buffered broadcasts). A contact leaving the relay
+        // ends its "session", so the next appearance re-syncs — unless a radio still reaches it.
+        sc.launch {
+            var previous = emptySet<String>()
+            transport.internetPeers.collect { present ->
+                for (gone in previous - present) {
+                    val radioOnline = runCatching { contactDao.getByNodeId(gone)?.isOnline }.getOrNull() == true
+                    if (!radioOnline) {
+                        forgetSentToPeer(gone)
+                        receiptsSentTo.remove(gone)
+                        connectBackoffUntil.remove(gone)
+                    }
+                }
+                if ((present - previous).isNotEmpty()) ch.trySend(OrchestratorEvent.FlushBuffer)
+                previous = present
             }
         }
         // Proactive short-interval flush so buffered messages reach online peers promptly
@@ -328,8 +366,16 @@ class DtnOrchestrator @Inject constructor(
 
     private suspend fun onPeerEvent(event: NodeEncounterEvent) {
         val peerId = event.nodeId
+        if (peerId == transport.localNodeId) return // never a contact of ourselves
 
         if (!event.isOnline) {
+            // One link lost it, but another still reaches it (BLE went quiet while the phone is on
+            // our hub, or it left the hub but is still in Bluetooth range): it hasn't gone anywhere.
+            // Transports drop a peer from their reachable set before reporting it offline.
+            if (transport.isRadioReachable(peerId)) {
+                Log.d(TAG, "OFFLINE ignored: ${peerId.value.takeLast(8)} is still reachable over another link")
+                return
+            }
             contactDao.markOffline(peerId.value)
             encounterDao.getMostRecentEncounter(peerId.value)?.let { enc ->
                 if (enc.endTimeMs == 0L) {
@@ -367,8 +413,9 @@ class DtnOrchestrator @Inject constructor(
         // in the UI even while we're actively receiving from them.
         contactDao.markOnline(peerId.value)
         // Keep the RSSI signal bars fresh — recordEncounter only fires on novel encounters,
-        // so without this, the UI's signal indicator would stick to a stale value.
-        contactDao.updateSignal(peerId.value, event.rssi, event.snr)
+        // so without this, the UI's signal indicator would stick to a stale value. A phone seen
+        // through the hub's roster has no signal of its own (-200): keep the last real reading.
+        if (event.rssi > -200) contactDao.updateSignal(peerId.value, event.rssi, event.snr)
         if (event.longName != null || event.shortName != null) {
             contactDao.updateNodeInfo(peerId.value, event.longName, event.shortName, event.hwModel)
         }
@@ -446,11 +493,15 @@ class DtnOrchestrator @Inject constructor(
         // Exchange routing summaries so both sides can drive Stage-2 (smart-spread) decisions
         // based on the peer's own predictability table. Launched OFF the event loop (so a slow
         // write to this peer can't stall other peers' events) but under this peer's lock so it
-        // serialises with the flush's writes to the same GATT link.
-        scope?.launch {
-            peerLock(peerId.value).withLock {
-                runCatching { sendRoutingSummary(peerId) }
-                    .onFailure { Log.w(TAG, "routing summary to ${peerId.value.takeLast(8)} failed", it) }
+        // serialises with the flush's writes to the same GATT link. A summary describes a 1-hop
+        // neighbour, so only over a link that ends at the peer — not to a phone two hops away
+        // through our hub, and not to the hub itself (it never reads them).
+        if (transport.reachesDirectly(peerId) && !transport.isHub(peerId)) {
+            scope?.launch {
+                peerLock(peerId.value).withLock {
+                    runCatching { sendRoutingSummary(peerId) }
+                        .onFailure { Log.w(TAG, "routing summary to ${peerId.value.takeLast(8)} failed", it) }
+                }
             }
         }
 
@@ -523,25 +574,37 @@ class DtnOrchestrator @Inject constructor(
      * GATT link never interleave.
      */
     private suspend fun flushOnce() {
-        val peers = contactDao.getOnlineContacts()
-        if (peers.isEmpty()) return
+        val radioPeers = contactDao.getOnlineContacts().map { it.nodeId }
+        // Contacts present on the internet relay and NOT reachable by a local radio. A radio link
+        // always wins (normal DTN semantics incl. custody); relay-only peers get relay semantics.
+        val myId = transport.localNodeId?.value
+        val radioSet = radioPeers.toSet()
+        val relayPeers = transport.internetPeers.value
+            .filter { it != myId && it !in radioSet }
+            .filter { runCatching { contactDao.getByNodeId(it) }.getOrNull() != null }
+        if (radioPeers.isEmpty() && relayPeers.isEmpty()) return
         val now = System.currentTimeMillis()
-        val onlineIds = peers.map { it.nodeId }.toSet()
+        val onlineIds = radioSet + relayPeers
         val snapshot = queueManager.getAllBuffered()
         // msgId → set of peers we successfully fanned a broadcast to this pass (thread-safe).
         val broadcastsSentTo = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
 
         coroutineScope {
-            for (peer in peers) {
-                val pid = peer.nodeId
+            val targets = radioPeers.map { it to false } + relayPeers.map { it to true }
+            for ((pid, viaInternet) in targets) {
                 if (isBackedOff(pid, now)) continue // skip recently-failed peers (no 8s stall)
                 launch {
                     sendSemaphore.withPermit {
                         peerLock(pid).withLock {
-                            runCatching { sendDeliveryReceipts(NodeId(pid)) }
-                                .onFailure { Log.w(TAG, "receipt push to ${pid.takeLast(8)} failed", it) }
+                            // A phone we reach only through our hub gets receipts from the hub: it
+                            // hands every receipt to all of its phones, so the copy sent to the hub
+                            // covers them (one per phone would each be flooded over LoRa too).
+                            if (!isHubOnly(NodeId(pid))) {
+                                runCatching { sendDeliveryReceipts(NodeId(pid)) }
+                                    .onFailure { Log.w(TAG, "receipt push to ${pid.takeLast(8)} failed", it) }
+                            }
                             if (snapshot.isNotEmpty()) {
-                                sendToSingle(NodeId(pid), snapshot, onlineIds, broadcastsSentTo)
+                                sendToSingle(NodeId(pid), snapshot, onlineIds, broadcastsSentTo, viaInternet)
                             }
                         }
                     }
@@ -566,17 +629,33 @@ class DtnOrchestrator @Inject constructor(
     /**
      * Send applicable messages from [snapshot] to a single peer.
      * - Direct delivery (dest == peer): send + mark delivered immediately (receipt generated).
-     * - Broadcast: send; [broadcastsSentTo] tracks which peers got it so the caller clears only
-     *   after a full fan-out.
+     * - Broadcast: sent at most once per peer per encounter/presence session (and never back to
+     *   the peer that gave it to us); receiver-side dedup makes a rare repeat harmless.
      * - Custody transfer (dest is someone else): send to mule, keep our copy for receipt.
+     *
+     * [viaInternet] = the peer is reachable only over the MQTT relay. Then: DMs addressed to it are
+     * published and kept until the end-to-end receipt returns (a broker PUBACK is not delivery),
+     * broadcasts are pushed once per presence session as a catch-up, and no third-party custody is
+     * handed over. Relay sends don't feed the routing benchmarks or Q-learning decisions.
      */
     private suspend fun sendToSingle(
         peerId: NodeId,
         snapshot: List<DtnMessage>,
         onlinePeerIds: Set<String>,
         broadcastsSentTo: java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>,
+        viaInternet: Boolean = false,
     ) {
-        val relayApproved: Set<String> = try {
+        // A peer the contacts table still shows radio-online may only be reachable over the relay
+        // right now (its BLE adverts just stopped). Apply relay semantics whenever the relay is the
+        // path the transport layer will actually use.
+        val relay = viaInternet ||
+            (!transport.isRadioReachable(peerId) && peerId.value in transport.internetPeers.value)
+        // The LoRa hub carries every DM it can't hand to a phone itself (it floods the backbone
+        // and replays to phones that register later). It sends no routing summaries, so the
+        // strategies have nothing to rank it by: it bypasses them (like a direct delivery).
+        val peerIsHub = transport.isHub(peerId)
+        val hubOnly = !peerIsHub && isHubOnly(peerId)
+        val relayApproved: Set<String> = if (relay || peerIsHub || hubOnly) emptySet() else try {
             when {
                 // Q-learning: the engine decides FORWARD vs STORE per (message, peer) from the
                 // live 9-feature state, and each decision is recorded for training.
@@ -608,6 +687,11 @@ class DtnOrchestrator @Inject constructor(
             if (receiptStore.isDelivered(msg.id) && msg.destinationNodeId != NodeId.BROADCAST) {
                 queueManager.markDelivered(msg.id)
                 lifecycle.markRouteDelivered(msg.id) // route observation → RESOLVED, matches chat
+                if (msg.messageType == DtnMessageType.DATA && lifecycle.isTracked(msg.id)) {
+                    lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        extra = "buffer copy cleared — delivery already confirmed by a receipt")
+                }
                 forgetSentTo(msg.id)
                 continue
             }
@@ -617,26 +701,52 @@ class DtnOrchestrator @Inject constructor(
             val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
             val isDirectDelivery = msg.destinationNodeId.value == peerId.value
 
+            // Relay-only peers never take custody of someone else's DM over the internet.
+            if (relay && !isDirectDelivery && !isBroadcast) continue
+
+            // A phone reached only through our hub: just the DMs addressed to it ([isHubOnly]).
+            if (hubOnly && !isDirectDelivery) continue
+
+            // The hub: each DM once per hub session (it keeps a copy and replays it to the phone
+            // when it registers, so re-sending adds nothing), and never one whose destination we
+            // reach ourselves right now — that phone's own pass delivers it (directly, through the
+            // hub, or over the relay) without flooding it over LoRa.
+            if (peerIsHub && !isBroadcast && !isDirectDelivery) {
+                if (sentTo[msg.id]?.containsKey(peerId.value) == true) continue
+                val dest = msg.destinationNodeId
+                if (transport.isRadioReachable(dest) || dest.value in transport.internetPeers.value) continue
+            }
+
             // Don't echo back to the immediate previous hop either. The wire header only
             // carries the ORIGIN, so without this an A→B→C→D chain has C bounce the bundle
             // straight back to B (B isn't the origin A), tying up the half-duplex BLE radio
-            // with a duplicate instead of advancing toward D. Direct delivery and broadcast
-            // are exempt: direct means the previous hop IS the destination, and broadcasts
-            // are meant to fan out to everyone (dedup handles the echo cheaply).
-            if (!isBroadcast && !isDirectDelivery && receivedFrom[msg.id] == peerId.value) continue
+            // with a duplicate instead of advancing toward D. Direct delivery is exempt (the
+            // previous hop IS the destination).
+            if (!isDirectDelivery && receivedFrom[msg.id] == peerId.value) continue
 
-            // Rate-limit check — but NEVER for direct delivery (dest is RIGHT HERE, send it!)
-            if (!isDirectDelivery && !isBroadcast && recentlySentTo(msg.id, peerId.value)) continue
+            // Broadcasts (incl. group messages and announces) go to each peer ONCE per encounter
+            // or presence session. Previously they were exempt from every throttle, so each
+            // buffered broadcast was re-sent to every online peer on every 4 s flush for its whole
+            // TTL — a GATT connect + write per bundle per peer, starving real traffic. The session
+            // ends when the peer goes offline (forgetSentToPeer), so a re-encounter re-syncs.
+            if (isBroadcast && sentTo[msg.id]?.containsKey(peerId.value) == true) continue
 
-            // Strategy veto applies ONLY to relay (mule) traffic. Direct and broadcast bypass.
-            if (!isDirectDelivery && !isBroadcast && msg.id !in relayApproved) {
+            // Rate-limit: never for a direct delivery over a link that ends at the destination
+            // (it's RIGHT HERE — send it). Anything that has to wait for an end-to-end receipt
+            // (same-hub hand-off, relay, hub flood, mule) retries on the 30 s window instead.
+            val directOverRadio = isDirectDelivery && transport.reachesDirectly(peerId)
+            if (!directOverRadio && !isBroadcast && recentlySentTo(msg.id, peerId.value)) continue
+
+            // Strategy veto applies ONLY to relay (mule) traffic. Direct, broadcast and hub
+            // hand-offs bypass it.
+            if (!isDirectDelivery && !isBroadcast && !peerIsHub && msg.id !in relayApproved) {
                 continue
             }
 
             // Send with hop incremented.
             val wireMsg = msg.copy(hopCount = (msg.hopCount + 1).coerceAtMost(255))
-            val ok = transport.sendMessage(wireMsg, peerId)
-            if (ok == null) {
+            val outcome = transport.sendMessageVia(wireMsg, peerId)
+            if (outcome == null) {
                 Log.w(TAG, "FAIL: ${peerId.value.takeLast(8)} unreachable")
                 markSendFailed(peerId.value) // back off so we don't pay the 8s connect again next flush
                 break // transport failed — stop trying this peer for now
@@ -644,13 +754,51 @@ class DtnOrchestrator @Inject constructor(
             markSendOk(peerId.value) // reachable again — clear any backoff
 
             markSentTo(msg.id, peerId.value)
-            runCatching { queueManager.incrementForwardCount(msg.id) }
-            benchmark.recordForward(strat)
             sentCount++
 
             val myId = transport.localNodeId?.value ?: ""
+            val path = outcome.path
+            val peer8 = peerId.value.takeLast(8)
+
+            // Control traffic (key announces etc.) is not a user message: engine console only, so
+            // it never shows up as mystery "broadcast messages in transit".
+            if (msg.messageType != DtnMessageType.DATA) {
+                lifecycle.console("CTRL ${msg.messageType.name} ${msg.id.take(8)} → $peer8 via ${path.label}")
+                continue
+            }
+
+            if (relay || path == SendPath.INTERNET) {
+                // Relay hand-off: the broker accepted it, which is NOT delivery. DMs stay buffered
+                // until the destination's receipt comes back over the relay.
+                val what = if (isBroadcast) "BCAST" else "DM"
+                lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                    origin = msg.originNodeId.value,
+                    dest = if (isBroadcast) "BROADCAST" else msg.destinationNodeId.value,
+                    hopCount = wireMsg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
+                    extra = "$what → $peer8 via ${path.label}" + if (isBroadcast) "" else " · awaiting receipt")
+                // The relay stores nothing: a DM published to a phone that just went offline is
+                // simply lost, and only our buffered copy still exists. So a relay publish is not a
+                // custody hand-off and must not turn the message into "Sent" — it stays Queued until
+                // the receipt proves delivery (the route records that link then). A broadcast
+                // pushed to a present peer did reach it, so that one is recorded.
+                if (isBroadcast) {
+                    lifecycle.recordOutgoing(
+                        msgId = msg.id, source = msg.originNodeId.value,
+                        dest = "^all", me = myId,
+                        nextHop = peerId.value, delivered = false, strategy = "INTERNET RELAY",
+                        path = path.label, channel = msg.channel,
+                    )
+                }
+                Log.d(TAG, "RELAY-$what: ${msg.id.take(8)} → $peer8")
+                continue
+            }
+            runCatching { queueManager.incrementForwardCount(msg.id) }
+            benchmark.recordForward(strat)
+
             when {
-                isDirectDelivery -> {
+                // Only a link that reaches the destination itself proves delivery. A "direct"
+                // send that fell back to a hub flood is a hand-off like any custody transfer.
+                isDirectDelivery && path.reachesTargetDirectly -> {
                     // BLE direct delivery: the GATT link is established and the write
                     // succeeded — reliable connection, so mark delivered immediately.
                     queueManager.markDelivered(msg.id)
@@ -665,18 +813,19 @@ class DtnOrchestrator @Inject constructor(
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
                         ttlRemainingMs = msg.remainingTtlMs(),
-                        extra = "DIRECT→${peerId.value.takeLast(8)} ✓delivered [$strat]")
+                        extra = "direct to $peer8 via ${path.label} ✓ delivered [$strat]")
                     // Also emit a buffer-clear so the buffer-history view stops showing this
                     // message as "still buffered" — direct delivery removes it from our buffer.
                     lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msg.id,
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                        extra = "delivered directly to ${peerId.value.takeLast(8)}")
+                        extra = "delivered directly to $peer8 via ${path.label}")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = msg.destinationNodeId.value, me = myId,
                         nextHop = peerId.value, delivered = true, strategy = strat,
+                        path = path.label, channel = msg.channel,
                     )
-                    Log.d(TAG, "DELIVERED-DIRECT: ${msg.id.take(8)} → ${peerId.value.takeLast(8)}")
+                    Log.d(TAG, "DELIVERED-DIRECT: ${msg.id.take(8)} → $peer8 via ${path.label}")
                 }
                 isBroadcast -> {
                     broadcastsSentTo.getOrPut(msg.id) {
@@ -685,28 +834,36 @@ class DtnOrchestrator @Inject constructor(
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
                         origin = msg.originNodeId.value, dest = "BROADCAST",
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
-                        extra = "BCAST→${peerId.value.takeLast(8)} [$strat]")
+                        extra = "${if (msg.channel > 0) "group" else "broadcast"} copy → $peer8 via ${path.label} [$strat]")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = "^all", me = myId,
                         nextHop = peerId.value, delivered = false, strategy = strat,
+                        path = path.label, channel = msg.channel,
                     )
-                    Log.d(TAG, "BCAST → ${peerId.value.takeLast(8)}: ${msg.id.take(8)}")
+                    Log.d(TAG, "BCAST → $peer8: ${msg.id.take(8)} via ${path.label}")
                 }
                 else -> {
-                    // Count a delivery attempt via this mule — success is credited later when a
+                    // Count a delivery attempt via this carrier — success is credited later when a
                     // receipt confirms end delivery (feeds the Q-state historicalSuccessRate).
                     runCatching { contactDao.incrementDeliveryAttempt(peerId.value) }
+                    val how = when {
+                        path == SendPath.HUB_LOCAL -> "handed to our LoRa hub for $peer8 (on the same hub)"
+                        peerIsHub -> "handed to LoRa hub $peer8 (floods it over LoRa)"
+                        isDirectDelivery -> "flooded toward $peer8 via ${path.label}"
+                        else -> "handed to carrier $peer8 via ${path.label}"
+                    }
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
-                        extra = "RELAY→${peerId.value.takeLast(8)} [$strat]")
+                        extra = "$how · awaiting receipt [$strat]")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = msg.destinationNodeId.value, me = myId,
                         nextHop = peerId.value, delivered = false, strategy = strat,
+                        path = path.label, channel = msg.channel,
                     )
-                    Log.d(TAG, "RELAYED: ${msg.id.take(8)} → mule ${peerId.value.takeLast(8)}")
+                    Log.d(TAG, "RELAYED: ${msg.id.take(8)} → $peer8 via ${path.label}")
                 }
             }
         }
@@ -769,9 +926,10 @@ class DtnOrchestrator @Inject constructor(
             )
             // Short-circuit: if a bundle fails to send, stop (peer unreachable) and don't mark
             // the rest as sent — they'll retry next flush.
-            if (transport.sendMessage(receiptBundle, peerId) == null) break
+            val outcome = transport.sendMessageVia(receiptBundle, peerId) ?: break
             chunk.forEach { alreadySent.add(it.first) }
             sentUids += chunk.size
+            lifecycle.console("RECEIPT ×${chunk.size} → ${peerId.value.takeLast(8)} via ${outcome.path.label}")
         }
         if (sentUids > 0) Log.d(TAG, "Sent $sentUids new receipts to ${peerId.value.takeLast(8)}")
     }
@@ -780,25 +938,35 @@ class DtnOrchestrator @Inject constructor(
      * Parse a receipt bundle payload — a concatenation of 16-byte UUIDs.
      * For each UID: mark it delivered locally and clear from buffer if present.
      */
-    private suspend fun processInboundReceipts(msg: DtnMessage) {
+    private suspend fun processInboundReceipts(msg: DtnMessage, via: com.dtn.mesh.receiver.TransportKind? = null) {
         val payload = msg.payloadBytes
         if (payload.size < UUID_BYTES) return
         val count = payload.size / UUID_BYTES
 
         var cleared = 0
+        val from8 = msg.originNodeId.value.takeLast(8)
         for (i in 0 until count) {
             val off = i * UUID_BYTES
             val bb = java.nio.ByteBuffer.wrap(payload, off, UUID_BYTES)
             val uuid = UUID(bb.long, bb.long).toString()
-            lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
-                origin = msg.originNodeId.value, extra = "from=${msg.originNodeId.value.takeLast(8)}")
+            // Receipts spread epidemically, so most are for other people's messages: only the ones
+            // about a message we hold or track belong in the message journal.
+            if (lifecycle.isTracked(uuid) || queueManager.existsInBuffer(uuid)) {
+                lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
+                    origin = msg.originNodeId.value, extra = "delivery receipt from $from8 via ${via.journalLabel()}")
+            } else {
+                lifecycle.console("RECEIPT ${uuid.take(8)} from $from8 via ${via.journalLabel()} (not ours, relaying)")
+            }
             receiptStore.markDelivered(uuid)
             // An end-to-end receipt confirms delivery — upgrade our route observation to RESOLVED
             // whether or not we still hold a buffer copy (no-op if we never tracked this route).
-            lifecycle.markRouteDelivered(uuid)
+            lifecycle.markRouteDelivered(uuid, via = via?.journalLabel().orEmpty(), confirmedBy = msg.originNodeId.value)
+            // …and our own chat row, even if our buffer copy is mid-forward (FORWARDING) or gone.
+            runCatching { chatDao.markOutgoingDelivered(uuid) }
             if (queueManager.existsInBuffer(uuid)) {
                 queueManager.markDelivered(uuid)
-                lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid)
+                lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid,
+                    extra = "delivered — confirmed by end-to-end receipt (via $from8)")
                 // A receipt confirms this message reached its destination — reward the
                 // Q-learning FORWARD decisions that carried it (credit the peer that acked).
                 resolveRewardDelivered(uuid, msg.originNodeId.value)
@@ -817,9 +985,18 @@ class DtnOrchestrator @Inject constructor(
     private suspend fun onMessageReceived(packet: InboundPacket) {
         val msg = packet.message
 
+        // One of OUR OWN bundles coming back (a carrier re-flooding it, a hub replaying its buffer,
+        // an older app version). We already hold it or are done with it — and acting on it pinned
+        // our own announce as a contact ("I can see myself") and could overwrite a sent chat row.
+        val me = transport.localNodeId
+        if (me != null && msg.originNodeId == me) {
+            lifecycle.console("ECHO ${msg.messageType.name} ${msg.id.take(8)} (our own) via ${packet.transport.journalLabel()} — ignored")
+            return
+        }
+
         // Delivery receipt bundle — handle and return.
         if (msg.messageType == DtnMessageType.ROUTING_ACK) {
-            processInboundReceipts(msg)
+            processInboundReceipts(msg, packet.transport)
             return
         }
 
@@ -848,8 +1025,14 @@ class DtnOrchestrator @Inject constructor(
         // ANNOUNCE: a signed identity/key broadcast. Verify + pin the peer's keys (TOFU), then
         // let it keep flooding so keys propagate across the mesh.
         if (msg.messageType.isAnnounce) {
-            processAnnounce(msg)
-            if (queueManager.ingest(msg)) requestFlush() // epidemic relay of the announce
+            if (!processAnnounce(msg)) return
+            val stored = queueManager.ingest(msg)
+            // The peer that handed it to us already has it — don't push it straight back.
+            packet.viaPeer?.let { markSentTo(msg.id, it.value) }
+            if (stored) {
+                lifecycle.console("ANNOUNCE from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — keys pinned, relaying")
+                requestFlush() // epidemic relay of the announce
+            }
             return
         }
 
@@ -879,7 +1062,18 @@ class DtnOrchestrator @Inject constructor(
             // UNICAST TO US — decrypt, show in chat, acknowledge end-to-end.
             val stored = queueManager.ingest(msg)
             if (stored) {
-                openAndPersistInbound(msg, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
+                val opened = openAndPersistInbound(msg, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
+                if (!opened) {
+                    // We can't decrypt it yet — typically the sender scanned OUR QR but we never
+                    // received their keys. Acknowledging would make the sender drop a message the
+                    // user never saw. Instead forget our copy (no tombstone) so a retransmission
+                    // is accepted once their announce has pinned the keys.
+                    queueManager.forget(msg.id)
+                    lifecycle.log(LifecycleEvent.IGNORED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        extra = "can't decrypt yet — no key for sender, not acknowledged")
+                    return
+                }
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // propagate an end-to-end receipt
                 rememberTombstone(msg.id, msg.originNodeId.value, msg.destinationNodeId.value,
@@ -887,15 +1081,18 @@ class DtnOrchestrator @Inject constructor(
                 benchmark.recordDelivery(strategySelector.name, msg.hopCount,
                     System.currentTimeMillis() - msg.createdAtMs)
                 resolveRewardDelivered(msg.id, packet.viaPeer?.value)
+                val via = packet.transport.journalLabel()
+                val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
                 lifecycle.log(LifecycleEvent.DELIVERED, msg.id,
                     origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                    hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs())
+                    hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
+                    extra = "received from $prev8 via $via · decrypted")
                 lifecycle.recordIncoming(
                     msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
-                    me = transport.localNodeId?.value ?: "", delivered = true,
+                    me = transport.localNodeId?.value ?: "", delivered = true, path = via,
                 )
-                lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id, extra = "receipt queued")
+                lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id, extra = "delivery receipt queued for the sender")
                 Log.d(TAG, "RX-MINE: ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}")
                 requestFlush()
             } else if (receiptStore.isDelivered(msg.id)) {
@@ -915,16 +1112,31 @@ class DtnOrchestrator @Inject constructor(
             // (Previously receivers minted receipts for broadcasts, which made the origin and
             // hubs drop the broadcast after the first receiver got it.)
             val stored = queueManager.ingest(msg)
+            // Whoever handed us this bundle already has it: count it as "sent to them" for this
+            // session so the once-per-peer broadcast fan-out never pushes it straight back.
+            packet.viaPeer?.let { markSentTo(msg.id, it.value) }
             if (stored) {
-                openAndPersistInbound(
+                // peer = the ORIGIN, so group / broadcast bubbles can show who actually sent it
+                // (the conversation key alone said "grp:N" / "^all" for every message).
+                val readable = openAndPersistInbound(
                     msg,
                     convKey = if (msg.channel > 0) "grp:${msg.channel}" else NodeId.BROADCAST.value,
-                    peer = null,
+                    peer = msg.originNodeId.value,
                 )
+                val via = packet.transport.journalLabel()
+                val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
+                val kind = if (msg.channel > 0) "group message" else "broadcast"
+                lifecycle.log(LifecycleEvent.BUFFERED, msg.id,
+                    origin = msg.originNodeId.value, dest = "^all",
+                    hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
+                    extra = "$kind received from $prev8 via $via · " +
+                        (if (readable) "shown in chat" else "not a member — carried, not readable") +
+                        " · keeps spreading until TTL")
                 lifecycle.recordIncoming(
                     msgId = msg.id, source = msg.originNodeId.value, dest = "^all",
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
                     me = transport.localNodeId?.value ?: "", delivered = false,
+                    channel = msg.channel, path = via,
                 )
                 requestFlush()
             }
@@ -938,30 +1150,52 @@ class DtnOrchestrator @Inject constructor(
         }
         if (queueManager.ingest(msg)) {
             Log.d(TAG, "RX-MULE: ${msg.id.take(8)} → dest ${msg.destinationNodeId.value.takeLast(8)}")
+            val via = packet.transport.journalLabel()
+            val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
+            lifecycle.log(LifecycleEvent.BUFFERED, msg.id,
+                origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
+                extra = "carrying for ${msg.destinationNodeId.value.takeLast(8)} (received from $prev8 via $via, encrypted)")
             lifecycle.recordIncoming(
                 msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                 prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
-                me = transport.localNodeId?.value ?: "", delivered = false,
+                me = transport.localNodeId?.value ?: "", delivered = false, path = via,
             )
             requestFlush()
         }
     }
 
-    /** Verify a signed ANNOUNCE and pin the peer's public keys (trust-on-first-use). */
-    private suspend fun processAnnounce(msg: DtnMessage) {
+    /**
+     * Verify a signed ANNOUNCE and pin the peer's public keys (trust-on-first-use).
+     *
+     * @return false when the announce must be neither pinned nor relayed: it was issued before
+     *   this phone's identity existed. Clearing the app's data (or reinstalling) creates a new
+     *   identity while the old one's announces still circulate for their TTL — in other phones'
+     *   buffers and in hub replays — and pinning them showed this phone's former self as a
+     *   contact ("I can see myself"). Live peers re-announce every 5 minutes, so a genuine
+     *   announce is only delayed, never lost.
+     */
+    private suspend fun processAnnounce(msg: DtnMessage): Boolean {
         val announce = Announce.parseAndVerify(msg.payloadBytes) ?: run {
             Log.w(TAG, "ANNOUNCE failed signature verification from ${msg.originNodeId.value.takeLast(8)}")
-            return
+            return true
         }
         if (NodeId.fromNodeNum(announce.nodeNum) != msg.originNodeId) {
             Log.w(TAG, "ANNOUNCE node-id binding mismatch; rejecting ${msg.originNodeId.value.takeLast(8)}")
-            return
+            return true
+        }
+        val bornAtSec = localIdentity.createdAtMs / 1000L
+        if (bornAtSec > 0 && announce.issuedAtSec.toLong() < bornAtSec) {
+            lifecycle.console("ANNOUNCE from ${msg.originNodeId.value.takeLast(8)} issued before this phone's " +
+                "identity was created — ignored (likely this phone's identity before its data was cleared)")
+            return false
         }
         runCatching {
             contactDao.insertIfNew(ContactEntity(nodeId = msg.originNodeId.value))
             contactDao.updateKeys(msg.originNodeId.value, announce.xPub, announce.edPub, announce.name, System.currentTimeMillis())
         }.onFailure { Log.w(TAG, "pinning announce keys failed", it) }
         Log.i(TAG, "ANNOUNCE pinned keys for ${msg.originNodeId.value.takeLast(8)} (${announce.name})")
+        return true
     }
 
     /**
@@ -970,18 +1204,20 @@ class DtnOrchestrator @Inject constructor(
      * reassembly (decode to text only after joining all chunks) keeps multi-byte UTF-8 chars intact
      * when a character straddles a fragment boundary.
      */
-    private suspend fun openAndPersistInbound(msg: DtnMessage, convKey: String, peer: String?) {
+    /** @return true if the bundle decrypted (a fragment counts even before reassembly completes). */
+    private suspend fun openAndPersistInbound(msg: DtnMessage, convKey: String, peer: String?): Boolean {
         val bytes = envelope.openBytes(msg) ?: run {
             Log.w(TAG, "RX undecryptable ${msg.id.take(8)} (no key / not a group member?)")
-            return
+            return false
         }
         if (msg.fragmentTotal <= 1) {
             persistInboundChat(msg.id, msg.channel, convKey, peer, String(bytes, Charsets.UTF_8))
-            return
+            return true
         }
         val parentKey = com.dtn.mesh.crypto.Fragmenter.canonicalParent(msg.id)
-        val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return
+        val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return true
         persistInboundChat(parentKey, msg.channel, convKey, peer, String(full, Charsets.UTF_8))
+        return true
     }
 
     /** Persist a decrypted inbound message into the user-visible chat log (dedup-by-id via REPLACE). */
@@ -1085,29 +1321,22 @@ class DtnOrchestrator @Inject constructor(
      */
     private suspend fun buildForwardingState(msg: DtnMessage, peer: NodeId): ForwardingState {
         val c = runCatching { contactDao.getByNodeId(peer.value) }.getOrNull()
-        val rssi = c?.lastRssi ?: -200
-        val rssiNorm = if (rssi <= -200) 0.0 else ((rssi + 100.0) / 60.0).coerceIn(0.0, 1.0) // [-100,-40]→[0,1]
-        val snr = (c?.lastSnr ?: -100f).toDouble()
-        val snrNorm = ((snr + 20.0) / 40.0).coerceIn(0.0, 1.0) // [-20,20]→[0,1]
-        val total = c?.totalEncounters ?: 0
-        val encFreq = (total.toDouble() / 20.0).coerceIn(0.0, 1.0)
-        val avgDurMs = if (c != null && c.totalEncounters > 0)
-            c.totalEncounterDurationMs.toDouble() / c.totalEncounters else 0.0
-        val encDur = (avgDurMs / 60_000.0).coerceIn(0.0, 1.0) // normalise by 60s
         // Feed the CANONICAL PROPHET predictability (not the active strategy's) — under Q-learning
         // the active strategy's getDeliveryProbability is a constant 0.5 stub, which starved this
         // feature. Both PROPHET variants learn on every encounter, so this is always meaningful.
-        val deliveryProb = strategySelector.prophetDeliveryProbability(peer).coerceIn(0.0, 1.0)
-        val ttlFrac = (msg.remainingTtlMs().toDouble() / msg.ttlMs.coerceAtLeast(1L)).coerceIn(0.0, 1.0)
-        val bufOcc = runCatching { queueManager.getBufferOccupancy() }.getOrDefault(0.0)
-        val succ = if (c != null && c.deliveryAttemptCount > 0)
-            c.deliverySuccessCount.toDouble() / c.deliveryAttemptCount else 0.0
-        val dupNorm = (msg.duplicateCount.toDouble() / 10.0).coerceIn(0.0, 1.0)
-        return ForwardingState(
-            rssiNorm = rssiNorm, snrNorm = snrNorm, encounterFrequency = encFreq,
-            encounterDuration = encDur, deliveryProbability = deliveryProb,
-            remainingTtlFraction = ttlFrac, bufferOccupancy = bufOcc,
-            historicalSuccessRate = succ, duplicateCountNorm = dupNorm,
+        // Normalisation lives in ForwardingStateBuilder so the UI's Q explanation matches exactly.
+        return com.dtn.mesh.learning.ForwardingStateBuilder.build(
+            lastRssi = c?.lastRssi ?: -200,
+            lastSnr = c?.lastSnr ?: -100f,
+            totalEncounters = c?.totalEncounters ?: 0,
+            totalEncounterDurationMs = c?.totalEncounterDurationMs ?: 0L,
+            deliveryProbability = strategySelector.prophetDeliveryProbability(peer),
+            remainingTtlMs = msg.remainingTtlMs(),
+            ttlMs = msg.ttlMs,
+            bufferOccupancy = runCatching { queueManager.getBufferOccupancy() }.getOrDefault(0.0),
+            deliverySuccessCount = c?.deliverySuccessCount ?: 0,
+            deliveryAttemptCount = c?.deliveryAttemptCount ?: 0,
+            duplicateCount = msg.duplicateCount,
         )
     }
 

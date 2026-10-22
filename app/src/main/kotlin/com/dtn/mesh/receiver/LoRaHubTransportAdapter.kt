@@ -22,8 +22,11 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -44,6 +47,10 @@ import javax.inject.Singleton
  * - HELLO    (0x03): hub → phone, 4B hub node id. Announces the hub so we can treat it as a peer.
  * - REGISTER (0x01): phone → hub, 4B our node id. Lets the hub route bundles back to us.
  * - BUNDLE   (0x02): either direction, a self-contained DTN bundle ([DtnWireCodec] wire bytes).
+ * - PING     (0x04): phone → hub every [PING_INTERVAL_MS], so an idle phone isn't timed out.
+ * - ROSTER   (0x05): hub → phone, `[1B n][n × 4B node id]` of every phone registered at the hub
+ *   (firmware v3+). Those phones are reachable through the hub right now: they're reported as
+ *   online peers ([hubPeers]) and DMs to them go straight through the hub.
  *
  * ## Auto-join
  * On API 29+ we request the hub network via [WifiNetworkSpecifier] (SSID prefix "DTN-HUB-") and
@@ -71,8 +78,28 @@ class LoRaHubTransportAdapter @Inject constructor(
         private const val FRAME_REGISTER: Byte = 0x01
         private const val FRAME_BUNDLE: Byte = 0x02
         private const val FRAME_HELLO: Byte = 0x03
+        private const val FRAME_PING: Byte = 0x04
+        private const val FRAME_ROSTER: Byte = 0x05
 
         private const val CONNECT_TIMEOUT_MS = 8_000
+        /** A hub reboot takes ~6 s before its Wi-Fi is back; asking sooner ends in "No devices found". */
+        private const val REREQUEST_DELAY_MS = 8_000L
+        /** Well inside the hub's 120 s idle timeout. */
+        private const val PING_INTERVAL_MS = 30_000L
+
+        /** Node ids in a ROSTER payload (`[1B n][n × 4B]`), or null when malformed. Pure (tested). */
+        fun parseRoster(payload: ByteArray): List<NodeId>? {
+            if (payload.isEmpty()) return null
+            val n = payload[0].toInt() and 0xFF
+            if (payload.size < 1 + n * 4) return null
+            return (0 until n).map { i ->
+                val o = 1 + i * 4
+                NodeId.fromNodeNum(
+                    ((payload[o].toInt() and 0xFF) shl 24) or ((payload[o + 1].toInt() and 0xFF) shl 16) or
+                        ((payload[o + 2].toInt() and 0xFF) shl 8) or (payload[o + 3].toInt() and 0xFF),
+                )
+            }
+        }
 
         private var packetIdCounter = 3_000_000
     }
@@ -81,6 +108,9 @@ class LoRaHubTransportAdapter @Inject constructor(
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val sendMutex = Mutex()
+
+    /** Whether the user wants the hub link (survives drops; cleared by [disconnect]). */
+    val isWanted: Boolean get() = wantConnection
 
     private val connectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -93,7 +123,19 @@ class LoRaHubTransportAdapter @Inject constructor(
     private var connectionJob: kotlinx.coroutines.Job? = null
 
     /** The hub's node id, learned from its HELLO frame. Null until connected. */
-    private var hubNodeId: NodeId? = null
+    @Volatile private var hubNodeId: NodeId? = null
+    private var pingJob: kotlinx.coroutines.Job? = null
+
+    private val _hubId = MutableStateFlow<String?>(null)
+    /** The connected hub's node id (null while not connected). */
+    val hubId: StateFlow<String?> = _hubId.asStateFlow()
+
+    private val _hubPeers = MutableStateFlow<Set<String>>(emptySet())
+    /** Other phones registered at our hub right now (from its ROSTER; never ourselves). */
+    val hubPeers: StateFlow<Set<String>> = _hubPeers.asStateFlow()
+
+    /** Whether [peer] is another phone on our hub (reachable through it right now). */
+    fun isHubPeer(peer: NodeId): Boolean = isConnected && peer.value in _hubPeers.value
 
     // ── Flows ────────────────────────────────────────────────────────────
 
@@ -112,6 +154,27 @@ class LoRaHubTransportAdapter @Inject constructor(
     private val _connectionState = MutableStateFlow(MeshConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<MeshConnectionState> = _connectionState.asStateFlow()
 
+    /** Hub + the phones on it, for the link details sheet. */
+    val linkInfo: StateFlow<LinkInfo> = combine(_connectionState, _hubId, _hubPeers) { st, hub, peers ->
+        when {
+            st == MeshConnectionState.CONNECTED && hub != null -> LinkInfo(
+                summary = "Connected to hub $hub · " + when (peers.size) {
+                    0 -> "no other phones on it"
+                    1 -> "1 other phone on it"
+                    else -> "${peers.size} other phones on it"
+                },
+                facts = listOf(
+                    "Phones on this hub reach each other through it; the hub also floods messages " +
+                        "over LoRa to other hubs.",
+                ),
+                peers = peers.sorted().map { LinkPeer(it, role = "On this hub") },
+            )
+            st == MeshConnectionState.CONNECTED -> LinkInfo(summary = "Connected — waiting for the hub to answer")
+            st == MeshConnectionState.CONNECTING -> LinkInfo(summary = "Joining the hub's Wi-Fi (DTN-HUB-…)")
+            else -> LinkInfo(summary = "Not connected")
+        }
+    }.stateIn(scope, SharingStarted.Eagerly, LinkInfo())
+
     override val isConnected: Boolean
         get() = _connectionState.value == MeshConnectionState.CONNECTED
 
@@ -129,6 +192,12 @@ class LoRaHubTransportAdapter @Inject constructor(
 
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // A previous request may have been declined in the system dialog or timed out with
+                // no hub in range. Drop it before asking again, otherwise every "tap to retry"
+                // would stack another pending request and callback.
+                networkCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
+                networkCallback = null
+                boundNetwork = null
                 requestHubNetwork() // learns the hub's WiFi Network via the callback
             }
             // One supervised reconnect loop serves both the API-29 specifier path and the legacy
@@ -158,11 +227,36 @@ class LoRaHubTransportAdapter @Inject constructor(
         runCatching { socket?.close() }
         socket = null
         output = null
-        hubNodeId?.let { emitHubEncounter(it, online = false) }
-        hubNodeId = null
+        linkDown()
         networkCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
         networkCallback = null
         boundNetwork = null
+    }
+
+    /** The hub link is gone: the hub and every phone we reached through it go offline. */
+    private fun linkDown() {
+        runCatching { pingJob?.cancel() }; pingJob = null
+        updateRoster(emptyList())
+        hubNodeId?.let { emitHubEncounter(it, online = false) }
+        hubNodeId = null
+        _hubId.value = null
+    }
+
+    /** Apply a ROSTER: phones that joined the hub come online, phones that left go offline. */
+    private fun updateRoster(nodes: List<NodeId>) {
+        val me = identity.nodeId.value
+        val now = nodes.map { it.value }.filter { it != me && it != hubNodeId?.value }.toSet()
+        val before = _hubPeers.value
+        if (now == before) return
+        _hubPeers.value = now // update first: offline handling checks reachability
+        val ts = System.currentTimeMillis()
+        (now - before).forEach { id ->
+            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = -200, snr = 0f, timestampMs = ts, isOnline = true))
+        }
+        (before - now).forEach { id ->
+            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = 0, snr = 0f, timestampMs = ts, isOnline = false))
+        }
+        Log.i(TAG, "Hub roster: ${now.size} other phone(s) ${now.joinToString { it.takeLast(8) }}")
     }
 
     /**
@@ -186,17 +280,48 @@ class LoRaHubTransportAdapter @Inject constructor(
                 _connectionState.value = MeshConnectionState.CONNECTED
                 backoff = 1_000L
                 Log.i(TAG, "Connected to hub at $HUB_IP:$HUB_PORT as ${identity.nodeId}")
+                // The hub drops phones that stay silent for 2 minutes; keep the link alive.
+                runCatching { pingJob?.cancel() }
+                pingJob = scope.launch {
+                    while (true) {
+                        kotlinx.coroutines.delay(PING_INTERVAL_MS)
+                        runCatching { writeFrame(FRAME_PING, byteArrayOf(0)) }.onFailure { return@launch }
+                    }
+                }
                 readLoop(DataInputStream(sock.getInputStream())) // blocks until the socket drops
             } catch (e: Exception) {
                 Log.w(TAG, "Hub connect/read failed: ${e.message}")
             }
-            _connectionState.value = MeshConnectionState.DISCONNECTED
+            // Still trying (the loop retries below) — report CONNECTING, not "not joined". Only a
+            // definitive "no hub / declined" from the system (onUnavailable) means DISCONNECTED,
+            // and that verdict is kept until the user retries.
+            val systemGaveUp = _connectionState.value == MeshConnectionState.DISCONNECTED && boundNetwork == null
+            if (!systemGaveUp) {
+                _connectionState.value = if (wantConnection) MeshConnectionState.CONNECTING else MeshConnectionState.DISCONNECTED
+            }
             runCatching { socket?.close() }; socket = null; output = null
-            hubNodeId?.let { emitHubEncounter(it, online = false) }; hubNodeId = null
+            linkDown()
             if (!wantConnection) break
             kotlinx.coroutines.delay(backoff)
             backoff = (backoff * 2).coerceAtMost(30_000L)
         }
+    }
+
+    /**
+     * Ask Android for the hub Wi-Fi again (after it was lost, e.g. Wi-Fi toggled or the hub
+     * rebooted). A specifier request is not re-satisfied automatically once its network is gone;
+     * Android remembers the user's earlier approval, so this normally reconnects without a dialog.
+     */
+    fun rerequestNetwork() {
+        if (!wantConnection || isConnected || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        runCatching {
+            networkCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
+            networkCallback = null
+            boundNetwork = null
+            _connectionState.value = MeshConnectionState.CONNECTING
+            requestHubNetwork()
+            Log.i(TAG, "Re-requested hub Wi-Fi")
+        }.onFailure { Log.w(TAG, "hub Wi-Fi re-request failed", it) }
     }
 
     @SuppressLint("MissingPermission")
@@ -221,14 +346,19 @@ class LoRaHubTransportAdapter @Inject constructor(
             override fun onLost(network: Network) {
                 Log.w(TAG, "Hub WiFi lost")
                 boundNetwork = null // the loop will wait until the hub WiFi returns
-                _connectionState.value = MeshConnectionState.DISCONNECTED
+                _connectionState.value = if (wantConnection) MeshConnectionState.CONNECTING else MeshConnectionState.DISCONNECTED
                 runCatching { socket?.close() }
                 socket = null; output = null
-                hubNodeId?.let { emitHubEncounter(it, online = false) }
-                hubNodeId = null
+                linkDown()
+                // Give the radio a moment (Wi-Fi toggles, hub reboots), then ask again.
+                scope.launch {
+                    kotlinx.coroutines.delay(REREQUEST_DELAY_MS)
+                    if (boundNetwork == null) rerequestNetwork()
+                }
             }
 
             override fun onUnavailable() {
+                // The system gave up: no hub in range, or the user declined the join dialog.
                 Log.w(TAG, "Hub WiFi unavailable")
                 _connectionState.value = MeshConnectionState.DISCONNECTED
             }
@@ -254,14 +384,16 @@ class LoRaHubTransportAdapter @Inject constructor(
                 FRAME_HELLO -> if (len >= 4) {
                     val hub = NodeId.fromNodeNum(readInt32(payload))
                     hubNodeId = hub
+                    _hubId.value = hub.value
                     Log.i(TAG, "Hub HELLO: $hub")
                     emitHubEncounter(hub, online = true)
                 }
+                FRAME_ROSTER -> parseRoster(payload)?.let { updateRoster(it) }
                 FRAME_BUNDLE -> {
                     val msg = DtnWireCodec.decode(payload, rssi = -40, snr = 15f) ?: continue
                     // The hub is our immediate previous hop — attribute it so the orchestrator's
                     // reverse-echo suppression and 1-hop routing-summary trust apply to hub traffic.
-                    _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = hubNodeId))
+                    _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = hubNodeId, transport = TransportKind.HUB))
                 }
                 else -> Log.d(TAG, "Unknown frame type $type")
             }

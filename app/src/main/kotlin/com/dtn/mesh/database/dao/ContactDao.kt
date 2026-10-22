@@ -141,6 +141,10 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE node_id = :nodeId")
     suspend fun getByNodeId(nodeId: String): ContactEntity?
 
+    /** Remove one contact row (used to drop a self-contact pinned by an echoed announce). */
+    @Query("DELETE FROM contacts WHERE node_id = :nodeId")
+    suspend fun deleteByNodeId(nodeId: String): Int
+
     /** All known contacts, ordered by last encounter (most recent first). */
     @Query("SELECT * FROM contacts ORDER BY last_encounter_ms DESC")
     suspend fun getAll(): List<ContactEntity>

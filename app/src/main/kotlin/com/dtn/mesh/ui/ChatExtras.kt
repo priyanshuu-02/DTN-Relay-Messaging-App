@@ -1,9 +1,5 @@
 package com.dtn.mesh.ui
 
-import android.graphics.Bitmap
-import android.graphics.Color
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,17 +8,20 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Divider
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,83 +29,79 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.MultiFormatWriter
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
+import com.dtn.mesh.receiver.MeshConnectionState
 
-/** Render a QR code for [content] as a Compose [Image], or nothing if encoding fails. */
+/** Latest user notice while a dialog is open (snackbars are hidden behind dialog windows). */
 @Composable
-fun QrImage(content: String, sizePx: Int = 560, modifier: Modifier = Modifier) {
-    val bmp = remember(content) { generateQrBitmap(content, sizePx) }
-    if (bmp != null) {
-        Image(bitmap = bmp.asImageBitmap(), contentDescription = "QR code", modifier = modifier.size(220.dp))
-    } else {
-        Text("QR unavailable", color = Palette.TextMuted)
-    }
+private fun rememberDialogNotice(viewModel: DtnViewModel): String? {
+    var notice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(viewModel) { viewModel.userMessages.collect { notice = it } }
+    return notice
 }
 
-private fun generateQrBitmap(content: String, size: Int): Bitmap? = try {
-    val matrix = MultiFormatWriter().encode(content, BarcodeFormat.QR_CODE, size, size)
-    Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
-        for (x in 0 until size) for (y in 0 until size) {
-            setPixel(x, y, if (matrix[x, y]) Color.BLACK else Color.WHITE)
+@Composable
+private fun NoticeLine(notice: String?) {
+    if (notice == null) return
+    Surface(color = Palette.PrimarySoft, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Text(notice, fontSize = 12.sp, color = Palette.TextPrimary, modifier = Modifier.padding(10.dp))
+    }
+    Spacer(Modifier.height(8.dp))
+}
+
+/** Full safety number: all 64 hex characters, four groups per line. */
+@Composable
+fun SafetyNumber(hex: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        UiText.fingerprintLines(hex).forEach {
+            Text(it, fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = Palette.TextPrimary)
         }
     }
-} catch (e: Exception) {
-    null
 }
-
-/** Split a hex fingerprint into readable groups for the safety-number display. */
-private fun formatFingerprint(hex: String): String =
-    hex.take(32).chunked(4).joinToString(" ")
 
 /* ==========================================================================
  *  Identity / key-exchange dialog
  * ========================================================================== */
 @Composable
 fun IdentityDialog(viewModel: DtnViewModel, onOpenChat: (String) -> Unit, onDismiss: () -> Unit) {
+    val context = LocalContext.current
     val qr = remember { viewModel.identityQrString() }
-    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
-        val contents = result.contents ?: return@rememberLauncherForActivityResult
-        if (contents.startsWith("dtngrp:")) {
-            viewModel.joinGroupFromInvite(contents) { ch -> onOpenChat("grp:$ch") }
-        } else {
-            viewModel.importContactQr(contents) { node -> if (node != null) onOpenChat(node) }
-        }
-    }
+    val notice = rememberDialogNotice(viewModel)
+    val qrActions = rememberQrActions(
+        prompt = "Scan a contact or group QR",
+        onResult = { text -> viewModel.handleScannedQr(text) { key -> onOpenChat(key) } },
+        onProblem = { viewModel.showMessage(it) },
+    )
     AlertDialog(
         onDismissRequest = onDismiss,
-        confirmButton = {
-            TextButton(onClick = {
-                scanLauncher.launch(ScanOptions().setOrientationLocked(false).setPrompt("Scan a DTN contact or group QR"))
-            }) { Text("Scan QR") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
         title = { Text("My identity") },
         text = {
             Column(
                 modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                NoticeLine(notice)
                 QrImage(qr)
                 Spacer(Modifier.height(8.dp))
                 Text(viewModel.myNodeId, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                Text("Safety number", fontSize = 11.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(10.dp))
+                Text("Safety number (full 256-bit fingerprint)", fontSize = 11.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(2.dp))
+                SafetyNumber(viewModel.myFingerprintHex)
+                Spacer(Modifier.height(12.dp))
+                QrInputButtons(qrActions)
+                TextButton(onClick = {
+                    if (!QrShare.share(context, qr, "Share my DTN contact QR")) viewModel.showMessage("Couldn't share the QR image")
+                }) { Text("Share my QR as an image") }
                 Text(
-                    formatFingerprint(viewModel.myFingerprintHex),
-                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "Show this QR to a contact (or scan theirs) to verify keys in person. " +
-                        "Scanning also joins a group if the QR is a group invite.",
+                    "Scan each other's QR in person to exchange keys — or share it as an image and the " +
+                        "other phone uploads it. A scanned contact can then be reached nearby or over the " +
+                        "internet relay. Group invites scan the same way.",
                     fontSize = 11.sp, color = Palette.TextMuted,
                 )
             }
@@ -115,23 +110,32 @@ fun IdentityDialog(viewModel: DtnViewModel, onOpenChat: (String) -> Unit, onDism
 }
 
 /* ==========================================================================
- *  Settings dialog
+ *  Settings dialog — every change is staged until Save (Cancel discards all)
  * ========================================================================== */
 @Composable
 fun SettingsDialog(viewModel: DtnViewModel, onDismiss: () -> Unit) {
     val savedName by viewModel.displayNameSetting.collectAsState()
-    val internetEnabled by viewModel.internetEnabled.collectAsState()
+    val savedInternet by viewModel.internetEnabled.collectAsState()
     val savedBroker by viewModel.brokerUrl.collectAsState()
+    val status by viewModel.transportStatus.collectAsState()
+    val relayPeers by viewModel.internetPeers.collectAsState()
+    val relayDiagnostics by viewModel.relayDiagnostics.collectAsState()
 
     var name by remember(savedName) { mutableStateOf(savedName) }
     var broker by remember(savedBroker) { mutableStateOf(savedBroker) }
+    var internet by remember(savedInternet) { mutableStateOf(savedInternet) }
+
+    val relayLine = when (status.internet) {
+        MeshConnectionState.CONNECTED -> "Relay connected · ${relayPeers.size} contact${if (relayPeers.size == 1) "" else "s"} online"
+        MeshConnectionState.CONNECTING -> "Relay connecting…"
+        else -> "Relay off"
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             TextButton(onClick = {
-                viewModel.setDisplayName(name.trim())
-                viewModel.setBrokerUrl(broker.trim())
+                viewModel.saveSettings(name.trim(), broker.trim(), internet)
                 onDismiss()
             }) { Text("Save") }
         },
@@ -140,43 +144,84 @@ fun SettingsDialog(viewModel: DtnViewModel, onDismiss: () -> Unit) {
         text = {
             Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                 Text("Display name", fontSize = 12.sp, color = Palette.TextMuted)
-                OutlinedTextField(value = name, onValueChange = { name = it }, singleLine = true,
+                OutlinedTextField(value = name, onValueChange = { name = it.take(48) }, singleLine = true,
                     modifier = Modifier.fillMaxWidth(), placeholder = { Text("shown to contacts") })
                 Spacer(Modifier.height(12.dp))
-                Divider(color = Palette.Divider)
+                HorizontalDivider(color = Palette.Divider)
                 Spacer(Modifier.height(12.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Internet relay", fontWeight = FontWeight.SemiBold)
-                        Text("Bridge over MQTT when online (messages stay encrypted)",
-                            fontSize = 11.sp, color = Palette.TextMuted)
+                        Text("Reach contacts anywhere over MQTT when both phones have internet. " +
+                            "Messages stay end-to-end encrypted.", fontSize = 11.sp, color = Palette.TextMuted)
                     }
-                    Switch(checked = internetEnabled, onCheckedChange = { viewModel.setInternetEnabled(it) })
+                    Switch(checked = internet, onCheckedChange = { internet = it })
+                }
+                Text(relayLine, fontSize = 11.sp, color = Palette.TextSecondary, modifier = Modifier.padding(top = 4.dp))
+                // Which endpoint it's on / why the last attempt failed — the first thing to check
+                // when the relay won't link on some network.
+                if (status.isWanted(com.dtn.mesh.receiver.TransportKind.INTERNET) && relayDiagnostics.isNotBlank()) {
+                    Text(relayDiagnostics, fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
                 }
                 Spacer(Modifier.height(8.dp))
                 Text("MQTT broker", fontSize = 12.sp, color = Palette.TextMuted)
                 OutlinedTextField(value = broker, onValueChange = { broker = it }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth(), placeholder = { Text("tcp://host:1883") })
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text(com.dtn.mesh.receiver.RelayEndpoints.DEFAULT_URL) })
+                Text(
+                    "Keep the default unless you run your own broker. On the public broker the app tries TLS " +
+                        "(8883) first and falls back to 1883 and WebSocket (8884) where networks block ports. " +
+                        "The broker is shared by everyone using it: it never sees the text of encrypted messages, " +
+                        "but it does see who is online and message headers.",
+                    fontSize = 10.sp, color = Palette.TextMuted, modifier = Modifier.padding(top = 4.dp),
+                )
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider(color = Palette.Divider)
+                Spacer(Modifier.height(12.dp))
+                AboutAndPrivacy()
             }
         },
     )
 }
 
+/** Version + the plain-language privacy summary (the full policy ships with the store listing). */
+@Composable
+private fun AboutAndPrivacy() {
+    Text("About & privacy", fontWeight = FontWeight.SemiBold)
+    Text(
+        "DTN Mesh Relay ${com.dtn.mesh.BuildConfig.VERSION_NAME} (build ${com.dtn.mesh.BuildConfig.VERSION_CODE})",
+        fontSize = 11.sp, color = Palette.TextSecondary,
+    )
+    Spacer(Modifier.height(6.dp))
+    listOf(
+        "No account, no ads, no analytics or tracking.",
+        "Your keys, contacts and chats stay on this phone and are excluded from cloud backups.",
+        "Direct and group messages are end-to-end encrypted: phones, LoRa hubs and the relay that carry them can't read them.",
+        "Broadcasts are public — anyone in reach can read them.",
+        "With the internet relay on, the broker sees your node id, when you're online and message headers.",
+        "Bluetooth, Wi-Fi and (on Android 12 and older) location access are used only to find nearby phones and hubs — never to track you.",
+    ).forEach { line ->
+        Text("•  $line", fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(bottom = 2.dp))
+    }
+}
+
 /* ==========================================================================
- *  Groups dialog (create / join / open)
+ *  Groups dialog (create / join / invite / leave)
  * ========================================================================== */
 @Composable
 fun GroupsDialog(viewModel: DtnViewModel, onOpenChat: (String) -> Unit, onDismiss: () -> Unit) {
+    val context = LocalContext.current
     val groups by viewModel.groups.collectAsState()
+    val notice = rememberDialogNotice(viewModel)
     var newName by remember { mutableStateOf("") }
-    var invite by remember { mutableStateOf<String?>(null) }
+    var invite by remember { mutableStateOf<Pair<String, String>?>(null) } // name → invite text
+    var leaveTarget by remember { mutableStateOf<GroupInfo?>(null) }
 
-    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
-        val contents = result.contents ?: return@rememberLauncherForActivityResult
-        if (contents.startsWith("dtngrp:")) {
-            viewModel.joinGroupFromInvite(contents) { ch -> onOpenChat("grp:$ch") }
-        }
-    }
+    val qrActions = rememberQrActions(
+        prompt = "Scan a group invite QR",
+        onResult = { text -> viewModel.handleScannedQr(text) { key -> onOpenChat(key) } },
+        onProblem = { viewModel.showMessage(it) },
+    )
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -184,39 +229,175 @@ fun GroupsDialog(viewModel: DtnViewModel, onOpenChat: (String) -> Unit, onDismis
         title = { Text("Groups") },
         text = {
             Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                NoticeLine(notice)
                 if (groups.isEmpty()) {
-                    Text("No groups yet. Create one and share the QR, or scan an invite.",
+                    Text("No groups yet. Create one and share its invite, or join with an invite QR.",
                         fontSize = 12.sp, color = Palette.TextMuted)
                 } else {
                     groups.forEach { g ->
                         Row(
                             modifier = Modifier.fillMaxWidth().clickable { onOpenChat("grp:${g.channel}") }
-                                .padding(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                                .padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text("👥 ${g.name}", fontWeight = FontWeight.Medium)
-                            TextButton(onClick = { viewModel.groupInvite(g.channel) { invite = it } }) { Text("Invite QR") }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("👥 ${g.name}", fontWeight = FontWeight.Medium, maxLines = 1)
+                                Text("channel ${g.channel} · tap to open", fontSize = 10.sp, color = Palette.TextMuted)
+                            }
+                            TextButton(onClick = {
+                                viewModel.groupInvite(g.channel) { inv -> invite = inv?.let { g.name to it } }
+                            }) { Text("Invite") }
+                            TextButton(onClick = { leaveTarget = g }) { Text("Leave", color = Palette.Error) }
                         }
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                Divider(color = Palette.Divider)
+                HorizontalDivider(color = Palette.Divider)
                 Spacer(Modifier.height(10.dp))
-                Text("Create group", fontSize = 12.sp, color = Palette.TextMuted)
-                OutlinedTextField(value = newName, onValueChange = { newName = it }, singleLine = true,
-                    modifier = Modifier.fillMaxWidth(), placeholder = { Text("group name") })
-                Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { viewModel.createGroup(newName) { invite = it; newName = "" } }) { Text("Create") }
+                Text("Create a group", fontSize = 12.sp, color = Palette.TextMuted)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(value = newName, onValueChange = { newName = it.take(32) }, singleLine = true,
+                        modifier = Modifier.weight(1f), placeholder = { Text("group name") })
                     Button(onClick = {
-                        scanLauncher.launch(ScanOptions().setOrientationLocked(false).setPrompt("Scan a group invite QR"))
-                    }) { Text("Join (scan)") }
+                        val n = newName.trim().ifBlank { "group" }
+                        viewModel.createGroup(n) { inv -> invite = n to inv; newName = "" }
+                    }) { Text("Create") }
                 }
-                invite?.let { inv ->
+                Spacer(Modifier.height(12.dp))
+                Text("Join a group", fontSize = 12.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(4.dp))
+                QrInputButtons(qrActions, scanLabel = "📷 Scan invite")
+                invite?.let { (gName, inv) ->
                     Spacer(Modifier.height(12.dp))
-                    Text("Share this invite:", fontSize = 12.sp, color = Palette.TextMuted)
+                    HorizontalDivider(color = Palette.Divider)
+                    Spacer(Modifier.height(10.dp))
+                    Text("Invite to “$gName” — anyone with this QR can read and post in the group.",
+                        fontSize = 12.sp, color = Palette.TextSecondary)
+                    Spacer(Modifier.height(8.dp))
                     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                         QrImage(inv)
+                        TextButton(onClick = {
+                            if (!QrShare.share(context, inv, "Share group invite")) viewModel.showMessage("Couldn't share the invite")
+                        }) { Text("Share invite as an image") }
+                    }
+                }
+            }
+        },
+    )
+
+    leaveTarget?.let { g ->
+        ConfirmLeaveGroupDialog(g.name, onConfirm = { viewModel.leaveGroup(g.channel); leaveTarget = null }) { leaveTarget = null }
+    }
+}
+
+@Composable
+private fun ConfirmLeaveGroupDialog(name: String, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Leave “$name”?") },
+        text = { Text("This phone forgets the group key and stops receiving its messages. Chat history stays here. " +
+            "You can rejoin later with an invite.") },
+        confirmButton = { TextButton(onClick = onConfirm) { Text("Leave", color = Palette.Error) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+/* ==========================================================================
+ *  Group info (from the group chat header)
+ * ========================================================================== */
+@Composable
+fun GroupInfoDialog(
+    viewModel: DtnViewModel,
+    group: GroupInfo,
+    membersSeen: List<String>,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var invite by remember { mutableStateOf<String?>(null) }
+    var confirmLeave by remember { mutableStateOf(false) }
+    LaunchedEffect(group.channel) { viewModel.groupInvite(group.channel) { invite = it } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = { TextButton(onClick = { confirmLeave = true }) { Text("Leave group", color = Palette.Error) } },
+        title = { Text("👥 ${group.name}") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                Text("End-to-end encrypted with the group key · channel ${group.channel}",
+                    fontSize = 11.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(10.dp))
+                Text("MEMBERS SEEN", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Palette.TextSecondary)
+                Text(
+                    if (membersSeen.isEmpty()) "Only you so far — members appear here once they post."
+                    else "You, " + membersSeen.joinToString(", "),
+                    fontSize = 12.sp, color = Palette.TextPrimary,
+                )
+                Text("There's no server, so membership is whoever holds the invite.",
+                    fontSize = 10.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(12.dp))
+                val inv = invite
+                if (inv != null) {
+                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                        QrImage(inv)
+                        TextButton(onClick = {
+                            if (!QrShare.share(context, inv, "Share group invite")) viewModel.showMessage("Couldn't share the invite")
+                        }) { Text("Share invite as an image") }
+                    }
+                }
+            }
+        },
+    )
+    if (confirmLeave) {
+        ConfirmLeaveGroupDialog(group.name, onConfirm = {
+            confirmLeave = false
+            viewModel.leaveGroup(group.channel)
+            onDismiss()
+        }) { confirmLeave = false }
+    }
+}
+
+/* ==========================================================================
+ *  Contact info (from the 1:1 chat header): reachability + safety number
+ * ========================================================================== */
+@Composable
+fun ContactInfoDialog(
+    viewModel: DtnViewModel,
+    peer: PeerInfo,
+    onRename: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val reach = when {
+        peer.isOnline -> "Nearby (radio)"
+        peer.internetOnline -> "Online via the internet relay"
+        else -> "Not reachable right now — messages wait in the buffer"
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        dismissButton = { TextButton(onClick = onRename) { Text("Rename") } },
+        title = { Text(peer.displayName()) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                Text(peer.nodeId, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = Palette.TextSecondary)
+                Spacer(Modifier.height(8.dp))
+                Text(reach, fontSize = 13.sp, color = if (peer.reachable) Palette.Accent else Palette.TextSecondary)
+                Spacer(Modifier.height(12.dp))
+                Text("SAFETY NUMBER", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Palette.TextSecondary)
+                val fp = peer.fingerprintHex
+                if (fp == null) {
+                    Text("No keys yet — scan their QR (🔑) or wait for their announce. Until then DMs can't be encrypted.",
+                        fontSize = 12.sp, color = Palette.TextMuted)
+                } else {
+                    Spacer(Modifier.height(4.dp))
+                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) { SafetyNumber(fp) }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (peer.keyVerified) "✓ Verified in person" else "Not verified — compare with “My identity” on their phone",
+                        fontSize = 12.sp, color = if (peer.keyVerified) Palette.Accent else Palette.Warning,
+                    )
+                    FilledTonalButton(onClick = { viewModel.setContactVerified(peer.nodeId, !peer.keyVerified) }) {
+                        Text(if (peer.keyVerified) "Clear verification" else "Mark as verified")
                     }
                 }
             }

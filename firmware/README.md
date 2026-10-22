@@ -42,6 +42,15 @@ Framed TCP on port 9740: `[1B type][2B length BE][payload]`
 - `HELLO` (0x03) hub→phone, 4B `HUB_ID`, sent once on connect so the phone treats the hub as a peer.
 - `REGISTER` (0x01) phone→hub, 4B phone node id, so the hub can deliver bundles back to that phone.
 - `BUNDLE` (0x02) either direction, a self-contained DTN bundle (32-byte header + payload).
+- `PING` (0x04) phone→hub every 30 s, keepalive only. A phone that PINGs is dropped after 120 s of
+  silence; older apps (no PING) are dropped only when TCP keepalive finds the link dead (~90 s).
+  The OLED `msg:` count shows only DMs waiting for delivery, not announces/broadcasts/receipts.
+- `ROSTER` (0x05) hub→phone (v3), `[1B n][n × 4B node id]` of every phone registered here, on change
+  and every 30 s, so phones on the same hub show each other online and DM each other through it.
+
+**v3 (current, `DTN_FW_VERSION=3`) — flash it to every hub.** Writes to phones go through a
+non-blocking per-phone TX queue. v2 gated every write on `WiFiClient::availableForWrite()`, which
+arduino-esp32 2.0.x always reports as 0, so a v2 hub never sent anything to a phone.
 
 Over LoRa the hub floods bundles with message-ID **dedup**, **TTL aging**, a **hop limit** (≤ 8),
 **listen-before-talk** (CAD) + random jitter, overhear-suppression, and a rolling-hour **duty-cycle**

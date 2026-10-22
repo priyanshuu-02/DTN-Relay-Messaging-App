@@ -796,3 +796,278 @@ entity/schema change**, so Room's identity hash is unchanged and reinstalling do
   real use. `No-Local` is also not set, so the origin receives its own publish back (currently harmless:
   deduped by message id in the orchestrator).
 - Everything in F.9 that was still open remains open.
+
+---
+
+# PART H — 2026-10-16 (cont.): connection model, internet presence, groups, QR, UX overhaul
+
+User report: 14 UX issues (2.1–2.14, no 2.12) + "groups are not working" + portrait QR scanning with
+image upload + "a QR-scanned contact out of range shows offline although their internet works" +
+"Bluetooth off → stuck on Connecting". Build green, **85 JVM tests pass** (59 + 26 new). **No Room
+schema change** (no migration, no DB wipe); 32-byte wire header and hub firmware unchanged.
+
+## H.1 Root causes found
+- **Groups:** channels were allocated sequentially per phone (everyone's first group = channel 1),
+  so joining another phone's group **silently overwrote** your own group (PK = channel) and traffic
+  collided; inbound group/broadcast rows stored no sender (every bubble said `grp:1`); the chat header
+  showed `grp:1`; invite parsing broke on `:` in names.
+- **Broadcast storm:** the flush rate-limit exempted broadcasts, so every buffered broadcast / group
+  message / announce was re-sent to every online peer **every 4 s for its whole TTL** (a GATT connect
+  + write per bundle per peer).
+- **Stuck "Connecting…":** `MultiTransportManager` computed the aggregate state as a **snapshot at
+  connect time** — never recomputed, so a hub joining later (or BLE failing with Bluetooth off) was
+  never reflected.
+- **Internet contacts offline / undelivered:** the MQTT relay had no presence, wasn't routable, wasn't
+  in the flush peer set, carried no receipts, published only once at send time, used a random client id,
+  never tracked disconnects, and never retried a failed first connect.
+- **Silent loss:** a DM we couldn't decrypt yet (sender scanned our QR but we lack their keys) was still
+  acknowledged → sender saw "delivered", user never saw it.
+- **Scanner landscape:** zxing's `CaptureActivity` is hard-locked to `sensorLandscape` in its manifest.
+
+## H.2 Transport / connection model
+- `receiver/TransportStatus.kt` (`TransportKind`, per-transport state + wanted set, reactive aggregate);
+  `receiver/RadioStatusMonitor.kt` (Bluetooth / Wi-Fi / location / validated-internet flows).
+- `MultiTransportManager`: `transportStatus`/`connectionState` derived via `combine` of all four
+  adapters; `connect(kind)` / `disconnect(kind)`; BLE stops when Bluetooth turns off and restarts when it
+  returns (if wanted); send priority BLE → Wi-Fi Direct → hub-target → **internet (peer present)** →
+  hub flood. `MeshTransport` gained `transportStatus`, `internetPeers`, `isRadioReachable()`.
+- BLE / Wi-Fi Direct emit offline events for their peers when individually switched off; the hub adapter
+  unregisters a stale `WifiNetworkSpecifier` request before "tap to retry".
+- ViewModel: foreground service + orchestrator run exactly while any transport is wanted.
+
+## H.3 Internet relay (presence + delivery)
+- `receiver/InternetFrames.kt` (`[D7 01][4B publisher][wire]` framing + `Presence` codec).
+- `InternetTransportAdapter` rewritten: stable client id `dtn-<hex8>`, Last Will `off` + retained `on`
+  presence on `dtn/v1/presence/<hex8>`, 60 s heartbeat + stale sweep, global publish consumer,
+  re-subscribe on every connect, state from connected/disconnected listeners, auto-reconnect incl. a
+  failed first attempt, `sendMessage()` publishes to the node topic and awaits PUBACK, own-echo and
+  relayed ROUTING_SUMMARY dropped.
+- Orchestrator: flush includes present contacts (radio link wins); relay semantics = DMs addressed to the
+  peer only, kept until the end-to-end receipt (PUBACK ≠ delivery), retried on the 30 s window; broadcasts
+  pushed once per presence session (catch-up); no third-party custody; no benchmark / Q pollution.
+  Presence changes trigger a flush; leaving the relay ends the session. Origin publishes only
+  broadcast/group/announce to `bcast`; DMs go through the flush.
+- Undecryptable DMs for us are no longer acknowledged (row forgotten, no tombstone) so a retransmission
+  after the sender's announce is accepted.
+
+## H.4 Groups
+- `crypto/QrPayloads.kt`: `GroupInvite` (key-derived channel `1 + SHA-256("DTN-grp-ch-v1"‖key)[0] mod
+  255`, colon-safe parsing, legacy invites still parse) and `IdentityQr` (java.util.Base64 → testable).
+- `GroupKeyStore`: new groups take a key-derived free slot; `joinGroup` returns
+  `Joined / AlreadyMember / Conflict` and **never overwrites** a different group.
+- Group/broadcast inbound rows store the origin → bubbles show the sender; header shows the group name,
+  members seen, and an info sheet (invite QR, share, leave). Leave group added.
+- Broadcast fan-out: once per peer per encounter/presence session, never echoed to whoever handed it over.
+
+## H.5 QR
+- `ui/QrScanner.kt`: portrait Compose scanner (embedded zxing `BarcodeView`, TextureView preview,
+  viewfinder overlay matching the framing rect, torch, haptic), camera-permission handling, **upload from
+  gallery** (Photo Picker → multi-pass ZXing decode with alpha flattening + downscale retry), share QR as a
+  PNG via FileProvider (`res/xml/file_paths.xml`), async crisp `QrImage`.
+- `ui/QrCodec.kt`: pure encode/decode (two binarizers × normal/inverted, then PURE_BARCODE fallback).
+
+## H.6 UX issues
+2.1 Clear asks first (with count) · 2.2 Settings fully staged (`saveSettings`) · 2.3 every broadcast id
+form labelled, group routes show the group name, broadcast routes say FLOODING · 2.4 path map: canvas for
+lines only, labels are ellipsized Compose text, rows scale with font size · 2.5 benchmark table in a
+horizontal scroller with fixed columns · 2.6 SENT ✓ / RELAYED / RECEIVED · 2.7 full 64-hex safety number
+(+ per-contact safety number with "Mark as verified") · 2.8 Network peers open the chat · 2.9 four
+tappable transport chips + preflight checklist (permissions / Bluetooth / Wi-Fi / location, "use internet
+instead") · 2.10 strategy-specific peer metric (P / f / Q fwd-wait) and a real Q-learning route breakdown
+(`ForwardingStateBuilder` shared with the orchestrator, `DoubleQLearningEngine.qValues`) · 2.11 QR built off
+the main thread at module resolution · 2.13 grapheme-safe avatar initials · 2.14 permission prompts with
+"App settings". Chat banner offers "Turn on Bluetooth" / "Use internet relay" when a contact is unreachable.
+
+## H.7 Verification status
+- Build + 85 unit tests green. **Not yet verified on device**: the phone dropped off adb during this
+  session, so install + on-device smoke test (scanner, chips, presence) are still to do.
+
+## H.8 Known limits
+- Presence and the publisher prefix are unauthenticated on the public broker (spoofing only causes extra
+  encrypted publishes / a skipped push; content is never exposed). The `dtn/v1` namespace is shared.
+- Relay delivery needs the relay on at both ends; the public broker keeps no offline queue (the sender's
+  buffer + presence does the store-and-forward).
+- Radio direct delivery still counts a successful GATT write as delivery (unchanged).
+
+---
+
+# PART I — 2026-10-22: field-bug round (ANR, relay, Wi-Fi Direct, message status) + Play Store readiness
+
+User reports after installing Part H: Disconnect "crashes" (mostly with the relay on), relay won't
+link on most phones, Wi-Fi Direct shows "unavailable" after Wi-Fi off→on, chat UI needs polish (keep
+the 4 transport chips), Message details say IN TRANSIT for delivered messages / details missing, make
+it publishable on Google Play, build an APK to share. **No Room schema change** (journal is a file).
+
+## I.1 Root causes (verified on the phone: logs, /data/anr, pulled DB, nc probes)
+- **"Crash" = ANR.** `InternetTransportAdapter.disconnect()` published the presence `off` with a
+  blocking HiveMQ call on the main thread (`MqttPublishFlowables.add` → `Object.wait`), reached from
+  `DtnViewModel.disconnectAll` / `toggleTransport` → "Input dispatching timed out".
+- **Relay never linked:** broken IPv6. `broker.hivemq.com` has AAAA records; on the user's network
+  every IPv6 connect black-holes (`nc -6` timed out even for google.com) while IPv4 works. The client
+  chose IPv6 and timed out on each retry.
+- **Wi-Fi Direct after Wi-Fi off→on:** the adapter went DISCONNECTED on P2P-disabled and never
+  resumed. It also auto-connected to *any* P2P device (a TV, strangers' phones) → invitation pop-ups,
+  a stuck negotiation and `discoverPeers` BUSY (reason 2).
+- **"In transit" though delivered:** route records were in memory (lost on restart) and only some
+  paths flipped them; three different status computations; the chat row's DELIVERED/EXPIRED was
+  written only by a ViewModel collector (lost while the screen was closed); receipts for a buffer copy
+  in FORWARDING state never updated the chat row.
+- **Noise:** announces/receipts/summaries appeared as routes and journal events; announce/receipt
+  expiries were journaled as EXPIRED messages.
+
+## I.2 Fixes
+- **Relay:** publishes on one dedicated thread, only while CONNECTED, `runInterruptible` + 8 s cap;
+  `disconnect()` returns at once and tears down in the background (session generations).
+  `receiver/RelayEndpoints.kt` (pure): own DNS, **IPv4 first**, HiveMQ fallbacks TLS 8883 → TCP 1883 →
+  WSS 8884, rotated per failed attempt; default broker `ssl://broker.hivemq.com:8883`. Diagnostics
+  line ("Connected · TLS 3.120.13.97:8883" / "Attempt n failed (…) · next …") in Settings + Log.
+- **Hub:** `onLost` → CONNECTING + re-request after 4 s; Wi-Fi follower re-requests on Wi-Fi return.
+- **Wi-Fi Direct:** stays wanted across Wi-Fi off (chip "Wi-Fi off" → "Searching" on return);
+  advertises DNS-SD `_dtnmesh._tcp` and connects **only** to devices advertising it; cancels a stale
+  connect at start and after 3 BUSY rounds; the sticky P2P-enabled broadcast no longer double-starts.
+- **Delivery semantics:** `SendPath.reachesTargetDirectly` — only BLE, Wi-Fi Direct or the hub that IS
+  the target proves delivery; relay / hub flood wait for the end-to-end receipt.
+- **Chat status persisted where it happens:** `MessageQueueManager` (markDelivered / confirmDelivered,
+  expiry, clear, drops, buffer-pressure evictions — the latter previously silent). New
+  `ChatDao.markOutgoingDelivered` / `markOutgoingEnded` never downgrade DELIVERED or touch IN rows.
+- **Persistent journal:** `MessageLifecycleLog` → `filesDir/message_journal_v1.log` via `JournalCodec`
+  (tab-separated, escaped, compaction at 6000 lines; 1000 events / 300 routes in memory). Identical
+  event+detail for one message within 10 min is collapsed (30 s relay retries). CREATED/BUFFERED are
+  written by `OutboundMessageService`; a relay broadcast publish is journaled once acknowledged.
+  Control traffic → engine console only.
+- **One status model:** `ui/MessageStatus.kt` `deliveryState()` (Queued 🕓 · Sent ✓ · Delivered ✓✓ ·
+  Received · Spreading · Carrying · Expired/Dropped !) used by bubbles, route rows and Message info.
+- **Chat UI:** date separators, sender runs, bubbles ≤ 80 % width, tap/long-press menu (Message info,
+  Copy), incoming "via <link>", contrast-safe status colours, empty-state cards (encryption notes),
+  multi-line composer with per-chat placeholder, Send disabled when blank/over budget, byte counter from
+  75 % of the 200 B single-frame budget, auto-scroll on new messages, IME double-gap fix
+  (`consumeWindowInsets`), notice instead of composer after leaving a group. Chat list: last-message
+  time + tick, conversations sorted by recency. Headline "Online via …" only (chips unchanged).
+- **`ui/MessageInfoDialog.kt` (live):** state pill + explanation, content, conversation, from/to,
+  sent/delivered (+ duration), link, hops, routed-by, path, journey timeline; routing math only for DMs
+  routed onward. Opened from bubbles, route rows, Lifecycle events and buffer-history rows.
+
+## I.3 Play Store readiness
+- AGP 8.13.2 / Gradle 8.13, compileSdk + targetSdk 36 (Play requirement since 31 Aug 2026),
+  versionCode 2 / versionName 1.0.0, `buildConfig` on (Settings → About & privacy).
+- Release: R8 minify + resource shrinking, `app/proguard-rules.pro` (HiveMQ: keep Netty/JCTools member
+  names + `-dontwarn` for optional deps). Upload key `keystore/dtn-upload.jks` + `keystore.properties`
+  (git-ignored; release is unsigned without them). `staging` build type = release code, debug-signed,
+  `.staging` suffix, for on-device R8 tests beside the debug app.
+- Manifest: location `maxSdkVersion=32` (PermissionHelper asks only ≤ API 32 — BLE/Wi-Fi Direct use the
+  `neverForLocation` permissions on 12+/13+), WRITE_EXTERNAL_STORAGE removed (export uses the
+  app-specific dir), `dataExtractionRules` exclude everything (keys/chats never leave the phone),
+  adaptive launcher icon with monochrome layer, notification icon + tap-to-open.
+- 16 KB pages: the only native libs (AndroidX `graphics.path`, `datastore_shared_counter`) have 16 KB
+  LOAD alignment and are 16 KB zip-aligned in the APK.
+- Store kit: `docs/play-store/` (listing, privacy policy, data safety, permissions/FGS declaration,
+  release checklist, graphics + screenshots).
+
+## I.4 Verified on device (Redmi 23090RA98I, Android 16)
+- Relay connects in 1–3 s over TLS/IPv4; Disconnect with the relay on → no ANR, also across rapid
+  connect/disconnect cycles. Wi-Fi Direct discovers without location on API 36; Wi-Fi off → "Wi-Fi off",
+  on → "Searching" within 4 s. Chat UI, menu, Message info and keyboard layout checked by screenshot.
+- R8 staging build: launches, Hilt/Room/WorkManager fine, relay connects (tested against
+  broker.emqx.io so the throwaway identity never reached real users), journal + Message info correct.
+- 109 JVM unit tests (new: RelayEndpoints, JournalCodec, deliveryState, date/time labels).
+
+## I.5 Known limits / next
+- A release-signed APK can't replace a debug-signed install (different key): one uninstall (loses
+  keys/chats); moving to the Play build later needs one more (Play App Signing key).
+- Play still needs: developer account, a public privacy-policy URL, the Console forms (texts prepared).
+- Multi-fragment messages are tracked as one route (the first fragment's receipt marks it delivered);
+  the composer keeps messages single-frame (≤ 200 B), so the UI can't create them today.
+
+---
+
+# PART J — 2026-10-22/23: LoRa hub fixed (firmware v3 + roster), invitation-free Wi-Fi Direct groups, buffer + presence fixes
+
+User reports: Wi-Fi Direct broken / invitation pop-ups, "I can see myself", contacts shown online
+over the internet long after they left, messages "Sent" while offline, announcements still counted
+as buffered; then "LoRa not working — 3 phones on the hub, nothing sent or received, all offline to
+each other", "link multiple devices, show Linked + who is connected", QR torch/upload too low.
+**No Room schema change.**
+
+## J.1 Root causes
+- **LoRa hub sent nothing to any phone (v2 firmware).** `sendFrame` returned early when
+  `sock.availableForWrite() < 3+len`; arduino-esp32 2.0.17's `WiFiClient` doesn't implement it, so
+  `Print::availableForWrite()` is always 0 → no HELLO, no deliveries, no replays. Phones never learned
+  the hub id and never flushed to it (dashboard: `out=0`, `dlv=0`).
+- The v2 idle check `millis() - lastSeenMs > CLIENT_IDLE_MS` wrapped when `lastSeenMs` was stamped a
+  millisecond after `now` → instant "Phone timed out (idle)" loops and ack floods.
+- Phones on one hub had no way to know about each other; the routing strategies never handed DMs
+  to the hub (it sends no routing summaries, so PROPHET had nothing to rank it by).
+- "I can see myself": after *Clear storage* the phone has a new identity while its old identity's
+  announces still circulate (other phones' buffers, hub replays) and got pinned as a contact.
+- Buffer counter/list still included broadcast + group DATA (only control types were filtered).
+- QR scanner: from Android 15, `Configuration.screenHeightDp` includes the system bars and Compose
+  sizes a full-width dialog's content from it, while the dialog window sits between the bars → the
+  content was ~90 dp taller than its window and the bottom buttons landed on the navigation bar.
+- Earlier in the round: own-origin bundles echoed back were processed (self-contact), retained
+  relay presence never went stale, and a relay DM publish was recorded as a hand-off ("Sent").
+
+## J.2 Firmware v3 (`firmware/src/main.cpp`, `DTN_FW_VERSION=3`)
+- Per-client 4 KB non-blocking TX queue (`enqueueFrame` whole frames only, `flushClient` with
+  `send(MSG_DONTWAIT)`); `dropClient`; a REGISTER retires a stale duplicate connection.
+- `deliverLocal(dest, data, len, skipClient)`: never echoes to the phone that handed it in;
+  ROUTING_ACK goes to every local phone (receipts addressed to the hub reach the phones too).
+- `pumpReplay` (cursor per client): after REGISTER, aged-TTL copies of bundles for that phone,
+  broadcasts and acks, skipping the phone's own.
+- ROSTER 0x05 (on change + every 30 s); PING 0x04 / zero-length frames refresh `lastSeenMs`;
+  signed idle check. A held bundle re-sent by a phone: DM re-delivered locally, never re-flooded;
+  broadcast/ack ignored. Dashboard lists phones (idle, txq) and `phones: in/out/dropped`.
+- Flashed to the COM11 hub (`!64dab734`). **Any other hub (e.g. COM13) still runs v2 → broken.**
+
+## J.3 App — LoRa hub
+- `LoRaHubTransportAdapter`: PING every 30 s, ROSTER parsing (`parseRoster`, tested) → `hubPeers`
+  and online/offline encounters (rssi −200 = no own signal; the orchestrator keeps the last real
+  RSSI), `hubId`, `linkInfo`; re-request the hub network 8 s after it's lost (hub reboot ≈ 6 s).
+- `MeshTransport`: `hubPeers`, `isHub`, `isHubPeer`, `reachesDirectly` (BLE / Wi-Fi Direct /
+  hub-as-target); `isRadioReachable` also covers roster phones.
+- `MultiTransportManager.sendMessageVia`: BLE → Wi-Fi Direct → hub (target is the hub) →
+  **same hub** (`SendPath.HUB_LOCAL`, only when the bundle's destination is that phone) → relay →
+  hub flood. `HUB_LOCAL.reachesTargetDirectly = false` → delivery waits for the receipt.
+- `DtnOrchestrator`: the hub gets every DM once per hub session, bypassing the strategy, unless the
+  destination is reachable directly / via the roster / on the relay. Roster-only phones get only
+  DMs addressed to them (no broadcasts, receipts, custody or routing summaries — the hub fans those
+  out). Rate-limit exemption uses `reachesDirectly`. An offline event is ignored while another link
+  still reaches the peer. Routing summaries only over direct links (never to the hub).
+- Announces issued before `DtnIdentity.createdAtMs` (identity file mtime) are neither pinned nor
+  relayed (live peers re-announce every 5 min, so a genuine one is only delayed).
+
+## J.4 App — Wi-Fi Direct groups (Android 10+, no invitations)
+- `WifiDirectGroupPolicy` (pure, tested): join the best group (most members, then lowest owner);
+  lowest node id creates (others wait 25 s, then create); empty owners merge; idle owner disbands
+  after 120 s alone.
+- `WifiDirectHints` (tested): BLE scan-response service data `[4B id][1B flags][4B nonce]`; group
+  `DIRECT-DT-<hex>`, passphrase = SHA-256-derived 20 hex chars. DNS-SD TXT `v=2,id,g,k,n` as a
+  second discovery path. Join/create via `WifiP2pConfig.Builder` → nobody accepts anything.
+- `WifiDirectTransportAdapter` rewritten: 3 s decision loop, discovery only while searching or an
+  empty owner, form timeout 30 s, failed-group backoff 30 s, HELLO heartbeat 10 s, stale 30 s, owner
+  ROSTER frame (−2) so members link to each other. CONNECTED (chip "Linked · N phones") only with
+  ≥ 1 linked DTN phone. Fixed a `ConcurrentHashMap` `!in` (checked values, not keys).
+
+## J.5 App — UI
+- Chips: "Active · N nearby", "Linked · N phones", "Connected · N phones", "Needs Android 10" (grey).
+  Tapping an ON/BUSY chip opens **link details** (summary, every device with name/role/IP, facts,
+  Turn off); OFF turns the link on; PROBLEM fixes/retries (chip look unchanged).
+- Peers on our hub show "📡 Online via LoRa hub" (`PeerInfo.hubOnly`).
+- Buffer counter, Network buffered list and Lifecycle buffer history: DMs only (`destination_node_id
+  != '^all'`); the event log still shows broadcasts.
+- QR scanner content sized to the window between the bars (`rememberBetweenBarsHeight`), buttons
+  52 dp tall, 72 dp above the navigation bar.
+
+## J.6 Verified
+- 140 JVM unit tests (new: `WifiDirectGroupPolicyTest`, `WifiDirectHintsTest`, `RosterParsingTest`,
+  chip counts / Android-10 chip in `UiLogicTest`).
+- Redmi (Android 16) + COM11 hub with two other phones: chip "Connected · 2 phones", details list
+  them, both show "Online via LoRa hub"; a DM went `HUB_LOCAL` and turned Delivered ✓✓ from the
+  end-to-end receipt ~4 s later. QR scanner and Wi-Fi Direct details checked by screenshot.
+- **Not verified:** multi-phone Wi-Fi Direct groups (only one phone on adb), hub-to-hub LoRa.
+
+## J.7 Known limits / next
+- Every phone needs this build: old builds don't PING (the hub drops them every 2 min → roster
+  flapping, 22-bundle replays) and still send Wi-Fi Direct invitations.
+- Flash v3 to every hub. After a hub reboot each phone shows the system "Connect to device" dialog.
+- A phone joined to a hub's SoftAP and in a Wi-Fi Direct group shares one radio channel; some
+  phones can't do both at once.

@@ -29,6 +29,18 @@ interface ChatDao {
     @Query("UPDATE chat_messages SET status = :status WHERE id = :id")
     suspend fun updateStatus(id: String, status: String)
 
+    /** Mark one of OUR messages delivered. No-op for received rows and unknown ids. */
+    @Query("UPDATE chat_messages SET status = 'DELIVERED' WHERE id = :id AND direction = 'OUT'")
+    suspend fun markOutgoingDelivered(id: String): Int
+
+    /**
+     * One of OUR messages left the buffer undelivered ([status] = EXPIRED / DROPPED). Never
+     * downgrades a delivered message, and never touches received rows (a carried copy of a
+     * broadcast we received can expire without making the chat row "expired").
+     */
+    @Query("UPDATE chat_messages SET status = :status WHERE id = :id AND direction = 'OUT' AND status != 'DELIVERED'")
+    suspend fun markOutgoingEnded(id: String, status: String): Int
+
     @Query("DELETE FROM chat_messages WHERE conv_key = :convKey")
     suspend fun deleteConversation(convKey: String)
 }

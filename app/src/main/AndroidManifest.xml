@@ -11,10 +11,14 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <!-- COARSE is required alongside FINE; a FINE-only request is ignored on Android 12,
-         which breaks WiFi Direct peer discovery on API 31-32. -->
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Location is only needed through Android 12L (API 32): BLE scans before 12 and Wi-Fi Direct
+         discovery before 13. From API 33 the neverForLocation NEARBY_WIFI_DEVICES / BLUETOOTH_*
+         permissions cover it, so location isn't requested at all there. COARSE is required
+         alongside FINE; a FINE-only request is ignored on Android 12 (API 31-32). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"
+        android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="tiramisu" />
@@ -36,20 +40,29 @@
         android:maxSdkVersion="30" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
+    <!-- In-app QR scanner (contact / group invites). Camera is optional: invites can also be
+         uploaded from an image. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <!-- WorkManager scheduling (exact alarms not required — periodic is sufficient) -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- Write to external storage for research data export (scoped storage on 29+) -->
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28"
-        tools:ignore="ScopedStorage" />
+    <!-- Research export writes to the app-specific external files dir, which needs no storage
+         permission on any supported API level. -->
 
+    <!-- Keys, contacts and chats never leave the phone: no cloud backup (allowBackup) and no
+         device-to-device transfer (dataExtractionRules, Android 12+). -->
     <application
         android:name=".DtnMeshApplication"
         android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.DtnMesh">
+        android:theme="@style/Theme.DtnMesh"
+        tools:targetApi="s">
 
         <activity
             android:name=".ui.MainActivity"
@@ -65,6 +78,17 @@
             android:name=".service.DtnForegroundService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
+
+        <!-- Shares QR codes as images (cache/qr only; read access is granted per share). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- Disable WorkManager's default on-startup initializer. We provide our own
              Hilt-aware Configuration via DtnMeshApplication (Configuration.Provider) so

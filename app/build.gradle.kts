@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -6,27 +8,58 @@ plugins {
     alias(libs.plugins.hilt.android)
 }
 
+// Upload-key credentials live in the git-ignored keystore.properties at the project root (see
+// docs/play-store/README.md). Without it, release builds are produced unsigned.
+val uploadKey = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val hasUploadKey = listOf("storeFile", "storePassword", "keyAlias", "keyPassword").all { !uploadKey.getProperty(it).isNullOrBlank() }
+
 android {
     namespace = "com.dtn.mesh"
-    compileSdk = 35
+    // Google Play requires new apps and updates to target Android 16 (API 36) since 31 Aug 2026.
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.dtn.mesh"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-research"
+        targetSdk = 36
+        versionCode = 2
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (hasUploadKey) {
+            create("upload") {
+                storeFile = rootProject.file(uploadKey.getProperty("storeFile"))
+                storePassword = uploadKey.getProperty("storePassword")
+                keyAlias = uploadKey.getProperty("keyAlias")
+                keyPassword = uploadKey.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasUploadKey) signingConfig = signingConfigs.getByName("upload")
+        }
+        // The release (R8-minified) code under a separate package, debug-signed, so it installs
+        // NEXT TO the everyday debug app for on-device testing without touching its data.
+        create("staging") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".staging"
+            versionNameSuffix = "-staging"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
         }
     }
 
@@ -41,6 +74,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true // VERSION_NAME / VERSION_CODE for Settings → About
     }
 
     // The MQTT client pulls in Netty, which ships duplicate META-INF resources.

@@ -21,4 +21,7 @@ class LocalNodeIdentity @Inject constructor(
 
     /** The 32-bit numeric form written on the wire. */
     val nodeNum32: Int get() = identity.nodeNum32
+
+    /** When this identity was generated (epoch ms, 0 = unknown); see [DtnIdentity.createdAtMs]. */
+    val createdAtMs: Long get() = identity.createdAtMs
 }

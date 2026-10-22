@@ -7,6 +7,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
 import com.dtn.mesh.database.dao.SeenBundleDao
+import com.dtn.mesh.model.DtnMessageType
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.routing.StrategySelector
 import com.dtn.mesh.service.DtnOrchestrator
@@ -55,9 +56,15 @@ class ForwardingWorker @AssistedInject constructor(
             queueManager.getAllBuffered()
                 .filter { it.remainingTtlMs() <= 0L }
                 .forEach { m ->
-                    lifecycle.log(LifecycleEvent.EXPIRED, m.id,
-                        origin = m.originNodeId.value, dest = m.destinationNodeId.value,
-                        hopCount = m.hopCount, extra = "TTL reached")
+                    // Only user messages belong in the message journal; announces and receipts
+                    // expire constantly by design and would bury real events.
+                    if (m.messageType == DtnMessageType.DATA) {
+                        lifecycle.log(LifecycleEvent.EXPIRED, m.id,
+                            origin = m.originNodeId.value, dest = m.destinationNodeId.value,
+                            hopCount = m.hopCount, extra = "TTL reached before delivery")
+                    } else {
+                        lifecycle.console("CTRL ${m.messageType.name} ${m.id.take(8)} expired")
+                    }
                     // Q-learning credit: decisions on a message that expired undelivered get a
                     // negative reward so the engine learns to avoid whatever led here.
                     runCatching { decisionDao.setRewardByMessageId(m.id, DtnOrchestrator.REWARD_EXPIRED) }

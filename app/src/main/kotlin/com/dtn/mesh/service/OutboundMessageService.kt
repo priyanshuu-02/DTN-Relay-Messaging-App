@@ -28,6 +28,7 @@ class OutboundMessageService @Inject constructor(
     private val queueManager: MessageQueueManager,
     private val chatDao: ChatDao,
     private val internet: InternetTransportAdapter,
+    private val lifecycle: MessageLifecycleLog,
 ) {
     sealed interface Result {
         data class Sent(val message: DtnMessage) : Result
@@ -71,7 +72,10 @@ class OutboundMessageService @Inject constructor(
             val status = if (channel > 0 || isBroadcast) ChatMessageEntity.Status.SENT else ChatMessageEntity.Status.SENDING
             chatDao.upsert(ChatMessageEntity(id, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, status, now))
             val stored = queueManager.ingest(msg)
-            if (stored) internet.publish(msg) // bridge to the internet relay too (no-op if not connected)
+            if (stored) {
+                journalCreated(msg, fragments = 1)
+                bridgeToRelay(msg)
+            }
             return if (stored) Result.Sent(msg) else Result.Error
         }
 
@@ -93,8 +97,12 @@ class OutboundMessageService @Inject constructor(
                 createdAtMs = now, ttlMs = ttlMs, messageType = DtnMessageType.DATA, channel = channel,
                 fragmentIndex = i, fragmentTotal = total, flags = flags,
             )
+            if (queueManager.ingest(msg)) {
+                // Fragments share the first 8 id characters, so the journal tracks them as one.
+                if (first == null) journalCreated(msg, fragments = total)
+                bridgeToRelay(msg)
+            }
             if (first == null) first = msg
-            if (queueManager.ingest(msg)) internet.publish(msg)
         }
         // One chat row for the whole message, keyed by the canonical parent id (status SENT: a
         // multi-fragment message is acknowledged per fragment, not tracked as one delivery).
@@ -118,7 +126,46 @@ class OutboundMessageService @Inject constructor(
             messageType = DtnMessageType.ANNOUNCE,
         )
         queueManager.ingest(msg)
-        internet.publish(msg) // propagate our keys over the internet relay too (if connected)
+        bridgeToRelay(msg) // propagate our keys over the internet relay too (if connected)
         return msg
+    }
+
+    /**
+     * Broadcasts, group messages and announces are fanned out over the relay once, by the origin,
+     * so every relay subscriber gets them immediately. DMs are NOT published here: the
+     * orchestrator's flush delivers them to the destination's node topic when it is present on
+     * the relay, keeps them until the end-to-end receipt returns, and retries otherwise.
+     */
+    private fun bridgeToRelay(msg: DtnMessage) {
+        if (msg.destinationNodeId != NodeId.BROADCAST) return
+        internet.publishBroadcast(msg) {
+            // Control traffic (announces) stays out of the message journal.
+            if (msg.messageType == DtnMessageType.DATA) {
+                lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                    origin = msg.originNodeId.value, dest = "BROADCAST",
+                    extra = "${if (msg.channel > 0) "group message" else "broadcast"} published to everyone on the internet relay")
+                lifecycle.recordRelayPublish(msg.id, "Internet relay")
+            }
+        }
+    }
+
+    /** Journal a message we just created: what it is, that it's queued, and the route record. */
+    private fun journalCreated(m: DtnMessage, fragments: Int) {
+        val dest = m.destinationNodeId
+        val multiParty = dest == NodeId.BROADCAST
+        val kind = when {
+            m.channel > 0 -> "group message (encrypted with the group key)"
+            multiParty -> "public broadcast (not encrypted)"
+            else -> "direct message (end-to-end encrypted)"
+        }
+        lifecycle.log(LifecycleEvent.CREATED, m.id,
+            origin = m.originNodeId.value, dest = dest.value, ttlRemainingMs = m.ttlMs,
+            extra = kind + if (fragments > 1) " · $fragments fragments" else "")
+        lifecycle.log(LifecycleEvent.BUFFERED, m.id,
+            origin = m.originNodeId.value, dest = dest.value,
+            extra = if (multiParty) "queued — goes to everyone this phone meets until it expires"
+            else "queued — waiting for a link toward the recipient")
+        lifecycle.recordAsOrigin(m.id, source = m.originNodeId.value, dest = dest.value,
+            me = m.originNodeId.value, channel = m.channel)
     }
 }

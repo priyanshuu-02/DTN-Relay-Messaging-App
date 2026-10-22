@@ -88,11 +88,44 @@ interface MeshTransport {
     // Query
     // ──────────────────────────────────────────────────────────────────────
 
-    /** Whether the AIDL service is currently bound and the radio reports CONNECTED. */
+    /** Whether any transport is currently up. */
     val isConnected: Boolean
 
     /** Our own node ID (populated after successful bind). Null if not connected. */
     val localNodeId: NodeId?
+
+    /** Per-transport live state + the set the user wants running (drives the UI chips). */
+    val transportStatus: StateFlow<TransportStatus>
+
+    /** Node ids currently present on the internet relay (never includes ourselves). */
+    val internetPeers: StateFlow<Set<String>>
+
+    /** Other phones registered at our LoRa hub right now (from its roster; never ourselves). */
+    val hubPeers: StateFlow<Set<String>>
+
+    /**
+     * True when a local radio reaches [peer] right now: BLE, Wi-Fi Direct, the hub itself, or a
+     * phone on our hub (through it). When false but the peer is in [internetPeers], a send goes
+     * over the relay — callers use this to apply relay semantics (wait for the end-to-end
+     * receipt, no custody hand-off).
+     */
+    fun isRadioReachable(peer: NodeId): Boolean
+
+    /**
+     * True when a link that ends AT [peer] carries bundles to it right now: BLE, Wi-Fi Direct, or
+     * the hub when [peer] is the hub. Only these prove delivery on a successful write; a phone on
+     * our hub ([isHubPeer]) is two hops away and needs the end-to-end receipt.
+     */
+    fun reachesDirectly(peer: NodeId): Boolean
+
+    /** True when [peer] is the LoRa hub we're connected to. */
+    fun isHub(peer: NodeId): Boolean
+
+    /** True when [peer] is another phone registered at our hub (reachable through it). */
+    fun isHubPeer(peer: NodeId): Boolean
+
+    /** Like [sendMessage], but also reports which link carried the bundle (null = not sent). */
+    suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId): SendOutcome?
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -118,7 +151,18 @@ data class InboundPacket(
      * to us, which wastes half-duplex BLE airtime and stalls forward progress in a chain.
      */
     val viaPeer: NodeId? = null,
+    /** Which transport delivered this packet (for the message journal), if known. */
+    val transport: TransportKind? = null,
 )
+
+/** Short label for the journal, e.g. "BLE", "LoRa hub", "Internet relay". */
+fun TransportKind?.journalLabel(): String = when (this) {
+    TransportKind.BLE -> "BLE"
+    TransportKind.WIFI_DIRECT -> "Wi-Fi Direct"
+    TransportKind.HUB -> "LoRa hub"
+    TransportKind.INTERNET -> "Internet relay"
+    null -> "radio"
+}
 
 /**
  * A node presence/signal event derived from Meshtastic NODE_CHANGE broadcasts.

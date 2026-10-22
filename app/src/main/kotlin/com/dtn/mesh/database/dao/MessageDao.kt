@@ -52,21 +52,29 @@ interface MessageDao {
 
     /**
      * Reactive flow of buffered message count (for the UI "Buffer N" badge).
-     * Counts only user DATA — control bundles (ANNOUNCE key-gossip, routing acks) live in the
-     * same buffer for relay but are not user-visible traffic, so they must not inflate the badge.
+     * Counts only DMs waiting for delivery. Control bundles (ANNOUNCE key-gossip, routing acks)
+     * and everything addressed to "^all" (broadcasts, group messages, announces) also live in the
+     * buffer — they keep spreading epidemically until their TTL by design — but they are never
+     * "waiting" for anyone, so they must not inflate the badge.
      */
-    @Query("SELECT COUNT(*) FROM messages WHERE status = '${MessageStatus.BUFFERED}' AND message_type = 'DATA'")
+    @Query("""
+        SELECT COUNT(*) FROM messages
+        WHERE status = '${MessageStatus.BUFFERED}'
+          AND message_type = 'DATA'
+          AND destination_node_id != '^all'
+    """)
     fun observeBufferedCount(): Flow<Int>
 
     /**
      * Reactive flow of currently-buffered message entities (for the Network tab list).
-     * DATA only — see [observeBufferedCount]; the periodic identity ANNOUNCE would otherwise
-     * show up as a stream of mystery "broadcast" rows the user never sent.
+     * DMs only — see [observeBufferedCount]; announces and broadcasts would otherwise show up as
+     * a stream of "buffered" rows that never leave until they expire.
      */
     @Query("""
         SELECT * FROM messages 
         WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
           AND message_type = 'DATA'
+          AND destination_node_id != '^all'
         ORDER BY received_at_ms DESC
     """)
     fun observeBufferedMessages(): Flow<List<MessageEntity>>
@@ -121,6 +129,10 @@ interface MessageDao {
     /** Get a single message by ID. */
     @Query("SELECT * FROM messages WHERE id = :messageId")
     suspend fun getById(messageId: String): MessageEntity?
+
+    /** Hard-delete one message row (see MessageQueueManager.forget). */
+    @Query("DELETE FROM messages WHERE id = :messageId")
+    suspend fun deleteById(messageId: String)
 
     /** Check if a message ID already exists (deduplication check without full insert). */
     @Query("SELECT COUNT(*) FROM messages WHERE id = :messageId")

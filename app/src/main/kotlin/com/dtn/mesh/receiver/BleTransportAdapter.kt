@@ -76,6 +76,7 @@ import javax.inject.Singleton
 class BleTransportAdapter @Inject constructor(
     @ApplicationContext private val context: Context,
     private val identity: LocalNodeIdentity,
+    private val wifiDirectHints: WifiDirectHints,
 ) : DtnTransport {
 
     companion object {
@@ -165,6 +166,21 @@ class BleTransportAdapter @Inject constructor(
 
     override val localNodeId: NodeId get() = identity.nodeId
 
+    private val _linkInfo = MutableStateFlow(LinkInfo())
+    /** Phones currently heard over BLE (refreshed by the sweeper), for the link details sheet. */
+    val linkInfo: StateFlow<LinkInfo> = _linkInfo.asStateFlow()
+
+    private fun publishLinkInfo() {
+        val peers = deviceForNode.keys.sorted().map { id ->
+            LinkPeer(id, role = "Nearby", detail = lastRssiByNode[id]?.let { "RSSI $it dBm" }.orEmpty())
+        }
+        _linkInfo.value = when {
+            !isConnected -> LinkInfo(summary = if (_connectionState.value == MeshConnectionState.CONNECTING) "Starting…" else "Off")
+            peers.isEmpty() -> LinkInfo(summary = "Advertising and scanning — no DTN phones in range yet")
+            else -> LinkInfo(summary = "${peers.size} DTN phone${if (peers.size == 1) "" else "s"} in range", peers = peers)
+        }
+    }
+
     /** Whether a peer is currently reachable via BLE (seen in recent scans). */
     fun isPeerReachable(peerId: NodeId): Boolean {
         return deviceForNode.containsKey(peerId.value)
@@ -198,6 +214,15 @@ class BleTransportAdapter @Inject constructor(
     }
 
     override fun disconnect() {
+        // Report every peer we were tracking as offline first. When only BLE is switched off
+        // (other transports still up, orchestrator still running) this keeps the contacts table
+        // honest instead of leaving BLE-only peers shown online over a radio that is gone.
+        val now = System.currentTimeMillis()
+        val tracked = peerLastSeenMs.keys.toList()
+        deviceForNode.clear() // first, so these peers no longer count as BLE-reachable
+        tracked.forEach { id ->
+            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = 0, snr = 0f, timestampMs = now, isOnline = false))
+        }
         runCatching { sweeperJob?.cancel() }; sweeperJob = null
         runCatching { adapterScope?.cancel() }; adapterScope = null
         runCatching { scanner?.stopScan(scanCallback) }
@@ -210,6 +235,7 @@ class BleTransportAdapter @Inject constructor(
         readyDevices.clear(); lastEncounterEmit.clear(); peerLastSeenMs.clear()
         connectWaiters.values.forEach { it.complete(false) }; connectWaiters.clear()
         chunkAckWaiters.values.forEach { it.complete(false) }; chunkAckWaiters.clear()
+        _linkInfo.value = LinkInfo(summary = "Off")
         _connectionState.value = MeshConnectionState.DISCONNECTED
     }
 
@@ -224,10 +250,13 @@ class BleTransportAdapter @Inject constructor(
     private fun startStalenessSweeper() {
         val sc = CoroutineScope(Dispatchers.IO + SupervisorJob())
         adapterScope = sc
+        followWifiDirectHints(sc)
         sweeperJob = sc.launch {
+            publishLinkInfo()
             while (isActive) {
                 delay(SWEEPER_TICK_MS)
                 runStalenessCheck(PEER_STALE_THRESHOLD_MS)
+                publishLinkInfo()
             }
         }
     }
@@ -372,7 +401,7 @@ class BleTransportAdapter @Inject constructor(
             emitOnlineEncounter(neighbour, rssi = neighbourRssi)
         }
 
-        _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = neighbour))
+        _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = neighbour, transport = TransportKind.BLE))
     }
 
     // ── Advertising ──────────────────────────────────────────────────────
@@ -390,16 +419,32 @@ class BleTransportAdapter @Inject constructor(
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .setConnectable(true)
             .build()
-        // Publish our node id (4 bytes) as service data so scanners identify us without connecting.
-        // We split the advertisement to fit within the 31-byte legacy limit:
-        // Service UUID in the advertisement, Service Data in the scan response.
+        // Publish our node id (4 bytes) + our Wi-Fi Direct group hint (5 bytes, see
+        // WifiDirectHints) as service data so scanners identify us without connecting. We split
+        // the advertisement to fit within the 31-byte legacy limit: Service UUID in the
+        // advertisement, Service Data (2 + 16 + 9 = 27 bytes) in the scan response.
+        val local = wifiDirectHints.local.value
         val data = AdvertiseData.Builder()
             .addServiceUuid(SERVICE_PARCEL)
             .build()
         val scanResponse = AdvertiseData.Builder()
-            .addServiceData(SERVICE_PARCEL, int32(identity.nodeNum32))
+            .addServiceData(SERVICE_PARCEL, WifiDirectHints.encode(identity.nodeNum32, local))
             .build()
+        advertisedHint = local
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+    }
+
+    @Volatile private var advertisedHint: WifiDirectHints.Local? = null
+
+    /** Re-advertise when this phone's Wi-Fi Direct group state changes (owner / members). */
+    private fun followWifiDirectHints(sc: CoroutineScope) {
+        sc.launch {
+            wifiDirectHints.local.collect { local ->
+                if (!isConnected || local == advertisedHint) return@collect
+                runCatching { advertiser?.stopAdvertising(advertiseCallback) }
+                runCatching { startAdvertising() }.onFailure { Log.w(TAG, "re-advertise failed", it) }
+            }
+        }
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -456,6 +501,8 @@ class BleTransportAdapter @Inject constructor(
             if (serviceData.size < 4) return
             val peer = NodeId.fromNodeNum(readInt32(serviceData))
             if (peer == identity.nodeId) return // ignore our own advertisement
+            // Its Wi-Fi Direct group hint (null for builds that only advertise the node id).
+            wifiDirectHints.onBleSighting(peer.value.removePrefix("!"), WifiDirectHints.decode(serviceData))
 
             deviceForNode[peer.value] = result.device
             lastRssiByNode[peer.value] = result.rssi // real link quality, reused for inbound writes

@@ -1,6 +1,8 @@
 package com.dtn.mesh.queue
 
+import com.dtn.mesh.database.dao.ChatDao
 import com.dtn.mesh.database.dao.MessageDao
+import com.dtn.mesh.database.entity.ChatMessageEntity
 import com.dtn.mesh.database.entity.MessageEntity
 import com.dtn.mesh.database.entity.MessageStatus
 import com.dtn.mesh.model.DtnMessage
@@ -25,6 +27,7 @@ import javax.inject.Singleton
 class MessageQueueManager @Inject constructor(
     private val messageDao: MessageDao,
     private val config: BufferConfig,
+    private val chatDao: ChatDao,
 ) {
 
     /**
@@ -32,9 +35,9 @@ class MessageQueueManager @Inject constructor(
      * either because we delivered it directly, because a broadcast finished fanning out,
      * or because a returning receipt confirmed the destination got it.
      *
-     * The UI listens to this to flip the "buffered" chat bubble to "✓ delivered". A mule
-     * hop does NOT emit here (queueManager.markDelivered is only called on end-delivery),
-     * so relay handoffs correctly stay showing as buffered.
+     * The matching chat row is updated right here (not by a UI collector), so delivery is
+     * recorded even while the app's screen is closed and only the relay service is running. A
+     * mule hop does NOT emit here (markDelivered is only called on end-delivery).
      */
     private val _deliveredIds = MutableSharedFlow<String>(
         extraBufferCapacity = 32,
@@ -126,7 +129,15 @@ class MessageQueueManager @Inject constructor(
 
         if (dropIds.isNotEmpty()) {
             messageDao.markDropped(dropIds)
+            // Previously silent: the chat bubble and route record never learned the message left.
+            endChats(dropIds, ChatMessageEntity.Status.DROPPED)
+            dropIds.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_DROPPED)) }
         }
+    }
+
+    /** Record on our own chat rows that these messages left the buffer undelivered. */
+    private suspend fun endChats(ids: List<String>, status: String) {
+        ids.forEach { id -> runCatching { chatDao.markOutgoingEnded(id, status) } }
     }
 
     /**
@@ -148,6 +159,7 @@ class MessageQueueManager @Inject constructor(
         // messages just expired (Room UPDATE can't return the affected rows).
         val expiringIds = messageDao.getExpiringMessageIds(now)
         val n = messageDao.markExpiredMessages(now)
+        endChats(expiringIds, ChatMessageEntity.Status.EXPIRED)
         expiringIds.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_EXPIRED)) }
         return n
     }
@@ -212,6 +224,7 @@ class MessageQueueManager @Inject constructor(
         // can prune send-tracking state — a bare UPDATE tells no one what changed.
         val ids = messageDao.getActiveMessageIds()
         messageDao.clearAllActive()
+        endChats(ids, ChatMessageEntity.Status.DROPPED)
         ids.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_CLEARED)) }
         return ids.size
     }
@@ -223,7 +236,16 @@ class MessageQueueManager @Inject constructor(
     suspend fun dropMessages(ids: List<String>) {
         if (ids.isEmpty()) return
         messageDao.markDropped(ids)
+        endChats(ids, ChatMessageEntity.Status.DROPPED)
         ids.forEach { _terminalEvents.tryEmit(TerminalEvent(it, REASON_DROPPED)) }
+    }
+
+    /**
+     * Remove a message row entirely, without a terminal event or tombstone, so a later copy of
+     * the same id is accepted as new. Used when a DM for us can't be decrypted yet.
+     */
+    suspend fun forget(messageId: String) {
+        messageDao.deleteById(messageId)
     }
 
     /** Check if a message exists in BUFFERED state. */
@@ -232,9 +254,18 @@ class MessageQueueManager @Inject constructor(
         return entity.status == MessageStatus.BUFFERED
     }
 
-    /** Mark a message as delivered (ACK received). */
+    /** Mark a message as delivered (direct delivery, or an end-to-end receipt arrived). */
     suspend fun markDelivered(messageId: String) {
         messageDao.markDelivered(messageId)
+        confirmDelivered(messageId)
+    }
+
+    /**
+     * Record end-to-end delivery of one of our messages on its chat row, whatever state its buffer
+     * copy is in (a receipt can arrive while the copy is still FORWARDING, or after it's gone).
+     */
+    suspend fun confirmDelivered(messageId: String) {
+        runCatching { chatDao.markOutgoingDelivered(messageId) }
         _deliveredIds.tryEmit(messageId)
     }
 

@@ -3,6 +3,7 @@ package com.dtn.mesh.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -12,7 +13,9 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.dtn.mesh.R
 import com.dtn.mesh.scheduler.SchedulerConfig
+import com.dtn.mesh.ui.MainActivity
 import com.dtn.mesh.scheduler.WorkManagerSetup
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
@@ -85,11 +88,20 @@ class DtnForegroundService : Service() {
         }
     }
 
-    private fun buildNotification(text: String): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(text: String): Notification {
+        // Tapping the notification brings the app back (it previously did nothing).
+        val open = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("DTN Mesh Relay")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setSmallIcon(R.drawable.ic_stat_dtn)
+            .setContentIntent(open)
             .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
+    }
 }

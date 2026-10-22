@@ -23,9 +23,17 @@ Thumbs.db
 # JVM crash logs
 **/hs_err_pid*.log
 **/replay_pid*.log
+# Play upload key + its passwords (back these up privately — never commit them)
+keystore/
+keystore.properties
+*.jks
+*.keystore
+# Built APK / AAB handed out for testing and Play uploads
+dist/
 
 # LMS project files and unrelated utilities
 LMS_Project_Scope_Assignment.docx
 ~$*.docx
 ~$LMS_Project_Scope_Assignment.docx
 docx_generator/
+_diag/

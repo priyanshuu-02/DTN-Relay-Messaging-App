@@ -26,10 +26,15 @@ object PermissionHelper {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Location required for WiFi Direct peer discovery (all API levels). COARSE must be
-        // requested with FINE or Android 12 (API 31-32) ignores a FINE-only request.
-        perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
-        perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        // Location is only needed up to Android 12L (API 32): BLE scanning before Android 12 and
+        // Wi-Fi Direct discovery before Android 13. From API 33 NEARBY_WIFI_DEVICES and the
+        // BLUETOOTH_* permissions (both declared neverForLocation) cover it, and the manifest
+        // caps location at maxSdkVersion 32 — so the app never asks for location there.
+        // COARSE must accompany FINE or Android 12 (API 31-32) ignores a FINE-only request.
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
+            perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            perms.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        }
 
         return perms.toTypedArray()
     }

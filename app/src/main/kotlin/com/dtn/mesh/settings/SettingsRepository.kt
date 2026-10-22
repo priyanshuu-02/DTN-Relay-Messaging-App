@@ -37,7 +37,8 @@ class SettingsRepository @Inject constructor(
     suspend fun setBrokerUrl(url: String) { store.edit { it[KEY_BROKER] = url } }
 
     companion object {
-        const val DEFAULT_BROKER = "tcp://broker.hivemq.com:1883"
+        /** TLS by default: hides topics/presence from the network path (payloads are E2E anyway). */
+        const val DEFAULT_BROKER = com.dtn.mesh.receiver.RelayEndpoints.DEFAULT_URL
         private val KEY_NAME = stringPreferencesKey("display_name")
         private val KEY_INET = booleanPreferencesKey("internet_enabled")
         private val KEY_BROKER = stringPreferencesKey("broker_url")
