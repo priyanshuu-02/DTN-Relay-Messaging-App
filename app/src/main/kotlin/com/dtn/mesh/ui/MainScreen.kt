@@ -293,16 +293,24 @@ private fun ChatListTab(viewModel: DtnViewModel) {
     val sortedGroups = remember(groups, summaries) {
         groups.sortedByDescending { summaries["grp:${it.channel}"]?.atMs ?: 0L }
     }
+    val discoverable by viewModel.discoverable.collectAsState()
+    // Contacts (added by QR / Add / a message either way) are the chats; phones that only
+    // announced themselves wait in "Discovered" until added.
     val sortedPeers = remember(peers, summaries) {
-        peers.sortedWith(
+        peers.filter { it.added || summaries.containsKey(it.nodeId) }.sortedWith(
             compareByDescending<PeerInfo> { summaries[it.nodeId]?.atMs ?: 0L }
                 .thenByDescending { it.reachable }
                 .thenByDescending { it.lastSeenMs },
         )
     }
+    val discovered = remember(peers, summaries) {
+        peers.filter { !it.added && !summaries.containsKey(it.nodeId) && it.hasKeys }
+            .sortedWith(compareByDescending<PeerInfo> { it.reachable }.thenByDescending { it.lastSeenMs })
+    }
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
         item { Spacer(Modifier.height(8.dp)) }
+        item { DiscoverCard(discoverable = discoverable, onChange = { viewModel.setDiscoverable(it) }) }
         item {
             val s = summaries[BROADCAST_CHAT_KEY]
             BroadcastCard(
@@ -328,7 +336,8 @@ private fun ChatListTab(viewModel: DtnViewModel) {
             item {
                 EmptyState(
                     "No contacts yet.",
-                    "Connect to discover nearby phones, or scan a contact's QR (🔑) to reach them over the internet relay.",
+                    "Scan a contact's QR (🔑) to add them, or turn on Discover so phones nearby and on the " +
+                        "internet relay can find each other.",
                 )
             }
         } else {
@@ -341,6 +350,22 @@ private fun ChatListTab(viewModel: DtnViewModel) {
                     onClick = { viewModel.openChat(peer.nodeId) },
                     onEdit = { renameTarget = peer },
                 )
+            }
+        }
+        if (discovered.isNotEmpty()) {
+            item {
+                Text(
+                    "DISCOVERED · ${discovered.size}",
+                    fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Palette.Primary, letterSpacing = 0.8.sp,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 2.dp, start = 4.dp),
+                )
+                Text(
+                    "Phones that made themselves discoverable. Add one to chat with it.",
+                    fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                )
+            }
+            items(discovered, key = { "disc-${it.nodeId}" }) { peer ->
+                DiscoveredRow(peer = peer, onAdd = { viewModel.addContact(peer.nodeId) })
             }
         }
         item { Spacer(Modifier.height(12.dp)) }
@@ -370,6 +395,7 @@ private fun reachabilityText(peer: PeerInfo): String = when {
     peer.isOnline && peer.hubOnly -> "📡 Online via LoRa hub"
     peer.isOnline -> "Nearby · ${peer.nodeId.takeLast(8)}"
     peer.internetOnline -> "🌐 Online via internet relay"
+    peer.viaOtherHub -> "📡 Online via LoRa · ${peer.meshHubLabel}"
     else -> "Offline · last seen ${relativeSince(peer.lastSeenMs)}"
 }
 
@@ -437,6 +463,64 @@ private fun BroadcastCard(lastPreview: String?, time: String, onClick: () -> Uni
                     fontSize = 12.sp, color = Palette.TextSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+    }
+}
+
+/** Discover on/off: whether this phone broadcasts its name + keys to everyone it can reach. */
+@Composable
+private fun DiscoverCard(discoverable: Boolean, onChange: (Boolean) -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        colors = CardDefaults.cardColors(containerColor = if (discoverable) Palette.AccentSoft else Palette.CardSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("📣", fontSize = 20.sp)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Discover", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Palette.TextPrimary)
+                Text(
+                    if (discoverable) "On — phones nearby and on the internet relay can see and add you"
+                    else "Off — only your contacts see you; others add you by your QR (🔑)",
+                    fontSize = 11.sp, color = Palette.TextSecondary,
+                )
+            }
+            androidx.compose.material3.Switch(
+                checked = discoverable,
+                onCheckedChange = onChange,
+                modifier = Modifier.semantics { contentDescription = "Discover" },
+            )
+        }
+    }
+}
+
+/** A phone that announced itself (Discover) but isn't in the chat list yet. */
+@Composable
+private fun DiscoveredRow(peer: PeerInfo, onAdd: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            PeerAvatar(peer = peer, size = 38.dp)
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(peer.displayName(), fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = Palette.TextPrimary,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(reachabilityText(peer), fontSize = 11.sp, color = Palette.TextSecondary,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            FilledTonalButton(onClick = onAdd) { Text("Add") }
         }
     }
 }
@@ -514,13 +598,17 @@ private fun ReachIndicator(peer: PeerInfo) {
         Text("📡", fontSize = 14.sp, modifier = Modifier.semantics { contentDescription = "Online via LoRa hub" })
     } else if (!peer.isOnline && peer.internetOnline) {
         Text("🌐", fontSize = 14.sp, modifier = Modifier.semantics { contentDescription = "Online via internet relay" })
+    } else if (peer.viaOtherHub) {
+        // On another hub, reached over LoRa through ours: no radio signal of our own either.
+        Text("📡", fontSize = 14.sp, modifier = Modifier.semantics { contentDescription = "Online via LoRa, on ${peer.meshHubLabel}" })
     } else {
         SignalBars(rssi = peer.lastRssi, isOnline = peer.isOnline)
     }
 }
 
-/** Circular colored avatar with the first character of the display name. Ring: green = nearby
- *  over radio, blue = online via the internet relay, red = not reachable. */
+/** Circular colored avatar with the first character of the display name. Ring: green = reachable
+ *  over radio (nearby, or over LoRa through the hubs), blue = online via the internet relay,
+ *  red = not reachable. */
 @Composable
 private fun PeerAvatar(peer: PeerInfo, size: androidx.compose.ui.unit.Dp) {
     val name = peer.displayName()
@@ -529,6 +617,7 @@ private fun PeerAvatar(peer: PeerInfo, size: androidx.compose.ui.unit.Dp) {
     val ringColor = when {
         peer.isOnline -> Palette.Accent
         peer.internetOnline -> Palette.PrimaryLight
+        peer.viaOtherHub -> Palette.Accent
         else -> Palette.Error
     }
     Box(
@@ -658,6 +747,7 @@ private fun ChatDetailScreen(viewModel: DtnViewModel, chatKey: String) {
         peer?.isOnline == true && peer.hubOnly -> "Online · via LoRa hub"
         peer?.isOnline == true -> "Online · nearby"
         peer?.internetOnline == true -> "Online · via internet relay"
+        peer?.viaOtherHub == true -> "Online · via LoRa (${peer.meshHubLabel})"
         peer != null -> "Offline · messages wait in the buffer"
         else -> ""
     }
@@ -1214,9 +1304,10 @@ private fun StrategySwitchRow(active: String, onSelect: (String) -> Unit) {
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     StrategyChip("MAXPROP", "Path-cost", active == "MAXPROP") { onSelect("MAXPROP") }
-                    StrategyChip("EPIDEMIC", "Flood-all", active == "EPIDEMIC") { onSelect("EPIDEMIC") }
+                    StrategyChip("DIMAXPROP", "Path-cost + distance", active == "DIMAXPROP") { onSelect("DIMAXPROP") }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    StrategyChip("EPIDEMIC", "Flood-all", active == "EPIDEMIC") { onSelect("EPIDEMIC") }
                     StrategyChip("QLEARNING", "Reinforcement-learning", active == "QLEARNING") { onSelect("QLEARNING") }
                 }
             }
@@ -1431,12 +1522,14 @@ private fun NetworkPeerRow(peer: PeerInfo, metric: PeerMetric?, onClick: () -> U
                         peer.isOnline && peer.hubOnly -> "active now · via LoRa hub"
                         peer.isOnline -> "active now · nearby"
                         peer.internetOnline -> "online via internet relay"
+                        peer.viaOtherHub -> "active now · via LoRa (${peer.meshHubLabel})"
                         else -> "last seen ${relativeSince(peer.lastSeenMs)}"
                     },
                     fontSize = 10.sp,
                     color = when {
                         peer.isOnline -> Palette.Accent
                         peer.internetOnline -> Palette.Primary
+                        peer.viaOtherHub -> Palette.Accent
                         else -> Palette.TextMuted
                     },
                 )
@@ -1445,6 +1538,7 @@ private fun NetworkPeerRow(peer: PeerInfo, metric: PeerMetric?, onClick: () -> U
                 val (chipText, chipColor) = when {
                     peer.isOnline -> "ACTIVE" to Palette.Accent
                     peer.internetOnline -> "INTERNET" to Palette.Primary
+                    peer.viaOtherHub -> "LORA" to Palette.Accent
                     else -> "INACTIVE" to Palette.Error
                 }
                 Surface(shape = RoundedCornerShape(8.dp), color = chipColor.copy(alpha = 0.15f)) {

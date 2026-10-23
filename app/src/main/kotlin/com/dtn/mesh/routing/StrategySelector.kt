@@ -20,10 +20,11 @@ class StrategySelector(
     private val epidemic: EpidemicStrategy = EpidemicStrategy(),
     private val stableProphet: ProphetStrategy = ProphetStrategy(ProphetConfig(stabilityAware = true)),
     private val qLearning: QLearningStrategy = QLearningStrategy(),
+    private val diMaxPropStrategy: DiMaxPropStrategy = DiMaxPropStrategy(),
     initialStrategy: StrategyType = StrategyType.PROPHET,
 ) : RoutingStrategy {
 
-    enum class StrategyType { PROPHET, MAXPROP, EPIDEMIC, STABLE, QLEARNING }
+    enum class StrategyType { PROPHET, MAXPROP, EPIDEMIC, STABLE, QLEARNING, DIMAXPROP }
 
     var activeType: StrategyType = initialStrategy
         private set
@@ -35,7 +36,14 @@ class StrategySelector(
             StrategyType.EPIDEMIC -> epidemic
             StrategyType.STABLE -> stableProphet
             StrategyType.QLEARNING -> qLearning
+            StrategyType.DIMAXPROP -> diMaxPropStrategy
         }
+
+    /**
+     * DiMaxProp is always learning (like every strategy here), whichever one is active:
+     * Q-learning reads its path costs (C(B,D) input + per-hop progress reward).
+     */
+    val diMaxProp: DiMaxPropStrategy get() = diMaxPropStrategy
 
     override val name: String get() = active.name
 
@@ -56,6 +64,7 @@ class StrategySelector(
         maxProp.onEncounter(peerId, contactRecord)
         epidemic.onEncounter(peerId, contactRecord)
         stableProphet.onEncounter(peerId, contactRecord)
+        diMaxPropStrategy.onEncounter(peerId, contactRecord)
     }
 
     override fun onRoutingSummaryReceived(peerId: NodeId, summary: RoutingSummary) {
@@ -66,11 +75,18 @@ class StrategySelector(
             "PROPHET" -> prophet.onRoutingSummaryReceived(peerId, summary)
             "STABLE-PROPHET" -> stableProphet.onRoutingSummaryReceived(peerId, summary)
             "MAXPROP" -> maxProp.onRoutingSummaryReceived(peerId, summary)
+            DiMaxPropStrategy.TAG -> diMaxPropStrategy.onRoutingSummaryReceived(peerId, summary)
             // EPIDEMIC carries no routing state — nothing to integrate.
         }
     }
 
-    override fun buildRoutingSummary(): RoutingSummary = active.buildRoutingSummary()
+    /**
+     * Our summary for a newly met peer: the active strategy's. Q-learning has no table of its own
+     * to share, so it sends DiMaxProp's (its path-cost input needs the neighbours' vectors).
+     */
+    override fun buildRoutingSummary(): RoutingSummary =
+        if (activeType == StrategyType.QLEARNING) diMaxPropStrategy.buildRoutingSummary()
+        else active.buildRoutingSummary()
 
     override fun rankForForwarding(candidates: List<DtnMessage>, peerId: NodeId): List<ForwardCandidate> =
         active.rankForForwarding(candidates, peerId)
@@ -83,6 +99,7 @@ class StrategySelector(
         maxProp.onPeriodicAge()
         epidemic.onPeriodicAge()
         stableProphet.onPeriodicAge()
+        diMaxPropStrategy.onPeriodicAge()
     }
 
     override fun getDeliveryProbability(peerId: NodeId): Double =

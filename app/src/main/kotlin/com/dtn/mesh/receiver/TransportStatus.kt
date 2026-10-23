@@ -24,6 +24,12 @@ enum class SendPath(val label: String, val reachesTargetDirectly: Boolean) {
 /** Result of a successful send: transport packet id + the link used. */
 data class SendOutcome(val packetId: Int, val path: SendPath)
 
+/**
+ * Short name of a LoRa hub, matching its Wi-Fi: hub `!da65bdb8` → "hub BDB8" (SSID DTN-HUB-BDB8,
+ * the last 4 hex digits of its id).
+ */
+fun hubLabel(hubId: String): String = "hub " + hubId.removePrefix("!").takeLast(4).uppercase()
+
 /** One device reachable over a link right now, for the link details sheet. */
 data class LinkPeer(
     val nodeId: String,

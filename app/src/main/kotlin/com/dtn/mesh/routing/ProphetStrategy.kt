@@ -417,6 +417,31 @@ class ProphetStrategy(
     fun peerDeliveryProbability(peer: NodeId, dest: NodeId): Double =
         peerPTables[peer.value]?.get(dest.value) ?: 0.0
 
+    /**
+     * Why [rankForForwardingWithTopology] hands [msg] to [peerId], with the numbers it used. Saved
+     * with the forward so Message info shows the decision as it was made, not today's values.
+     */
+    fun explain(msg: DtnMessage, peerId: NodeId, onlinePeers: Set<String>): String {
+        val dest = msg.destinationNodeId.value
+        val peer = peerId.value
+        val myP = pTable.getOrDefault(dest, 0.0)
+        val peerP = peerPTables[peer]?.get(dest) ?: 0.0
+        val nextHop = findNextHopToward(dest, onlinePeers)
+        val f3 = { v: Double -> "%.3f".format(v) }
+        val why = when {
+            nextHop == peer -> "${peer.takeLast(8)} is the next hop of a live path to ${dest.takeLast(8)}"
+            nextHop != null -> "a live path goes through ${nextHop.takeLast(8)} (not this carrier)"
+            msg.forwardCount <= config.maxForwards ->
+                "stage 1 spread: copy ${msg.forwardCount + 1} of up to ${config.maxForwards}"
+            peerP > myP -> "stage 2: ${peer.takeLast(8)} is the better carrier (${f3(peerP)} > ${f3(myP)})"
+            onlinePeers.isNotEmpty() && dest !in onlinePeers -> "destination away: bounded exploratory copy"
+            else -> "neither side knows the destination yet: low-priority exploratory copy"
+        }
+        return "$name · P(me→${dest.takeLast(8)}) ${f3(myP)} · P(${peer.takeLast(8)}→${dest.takeLast(8)}) ${f3(peerP)}\n" +
+            "P(me→${peer.takeLast(8)}) ${f3(pTable.getOrDefault(peer, 0.0))} · copies so far ${msg.forwardCount}\n" +
+            "Decision: $why"
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // State persistence
     // ══════════════════════════════════════════════════════════════════════

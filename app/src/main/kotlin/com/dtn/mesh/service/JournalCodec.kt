@@ -6,7 +6,9 @@ package com.dtn.mesh.service
  *
  *  - `E` event: `E \t epochMs \t EVENT \t msgId8 \t origin8 \t dest8 \t hop \t fwd \t ttlMin \t extra`
  *  - `R` route: `R \t msgId8 \t fullId \t source \t dest \t channel \t prev \t me \t next \t delivered
- *               \t updatedMs \t strategy \t createdMs \t lastPath \t outcome \t deliveredMs`
+ *               \t updatedMs \t strategy \t createdMs \t lastPath \t outcome \t deliveredMs
+ *               \t decision \t decisionMs \t senderStrategy` (the last three are optional: older
+ *               lines without them still load)
  *
  * Unknown / malformed lines are skipped, so the file can evolve without breaking old installs.
  */
@@ -46,6 +48,7 @@ object JournalCodec {
         "R", r.msgId, r.fullId, r.source, r.destination, r.channel.toString(), r.prevHop.orEmpty(), r.me,
         r.nextHop.orEmpty(), if (r.delivered) "1" else "0", r.timestampMs.toString(), r.strategy,
         r.createdAtMs.toString(), r.lastPath, r.outcome, r.deliveredAtMs.toString(),
+        r.decision, r.decisionAtMs.toString(), r.senderStrategy,
     ).joinToString("\t") { esc(it) }
 
     /** Decoded line: exactly one of [event] / [route] is set. */
@@ -73,6 +76,9 @@ object JournalCodec {
                     timestampMs = f[10].toLongOrNull() ?: 0L, strategy = f[11],
                     createdAtMs = f[12].toLongOrNull() ?: 0L, lastPath = f[13], outcome = f[14],
                     deliveredAtMs = f[15].toLongOrNull() ?: 0L,
+                    decision = f.getOrNull(16).orEmpty(),
+                    decisionAtMs = f.getOrNull(17)?.toLongOrNull() ?: 0L,
+                    senderStrategy = f.getOrNull(18).orEmpty(),
                 ))
             }
             else -> null

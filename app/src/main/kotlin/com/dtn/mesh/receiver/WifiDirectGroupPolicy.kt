@@ -17,7 +17,7 @@ package com.dtn.mesh.receiver
 object WifiDirectGroupPolicy {
 
     /** How long a higher-id phone waits for the lowest-id phone to create the group. */
-    const val CREATE_WAIT_MS = 25_000L
+    const val CREATE_WAIT_MS = 8_000L
     /** An owner with no members and no DTN phone in sight gives the group up after this. */
     const val OWNER_IDLE_MS = 120_000L
 

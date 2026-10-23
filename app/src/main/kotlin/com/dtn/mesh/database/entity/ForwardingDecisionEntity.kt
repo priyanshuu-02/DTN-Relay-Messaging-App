@@ -53,6 +53,10 @@ data class ForwardingDecisionEntity(
     @ColumnInfo(name = "state_buffer_occupancy") val stateBufferOccupancy: Double,
     @ColumnInfo(name = "state_historical_success_rate") val stateHistoricalSuccessRate: Double,
     @ColumnInfo(name = "state_duplicate_count_norm") val stateDuplicateCountNorm: Double,
+    /** The relay's normalised DiMaxProp cost to the destination (1 = unreachable / unknown). */
+    @ColumnInfo(name = "state_dimaxprop_cost", defaultValue = "1.0") val stateDiMaxPropCost: Double = 1.0,
+    @ColumnInfo(name = "state_hop_count_norm", defaultValue = "0.0") val stateHopCountNorm: Double = 0.0,
+    @ColumnInfo(name = "state_relay_buffer", defaultValue = "0.0") val stateRelayBuffer: Double = 0.0,
 
     // ── Decision output ──
 
@@ -81,6 +85,13 @@ data class ForwardingDecisionEntity(
     /** Reward signal assigned after outcome is known. Null until backfilled. */
     @ColumnInfo(name = "reward")
     val reward: Double? = null,
+
+    /**
+     * DiMaxProp progress reward η·(C(A,D) − C(B,D)) applied when this FORWARD was made (paper
+     * eq. 13). Null for STORE decisions and when neither side knew a path.
+     */
+    @ColumnInfo(name = "shaping_reward")
+    val shapingReward: Double? = null,
 
     /** Whether this decision has been used in a Q-update step. */
     @ColumnInfo(name = "update_applied")

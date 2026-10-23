@@ -163,4 +163,11 @@ data class ContactEntity(
     /** Display name advertised in the peer's signed ANNOUNCE. */
     @ColumnInfo(name = "announce_name")
     val announceName: String? = null,
+
+    /**
+     * In the chat list as a contact: added by QR, with Add, by messaging them, or because they
+     * messaged us. Phones that only announced themselves (Discover) stay in "Discovered" until added.
+     */
+    @ColumnInfo(name = "is_added", defaultValue = "0")
+    val isAdded: Boolean = false,
 )

@@ -98,6 +98,8 @@ class MultiTransportManager @Inject constructor(
 
     override val hubPeers: StateFlow<Set<String>> = loRaHubTransport.hubPeers
 
+    override val meshPeers: StateFlow<Map<String, String>> = loRaHubTransport.meshPeers
+
     /** Wi-Fi Direct groups (no invitations) need Android 10+; older phones show it unavailable. */
     val wifiDirectSupported: Boolean get() = WifiDirectTransportAdapter.SUPPORTED
 

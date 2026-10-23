@@ -229,4 +229,12 @@ interface ContactDao {
     /** Contacts for which we hold an X25519 key (can encrypt to). */
     @Query("SELECT * FROM contacts WHERE x_pub IS NOT NULL")
     suspend fun getContactsWithKeys(): List<ContactEntity>
+
+    /** Put a peer in the chat list (QR scan, Add, a message either way). No-op if unknown. */
+    @Query("UPDATE contacts SET is_added = 1 WHERE node_id = :nodeId AND is_added = 0")
+    suspend fun markAdded(nodeId: String): Int
+
+    /** Contacts in the chat list (they get our direct announces while Discover is off). */
+    @Query("SELECT * FROM contacts WHERE is_added = 1")
+    suspend fun getAddedContacts(): List<ContactEntity>
 }

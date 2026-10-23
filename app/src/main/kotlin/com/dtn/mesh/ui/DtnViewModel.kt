@@ -158,8 +158,8 @@ class DtnViewModel @Inject constructor(
      * - Custom nicknames (Task 4) flow through automatically.
      */
     val peerList: StateFlow<List<PeerInfo>> = combine(
-        contactDao.observeAll(), transport.internetPeers, transport.hubPeers, linkInfo,
-    ) { contacts, present, onHub, links ->
+        contactDao.observeAll(), transport.internetPeers, transport.hubPeers, transport.meshPeers, linkInfo,
+    ) { contacts, present, onHub, otherHubs, links ->
             val me = identity.nodeId.value
             // Phones a link of ours ends at (BLE in range, Wi-Fi Direct group): "nearby".
             val direct = (links[TransportKind.BLE]?.peers.orEmpty() + links[TransportKind.WIFI_DIRECT]?.peers.orEmpty())
@@ -174,6 +174,8 @@ class DtnViewModel @Inject constructor(
                     lastRssi = c.lastRssi,
                     internetOnline = c.nodeId in present,
                     hubOnly = c.nodeId in onHub && c.nodeId !in direct,
+                    meshHub = otherHubs[c.nodeId],
+                    added = c.isAdded,
                     announceName = c.announceName,
                     lastSnr = c.lastSnr,
                     totalEncounters = c.totalEncounters,
@@ -250,6 +252,16 @@ class DtnViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
     val brokerUrl: StateFlow<String> = settings.brokerUrl
         .stateIn(viewModelScope, SharingStarted.Eagerly, SettingsRepository.DEFAULT_BROKER)
+
+    /** Discover mode (off by default): when on, everyone in reach and on the relay can see us. */
+    val discoverable: StateFlow<Boolean> = settings.discoverable
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** DiMaxProp λ (distance weight) and Q-learning η (progress-reward scale). */
+    val diMaxPropLambda: StateFlow<Double> = settings.diMaxPropLambda
+        .stateIn(viewModelScope, SharingStarted.Eagerly, SettingsRepository.DEFAULT_LAMBDA)
+    val qShapingEta: StateFlow<Double> = settings.qShapingEta
+        .stateIn(viewModelScope, SharingStarted.Eagerly, SettingsRepository.DEFAULT_ETA)
 
     /** My public identity for the QR / safety-number screen. */
     val myNodeId: String get() = identity.nodeId.value
@@ -404,6 +416,11 @@ class DtnViewModel @Inject constructor(
                     PeerMetric("P", fmt2(active.getDeliveryProbability(id)), "delivery predictability")
                 is com.dtn.mesh.routing.MaxPropStrategy ->
                     PeerMetric("f", fmt2(active.getDeliveryProbability(id)), "meeting likelihood")
+                is com.dtn.mesh.routing.DiMaxPropStrategy -> {
+                    val e = active.edgeInfo(com.dtn.mesh.routing.DiMaxPropStrategy.ME_LABEL, p.nodeId)
+                    PeerMetric("w", e?.let { fmt2(it.weight) } ?: "—",
+                        if (e?.dNorm != null) "hop cost (1−f)+λ·d" else "hop cost 1−f (no distance)")
+                }
                 is com.dtn.mesh.routing.EpidemicStrategy ->
                     PeerMetric("flood", "all", "epidemic forwards to every peer")
                 is com.dtn.mesh.routing.QLearningStrategy -> {
@@ -635,6 +652,42 @@ class DtnViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Discover on: broadcast our name + keys to every phone in reach and on the relay (now, then
+     * every 5 minutes). Off: only contacts get them; others add us by scanning our QR.
+     */
+    fun setDiscoverable(on: Boolean) {
+        viewModelScope.launch {
+            settings.setDiscoverable(on)
+            if (on) {
+                runCatching { outbound.sendAnnounce(displayName()) }
+                notifyUser("Discoverable — phones nearby and on the internet relay can see you and add you")
+            } else {
+                notifyUser("Hidden — only your contacts see you. Others can add you by scanning your QR (🔑)")
+            }
+        }
+    }
+
+    /** Move a discovered phone into the chat list, and send it our name + keys so it can reply. */
+    fun addContact(nodeId: String) {
+        viewModelScope.launch {
+            runCatching { contactDao.markAdded(nodeId) }
+            runCatching { outbound.sendAnnounceTo(NodeId(nodeId), displayName()) }
+            val name = peerList.value.firstOrNull { it.nodeId == nodeId }?.displayName() ?: nodeId.takeLast(8)
+            notifyUser("Added $name to your chats")
+            runCatching { orchestrator.triggerFlush() }
+        }
+    }
+
+    /** Apply DiMaxProp λ and Q-learning η from Settings (both 0..1). */
+    fun saveRoutingTuning(lambda: Double, eta: Double) {
+        viewModelScope.launch {
+            settings.setDiMaxPropLambda(lambda)
+            settings.setQShapingEta(eta)
+            addLog("Routing tuning: DiMaxProp λ=%.2f · Q-learning η=%.2f".format(lambda, eta))
+        }
+    }
+
     /** Set (or clear) a user-provided nickname for a peer. Blank string clears the name. */
     fun renamePeer(nodeId: String, name: String) {
         viewModelScope.launch {
@@ -657,6 +710,8 @@ class DtnViewModel @Inject constructor(
             when (val result = outbound.sendText(trimmed, dest, channel, DEFAULT_TTL_MS)) {
                 is OutboundMessageService.Result.Sent -> {
                     val m = result.message
+                    // Whoever we message is a contact (keeps them in the chat list).
+                    if (channel == 0 && dest != NodeId.BROADCAST) runCatching { contactDao.markAdded(dest.value) }
                     val target = when {
                         channel > 0 -> "grp:$channel"
                         dest == NodeId.BROADCAST -> "ALL"
@@ -788,6 +843,45 @@ class DtnViewModel @Inject constructor(
                         "recency decay=${fmt2(cfg.recencyDecayFactor)}",
                 )
             }
+            is com.dtn.mesh.routing.DiMaxPropStrategy -> {
+                // Score = 1 / (1 + C(node, dest)): higher means the node is closer to the destination
+                // in DiMaxProp cost. My own cost is shown as the reference a carrier must beat.
+                val mine = active.costFromMe(destNodeId)
+                val beliefs = candidates.map { peer ->
+                    val theirs = active.costFromPeer(peer.nodeId, destNodeId)
+                    val e = active.edgeInfo(com.dtn.mesh.routing.DiMaxPropStrategy.ME_LABEL, peer.nodeId)
+                    RoutingNodeBelief(
+                        nodeId = peer.nodeId,
+                        displayName = peer.displayName(),
+                        isOnline = peer.isOnline,
+                        score = if (theirs.reachable) 1.0 / (1.0 + theirs.cost) else 0.0,
+                        detail = "C(node→dest) ${if (theirs.reachable) fmt(theirs.cost) else "no path"} · " +
+                            "me→node ${e?.let { fmt(it.weight) } ?: "—"}" +
+                            (e?.dNorm?.let { " (d ${fmt2(it)})" } ?: " (no distance)"),
+                    )
+                }.sortedByDescending { it.score }
+                val best = beliefs.firstOrNull { it.score > 0.0 }
+                RoutingExplanation(
+                    dest = destNodeId,
+                    strategy = "DIMAXPROP",
+                    // Shown as a score tile: 1/(1+C) like the carriers (0 = no known path).
+                    myScore = if (mine.reachable) 1.0 / (1.0 + mine.cost) else 0.0,
+                    myScoreLabel = if (mine.reachable) "1/(1+C) me" else "me: no path",
+                    beliefs = beliefs,
+                    bestNextHop = best?.nodeId,
+                    bestNextHopName = best?.displayName,
+                    bestScore = best?.score ?: 0.0,
+                    bestScoreLabel = "1/(1+C)",
+                    formulas = listOf(
+                        FormulaItem("Hop cost", "w(u,v) = (1 − f(u,v)) + λ·d_norm(u,v)   (λ only where a distance is known)"),
+                        FormulaItem("Path cost", "C(path) = Σ w   — cheapest path by Dijkstra (all w ≥ 0)"),
+                        FormulaItem("Forward rule", "hand to B if C(B,dest) < C(me,dest), or B is my cheapest path's first hop"),
+                        FormulaItem("Distance", "d_norm = BLE distance from RSSI / ${active.config.bleRangeM.toInt()} m (clamped to 1)"),
+                    ),
+                    constantsLine = "λ=${fmt2(active.lambda)} · f = MaxProp meeting likelihood · " +
+                        "λ = 0 gives plain MaxProp",
+                )
+            }
             is com.dtn.mesh.routing.EpidemicStrategy -> {
                 val beliefs = candidates.map { peer ->
                     RoutingNodeBelief(
@@ -846,14 +940,16 @@ class DtnViewModel @Inject constructor(
                     bestScore = best?.score ?: 0.0,
                     bestScoreLabel = "ΔQ",
                     formulas = listOf(
-                        FormulaItem("Decision", "ε-greedy on (Q_A+Q_B)/2: FORWARD if Q(fwd) > Q(wait)"),
+                        FormulaItem("Decision", "ε-greedy on (Q_A+Q_B)/2: FORWARD if Q(fwd) > Q(wait); ties → DiMaxProp rule"),
                         FormulaItem("Double-Q update", "Q_A(s,a) += α·[r + γ·Q_B(s′, argmax Q_A(s′,·)) − Q_A(s,a)]"),
-                        FormulaItem("Reward", "+1.0 forward that delivered · +0.3 baseline · −0.3 expired"),
-                        FormulaItem("State", "rssi · snr · enc freq · enc dur · P · ttl · buffer · success · dups (bucketed)"),
+                        FormulaItem("Reward", "+1.0 forward that delivered · +0.3 baseline · −0.3 expired · " +
+                            "η·(C(me,D) − C(relay,D)) per forward"),
+                        FormulaItem("State", "rssi · enc freq · enc dur · P · ttl · buffer · success · dups · " +
+                            "DiMaxProp C(relay,D) · hops · relay buffer (bucketed)"),
                     ),
                     constantsLine = "α=${fmt2(cfg.learningRate)} · γ=${fmt2(cfg.discountFactor)} · " +
                         "ε=${fmt2(qEngine.currentEpsilon)} (min ${fmt2(cfg.epsilonMin)}, decay ${cfg.epsilonDecay}) · " +
-                        "updates=${qEngine.totalUpdates}",
+                        "η=${fmt2(qShapingEta.value)} · updates=${qEngine.totalUpdates}",
                 )
             }
             else -> null
@@ -1018,6 +1114,7 @@ class DtnViewModel @Inject constructor(
                 contactDao.insertIfNew(com.dtn.mesh.database.entity.ContactEntity(nodeId = nodeId.value))
                 contactDao.updateKeys(nodeId.value, parsed.xPub, parsed.edPub, parsed.name, System.currentTimeMillis())
                 contactDao.setKeyVerified(nodeId.value, true)
+                contactDao.markAdded(nodeId.value)
                 // Use the QR's name as a nickname only if the user hasn't chosen one already.
                 val existing = contactDao.getByNodeId(nodeId.value)
                 if (parsed.name.isNotBlank() && existing?.customName.isNullOrBlank()) {
@@ -1029,6 +1126,9 @@ class DtnViewModel @Inject constructor(
                 onDone(null)
                 return@launch
             }
+            // They need our keys too, to reply: send them our identity directly.
+            runCatching { outbound.sendAnnounceTo(nodeId, displayName()) }
+            runCatching { orchestrator.triggerFlush() }
             val label = parsed.name.ifBlank { nodeId.value.takeLast(8) }
             val reach = if (nodeId.value in internetPeers.value) "online via internet" else
                 "they'll show online when nearby or on the internet relay"
@@ -1051,7 +1151,8 @@ class DtnViewModel @Inject constructor(
             if (name != oldName) {
                 settings.setDisplayName(name)
                 cachedName = name
-                if (transport.isConnected) runCatching { outbound.sendAnnounce(displayName()) }
+                // A new name goes out now, to everyone (Discover) or to each contact.
+                if (transport.isConnected) runCatching { outbound.sendAnnounce(displayName(), force = true) }
             }
             val broker = brokerUrl.trim()
             val brokerChanged = broker.isNotBlank() && broker != oldBroker
@@ -1136,6 +1237,11 @@ data class PeerInfo(
      * not over Bluetooth or Wi-Fi Direct. [isOnline] is true as well.
      */
     val hubOnly: Boolean = false,
+    /**
+     * Id of the OTHER LoRa hub this peer is on, when our hub hears that hub over LoRa (null
+     * otherwise). Reachable over LoRa through the hubs; [isOnline] stays false (no link of ours).
+     */
+    val meshHub: String? = null,
     /** Name from the peer's signed announce / QR. */
     val announceName: String? = null,
     val lastSnr: Float = -100f,
@@ -1147,6 +1253,8 @@ data class PeerInfo(
     val keyVerified: Boolean = false,
     /** Hex safety-number fingerprint, null until we hold the peer's keys. */
     val fingerprintHex: String? = null,
+    /** In the chat list (QR, Add, or a message either way); otherwise only in "Discovered". */
+    val added: Boolean = false,
 ) {
     /** Display label preferring the custom nickname, then longName, announce name, last 8 of the id. */
     fun displayName(): String =
@@ -1155,8 +1263,14 @@ data class PeerInfo(
             ?: announceName?.takeIf { it.isNotBlank() }
             ?: nodeId.takeLast(8)
 
-    /** Reachable by any transport right now. */
-    val reachable: Boolean get() = isOnline || internetOnline
+    /** Reachable by any transport right now (incl. over LoRa on another hub). */
+    val reachable: Boolean get() = isOnline || internetOnline || meshHub != null
+
+    /** Reachable only over LoRa through another hub right now (no own link, not on the relay). */
+    val viaOtherHub: Boolean get() = !isOnline && !internetOnline && meshHub != null
+
+    /** "hub BDB8" for [meshHub], matching that hub's Wi-Fi name. */
+    val meshHubLabel: String get() = meshHub?.let { com.dtn.mesh.receiver.hubLabel(it) }.orEmpty()
 
     /** We hold this peer's encryption keys (can send it end-to-end encrypted DMs). */
     val hasKeys: Boolean get() = fingerprintHex != null

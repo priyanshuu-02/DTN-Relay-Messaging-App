@@ -53,6 +53,28 @@ class JournalCodecTest {
     }
 
     @Test
+    fun route_keepsTheSavedDecisionAndSenderAlgorithm() {
+        val r = MessageLifecycleLog.RouteRecord(
+            msgId = "1a2b3c4d", source = "58fe1be9", destination = "ffbd889b", me = "58fe1be9",
+            nextHop = "0000000b", timestampMs = 5L, strategy = "DIMAXPROP", createdAtMs = 1L,
+            decision = "DiMaxProp · λ 0.50\n  me → 0000000b  0.42 = (1 − f 0.70)\tx\nDecision: forward",
+            decisionAtMs = 3L, senderStrategy = "Q-learning",
+        )
+        assertEquals(r, JournalCodec.decode(JournalCodec.encodeRoute(r), fmt)?.route)
+    }
+
+    @Test
+    fun routeLinesFromBeforeDecisionsWereSaved_stillLoad() {
+        val old = listOf("R", "1a2b3c4d", "full", "src", "dst", "0", "", "me", "nxt", "0", "5", "PROPHET",
+            "1", "BLE", "", "0").joinToString("\t")
+        val route = JournalCodec.decode(old, fmt)?.route
+        assertEquals("PROPHET", route?.strategy)
+        assertEquals("", route?.decision)
+        assertEquals(0L, route?.decisionAtMs)
+        assertEquals("", route?.senderStrategy)
+    }
+
+    @Test
     fun malformedOrUnknownLines_areSkipped() {
         assertNull(JournalCodec.decode("", fmt))
         assertNull(JournalCodec.decode("X\tsomething new", fmt))

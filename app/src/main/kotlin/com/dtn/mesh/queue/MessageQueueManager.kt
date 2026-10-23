@@ -87,7 +87,7 @@ class MessageQueueManager @Inject constructor(
         // identical and only the newest needs relaying, so we drop that origin's stale copies.
         // Without this, a node's periodic re-announce piled up one buffered bundle per interval.
         if (stored && message.messageType == com.dtn.mesh.model.DtnMessageType.ANNOUNCE) {
-            messageDao.supersedeAnnounces(message.originNodeId.value, message.id)
+            messageDao.supersedeAnnounces(message.originNodeId.value, message.destinationNodeId.value, message.id)
         }
         return stored
     }

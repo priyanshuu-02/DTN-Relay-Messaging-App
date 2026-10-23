@@ -77,6 +77,13 @@ android {
         buildConfig = true // VERSION_NAME / VERSION_CODE for Settings → About
     }
 
+    // Room's exported schemas, so the instrumented MigrationTest can build every past version.
+    sourceSets {
+        getByName("androidTest") {
+            assets.srcDir("$projectDir/schemas")
+        }
+    }
+
     // The MQTT client pulls in Netty, which ships duplicate META-INF resources.
     packaging {
         resources {
@@ -140,6 +147,7 @@ dependencies {
     testImplementation(libs.room.testing)
     androidTestImplementation(libs.androidx.test.ext)
     androidTestImplementation(libs.androidx.test.espresso)
+    androidTestImplementation(libs.room.testing)
 }
 
 kapt {

@@ -1071,3 +1071,98 @@ each other", "link multiple devices, show Linked + who is connected", QR torch/u
 - Flash v3 to every hub. After a hub reboot each phone shows the system "Connect to device" dialog.
 - A phone joined to a hub's SoftAP and in a Wi-Fi Direct group shares one radio channel; some
   phones can't do both at once.
+
+---
+
+# PART K — 2026-10-23: DiMaxProp, Q-learning audit + paper features, saved routing decisions, Discover
+
+User asks: LoRa-to-LoRa test, Wi-Fi Direct links faster ("Searching for phones to link", keep
+scanning as is), check Q-learning and add DiMaxProp (the team's paper: Kar, Dalai, Raina, Tiwari,
+Shrivastwa, Upadhyay), Message info must show the algorithm a message was actually routed with
+(receiver: sender's algorithm), optional Discover button. **DB v3 → v4** (AutoMigration + spec).
+
+## K.1 Q-learning audit (found in code, fixed)
+- Tables and ε were never saved: every launch restarted from an empty table at ε = 1 (fully random).
+  → `QTableCodec` + `QTableStore` (`filesDir/q_tables_v2.bin`, tagged with `QLearningConfig.stateSchema`,
+  loaded once per process, saved 5 s after updates and on stop).
+- The flush runs every 4 s and re-drew an ε-greedy action each time, but only one decision per 30 s
+  was recorded, so the forward that happened was often not the one rewarded. → the choice is kept
+  per (bundle, carrier) for 30 s (`qChoice`).
+- Exploration picked uniformly among STORE/FORWARD/WAIT/DROP; WAIT/DROP are no-ops in the
+  orchestrator (3 of 4 random picks held, learning split three ways). → `QLearningConfig.actions`
+  = STORE, FORWARD.
+- Unseen states (all Q = 0) always held, so a fresh table almost never forwarded. → tie-break prior =
+  the DiMaxProp rule (forward when the carrier's cost to D is lower). A prior, not an override.
+- Q-learning phones sent an empty summary, so no multi-hop information was ever exchanged. → they
+  send DiMaxProp's summary.
+- SNR is constant on every link here (BLE has none, others are placeholders) → 1 bucket.
+- Decisions were recorded for bundles the loop never sends to that carrier (its own / its sender). → skipped.
+
+## K.2 Q-learning per the paper (§VI)
+- State: 9 old features + C_DiMaxProp(B,D) (normalised by 2.0, 3 buckets), hop count / 8 (2), the
+  relay's reported buffer occupancy (2). Buckets rebalanced: 10,368 states (was 10,800).
+- Reward: +1.0 forward that delivered · +0.3 baseline · −0.3 expired (unchanged) plus the immediate
+  progress reward η·(C(A,D) − C(B,D)) per FORWARD (unreachable = 3.0, none if neither knows a path),
+  applied on the event loop (`OrchestratorEvent.QShaping`) and stored in `shaping_reward`.
+- New columns on `forwarding_decisions`: `state_dimaxprop_cost`, `state_hop_count_norm`,
+  `state_relay_buffer`, `shaping_reward`.
+
+## K.3 DiMaxProp (`routing/DiMaxPropStrategy.kt`)
+- Hop cost `(1 − f) + λ·d_norm` (λ only where a distance exists), Dijkstra, rule: forward if
+  C(B,D) < C(A,D) or B is the first hop of A's cheapest path; cold start = bounded exploratory copy
+  (as MaxProp). λ = 0 reproduces MaxProp's cost (unit-tested), λ default 0.5, η default 0.2, both in
+  Settings → Routing tuning (DataStore; the orchestrator follows them live).
+- d_norm = BLE distance (RSSI → log-distance, `RadioDistanceEstimator`) / 50 m. Encounters now carry
+  their transport (`NodeEncounterEvent.transport`); only BLE gets a distance (Wi-Fi Direct reports a
+  fixed −30, hub −40 / −200). Hub-roster sightings no longer train PRoPHET / MaxProp / DiMaxProp.
+- Compact summary (0xD1 marker) with f, d and buffer occupancy, ≤ 36 entries, recognised by its
+  marker on receipt. 6th button in the algorithm picker; benchmarks key by name.
+- Not done (outside the app): the paper's ONE-simulator study. λ / η "best values" need field or
+  simulator runs; the Settings sliders exist so they can be varied per run.
+
+## K.4 Message details
+- Every forward saves its decision text in the journal route (`RouteRecord.decision`, `decisionAtMs`;
+  JournalCodec fields 16–18, older lines still load). PRoPHET / MaxProp / DiMaxProp `explain()`,
+  Q-learning note (ε, Q values, inputs, costs, progress reward), Epidemic, direct / hub / same-hub
+  texts. Message info shows it; the live `explainRoute` math was removed from Message info (kept in
+  the Network tab's buffered-message view, where "what would happen now" is the point).
+- Receiver: DM plaintext byte 0 = sender's algorithm (`AlgorithmCode`, inside the encryption) →
+  `RouteRecord.senderStrategy`, shown as "Sender's algorithm". Old phones would show a stray
+  character; all phones are being updated.
+
+## K.5 Discover
+- `contacts.is_added`; migration marks 1:1 chat partners and QR-verified contacts added. Chat list =
+  added contacts (+ any with chat history); "Discovered" = other phones with keys, with Add.
+- Discover switch (home, off by default, stays on until turned off). On: broadcast announces as
+  before. Off: direct announce to each added contact (TTL 30 min, ≤ 1 / 30 min, immediately on QR
+  add / Add / name change); only the addressee pins the keys. Someone who DMs us is auto-added.
+  `supersedeAnnounces` is now per (origin, destination).
+
+## K.6 Wi-Fi Direct
+- Create-wait 25 s → 8 s, failed-join retry 30 s → 8 s, 1 s ticks while forming / joining, HELLO
+  every second for 15 s after joining. Scanning unchanged. Chip: "Searching for phones to link".
+
+## K.7 Verified / not verified
+- 168 JVM unit tests (new: DiMaxPropStrategyTest 17, QLearningPaperTest 7, AlgorithmCodeTest 2,
+  JournalCodec +2). Instrumented `MigrationTest` (3 → 4) added under `app/src/androidTest`.
+- Not verified on devices yet: DiMaxProp / Q-learning behaviour between phones, Discover between
+  phones, LoRa-to-LoRa (needs the second hub flashed with v3).
+
+## K.8 Two-hub bench test (2026-10-23 evening)
+- Both boards had advertised `DTN-HUB-B734`: `HUB_ID` came from the low bytes of `getEfuseMac()`,
+  which are the shared Espressif OUI. Now id = MAC bytes 2..5, SSID = bytes 4..5 (COM11
+  `!da64a9b0` / `DTN-HUB-A9B0`, COM3 `!da65bdb8` / `DTN-HUB-BDB8`).
+- CAD aborts an ongoing receive: a hub with a queue missed the other's back-to-back frames. It now
+  waits while PREAMBLE_DETECTED / HEADER_VALID is latched. LoRa peer table = directly heard hub
+  heartbeats only (phone origins used to count as hubs). `[RF]` rx/tx log lines (RSSI/SNR),
+  `ping` / `txpow` serial commands, OLED top line = last frame heard.
+- Bench (≈30 cm): −9 / 0 / +10 / +22 dBm TX → −30 / −20 / −11 / ≥ −7 dBm RX (saturated), SNR +11 dB,
+  ≈21 dB path loss. Link budget at 22 dBm SF9 BW125 ≈ 151 dB (−129 dBm sensitivity); estimated
+  ranges in the session notes, not measured (walk test with the OLED readout still to do).
+- Cross-hub DM verified: Redmi on hub A → raushan on hub B, Delivered ✓✓ by receipt in ~2 s.
+- Phones on the other hub showed "Offline": nothing told a phone they exist. → hub heartbeats carry
+  the hub's phones, hubs pass the other hubs' phones to their own as MESH_ROSTER (0x06), the app
+  shows them "Online · via LoRa (hub XXXX)" (`MeshTransport.meshPeers`, `PeerInfo.meshHub`).
+  Presence only: routing unchanged (the hub already floods every DM it can't hand over itself).
+- Known gap: a LoRa flood is sent once per hub; a frame lost to a collision isn't re-flooded when
+  the phone re-sends (the hub already holds it), so that DM waits for the next hub session.

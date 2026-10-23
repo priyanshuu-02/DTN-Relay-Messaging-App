@@ -105,6 +105,15 @@ class MessageLifecycleLog @Inject constructor(
         val lastPath: String = "",
         val outcome: String = "",
         val deliveredAtMs: Long = 0L,
+        /**
+         * The routing decision this phone made when it handed the message on (algorithm + every
+         * number it used), saved at that moment so Message info never recomputes it with whatever
+         * algorithm is selected later. Multi-line text; "" when none was recorded.
+         */
+        val decision: String = "",
+        val decisionAtMs: Long = 0L,
+        /** For a message we received: the routing algorithm the sender's phone used (from the DM). */
+        val senderStrategy: String = "",
     ) {
         val isBroadcast: Boolean get() = destination == "BROADCAST"
 
@@ -262,7 +271,7 @@ class MessageLifecycleLog @Inject constructor(
      */
     fun recordIncoming(
         msgId: String, source: String, dest: String, prevHop: String, me: String, delivered: Boolean,
-        channel: Int = 0, path: String = "",
+        channel: Int = 0, path: String = "", senderStrategy: String = "",
     ) {
         upsertRoute(msgId) { existing ->
             val base = existing ?: newRecord(msgId, source, dest, me, channel)
@@ -276,6 +285,7 @@ class MessageLifecycleLog @Inject constructor(
                 deliveredAtMs = if (!base.delivered && delivered) now else base.deliveredAtMs,
                 channel = if (channel != 0) channel else base.channel,
                 lastPath = path.ifBlank { base.lastPath },
+                senderStrategy = senderStrategy.ifBlank { base.senderStrategy },
             )
         }
     }
@@ -286,7 +296,7 @@ class MessageLifecycleLog @Inject constructor(
      */
     fun recordOutgoing(
         msgId: String, source: String, dest: String, me: String, nextHop: String, delivered: Boolean,
-        strategy: String = "", path: String = "", channel: Int = 0,
+        strategy: String = "", path: String = "", channel: Int = 0, decision: String = "",
     ) {
         upsertRoute(msgId) { existing ->
             val base = existing ?: newRecord(msgId, source, dest, me, channel)
@@ -300,6 +310,8 @@ class MessageLifecycleLog @Inject constructor(
                 else -> nextHop.takeLast(8)
             }
             val now = System.currentTimeMillis()
+            // The decision follows the same rule as the next hop, so it always explains the hop shown.
+            val keepDecision = base.delivered || (!delivered && base.decision.isNotBlank()) || decision.isBlank()
             base.copy(
                 source = source.takeLast(8),
                 destination = normaliseDest(dest),
@@ -311,6 +323,8 @@ class MessageLifecycleLog @Inject constructor(
                 strategy = if (base.delivered) base.strategy else strategy.ifBlank { base.strategy },
                 lastPath = if (base.delivered) base.lastPath else path.ifBlank { base.lastPath },
                 channel = if (channel != 0) channel else base.channel,
+                decision = if (keepDecision) base.decision else decision,
+                decisionAtMs = if (keepDecision) base.decisionAtMs else now,
             )
         }
     }

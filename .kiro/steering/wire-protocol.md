@@ -48,6 +48,14 @@ currently `dtnmesh123`, IP 192.168.4.1.
 - ROSTER 0x05 (hub→phone, firmware v3+) `[1B n][n × 4B nodeId]` = every phone registered at the
   hub; sent on change and every 30 s. The app marks those phones online ("via LoRa hub", rssi −200
   = no own signal). Older apps ignore unknown frame types.
+- MESH_ROSTER 0x06 (hub→phone, Oct 2026+) `[1B n][n × (4B phone id, 4B hub id)]` = phones on the
+  OTHER hubs this hub hears (from their heartbeats), minus phones registered here; sent with every
+  ROSTER (on change and every 30 s), also when empty. The app shows them "Online · via LoRa (hub
+  XXXX)" (`meshPeers`, presence only): not online peers, no encounters, no routing-table training;
+  a DM to one still goes to our hub (which floods it) and is Delivered only by the receipt.
+- Hub heartbeat (LoRa, every 60–72 s; early, ≥ 10 s apart, when its phones change) = 32 B
+  ROUTING_SUMMARY from HUB_ID (msg id starts with HUB_ID, hop 0) + `[0xD8][ver 1][n][n × 4B phone
+  id]`. One hop: summaries are never re-flooded. Remote phones expire after 200 s unheard.
 - App send rules: a DM for a roster phone goes to the hub as `HUB_LOCAL` (header dest = that
   phone, not a direct link → waits for the receipt, 30 s retry). The hub contact gets every other
   DM once per hub session, bypassing the routing strategy, unless the destination is reachable
@@ -73,6 +81,27 @@ Direct running, bits2-5 group members (0-15). Readers of only the first 4 bytes 
 - TCP :9734, `[4B wireLength][wire][4B idLen][id]`; wireLength 0 = HELLO (node-id ↔ IP, heartbeat
   every 10 s, peer stale after 30 s); wireLength −2 = ROSTER `[2B len]["hex@ip,hex@ip,…"]` from the
   owner so members link to each other directly. A TCP write inside the group = delivered.
+
+## Payload framing (inside the encryption)
+- DM plaintext starts with 1 byte naming the sender's routing algorithm: 0x01 PRoPHET, 0x02 Stable
+  PRoPHET, 0x03 MaxProp, 0x04 DiMaxProp, 0x05 Epidemic, 0x06 Q-learning (`AlgorithmCode`). The
+  receiver strips it (shown as "Sender's algorithm" in Message info). A first byte outside 0x01–0x06
+  = an older build's message, left as is. Group / broadcast plaintext has no prefix.
+
+## Routing summaries (ROUTING_SUMMARY payload, 1 hop, direct links only)
+- The tag is not on the wire: a payload starting `0xD1 0x01` is DiMaxProp's; anything else is read
+  in the receiver's own strategy format (PRoPHET / MaxProp start with a 0x00 count byte).
+- DiMaxProp: `[0xD1][ver 1][buffer occupancy ×255][n]` then n × `[4B node id][f ×255][d_norm ×254,
+  0xFF = no distance]`, top n ≤ 36 contacts by f (≤ 220 B, one LoRa frame). Q-learning phones send
+  it too (their state needs C(B,D) and the relay's buffer). Hub-roster phones never get summaries.
+
+## Announces + Discover
+- Discover on: ANNOUNCE to `0xFFFFFFFF` (+ relay `bcast`) every 5 min, TTL 10 min, as before.
+- Discover off (default): one ANNOUNCE addressed to each added contact (dest = its node id, TTL
+  30 min, at most every 30 min, immediately on QR add / Add / name change). Only the addressee pins
+  the keys; carriers relay it like a DM. Superseded per (origin, destination). Dropped from the
+  buffer once handed to its destination (direct, same hub, or relay).
+- Announces issued before the receiver's own identity existed are ignored (data-clear ghost).
 
 ## Groups
 - Channel byte (1..255) of a NEW group = `1 + (SHA-256("DTN-grp-ch-v1" ‖ key)[0] mod 255)`.
@@ -102,8 +131,11 @@ Direct running, bits2-5 group members (0-15). Readers of only the first 4 bytes 
   22 dBm (region-capped), 140 mA OCP, 1.8 V TCXO (+XTAL fallback), boosted RX, preamble 16,
   sync word 0x2B, DIO2 as RF switch. Pins NSS8 DIO1-14 RST12 BUSY13 SCK9 MISO11 MOSI10.
 - Hub routes on the header only; it must NOT need to decrypt. It ages TTL by buffer residence,
-  enforces a rolling-hour duty-cycle budget, does CAD + jitter before TX, and replays buffered
-  bundles to a phone on REGISTER. HUB_ID + SSID suffix derive from the eFuse MAC.
+  enforces a rolling-hour duty-cycle budget, does CAD + jitter before TX (never while a frame is
+  arriving: PREAMBLE_DETECTED / HEADER_VALID latched, since CAD aborts a receive), and replays buffered
+  bundles to a phone on REGISTER. HUB_ID = eFuse MAC bytes 2..5, SSID suffix = bytes 4..5 (the low
+  bytes of `getEfuseMac()` are the shared Espressif OUI — using them gave every board `DTN-HUB-B734`).
+  Only a directly heard hub heartbeat (32 B, hop 0, msg id = origin) updates the LoRa peer table.
 - v3 (`DTN_FW_VERSION=3`): writes to phones go through a per-client non-blocking TX queue
   (4 KB, whole frames only, `send(MSG_DONTWAIT)`). Never gate on `WiFiClient::availableForWrite()`:
   arduino-esp32 2.0.x always returns 0, which made v2 hubs silently send nothing to any phone.

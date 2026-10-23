@@ -12,12 +12,13 @@ import kotlin.random.Random
  * the other evaluates the bootstrapped target action.
  *
  * ## State discretisation
- * Continuous [ForwardingState] features in [0,1] are bucketed into [config.stateBuckets]
- * discrete levels. The state key is the concatenation of all bucket indices, producing
- * a string like "3-7-2-5-8-1-4-6-0" (9 dimensions × N buckets each).
+ * Continuous [ForwardingState] features in [0,1] are bucketed per feature (see [QLearningConfig]).
+ * The state key is the concatenation of all bucket indices, e.g. "1-0-2-1-2-1-0-1-0-2-0-1"
+ * (12 dimensions, including the DiMaxProp path cost, hop count and relay buffer).
  *
  * ## Action space
- * [ForwardingAction]: STORE, FORWARD, WAIT, DROP
+ * [QLearningConfig.actions]: STORE (keep holding) and FORWARD — the two things the orchestrator
+ * can do with a bundle for a given carrier.
  *
  * ## Thread safety
  * Not internally synchronised. All calls must be serialised by the caller
@@ -54,28 +55,33 @@ class DoubleQLearningEngine(
     // ──────────────────────────────────────────────────────────────────────
 
     /**
-     * Greedy action selection using averaged Q-values: Q̄ = (QA + QB) / 2.
-     * Used for inference (exploitation only, no exploration).
+     * Greedy action selection using averaged Q-values: Q̄ = (QA + QB) / 2, over [QLearningConfig.actions].
+     * Used for inference (exploitation only, no exploration). Ties (e.g. a state never seen) go to
+     * the first configured action (STORE).
      */
     fun selectAction(state: ForwardingState): ForwardingAction {
         val key = discretise(state)
-        return bestActionByAverage(key)
+        return bestActionByAverage(key, tieBreak = null)
     }
 
     /**
      * ε-greedy action selection for training.
-     * With probability [epsilon]: choose uniformly at random (exploration).
+     * With probability [epsilon]: choose uniformly among [QLearningConfig.actions] (exploration).
      * Otherwise: greedy w.r.t. averaged Q-values (exploitation).
      *
+     * @param tieBreak action to take when every action has the same value — typically a state the
+     *   engine has never been rewarded in. The orchestrator passes the DiMaxProp rule's choice, so a
+     *   fresh table starts from a sensible policy instead of "never forward". It is a prior, not an
+     *   override: once the state has learned values, they decide.
      * @return Pair of (action chosen, whether it was exploratory)
      */
-    fun selectActionEpsilonGreedy(state: ForwardingState): Pair<ForwardingAction, Boolean> {
+    fun selectActionEpsilonGreedy(state: ForwardingState, tieBreak: ForwardingAction? = null): Pair<ForwardingAction, Boolean> {
         val explore = random.nextDouble() < _epsilon
         return if (explore) {
-            val actions = ForwardingAction.entries
+            val actions = config.actions
             actions[random.nextInt(actions.size)] to true
         } else {
-            selectAction(state) to false
+            bestActionByAverage(discretise(state), tieBreak) to false
         }
     }
 
@@ -90,18 +96,22 @@ class DoubleQLearningEngine(
         return forward to store
     }
 
-    private fun bestActionByAverage(stateKey: String): ForwardingAction {
-        var bestAction = ForwardingAction.STORE
+    private fun bestActionByAverage(stateKey: String, tieBreak: ForwardingAction?): ForwardingAction {
+        val actions = config.actions
+        var bestAction = actions.first()
         var bestValue = Double.NEGATIVE_INFINITY
+        var allEqual = true
+        var firstValue: Double? = null
 
-        for (action in ForwardingAction.entries) {
+        for (action in actions) {
             val avg = (tableA.get(stateKey, action) + tableB.get(stateKey, action)) / 2.0
+            if (firstValue == null) firstValue = avg else if (avg != firstValue) allEqual = false
             if (avg > bestValue) {
                 bestValue = avg
                 bestAction = action
             }
         }
-        return bestAction
+        return if (allEqual && tieBreak != null && tieBreak in actions) tieBreak else bestAction
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -201,7 +211,7 @@ class DoubleQLearningEngine(
             tableB.get(key, ForwardingAction.FORWARD)) / 2.0
 
         // Normalise against max possible Q to get [0,1]
-        val allQs = ForwardingAction.entries.map { action ->
+        val allQs = config.actions.map { action ->
             (tableA.get(key, action) + tableB.get(key, action)) / 2.0
         }
         val maxQ = allQs.maxOrNull() ?: 0.0
@@ -220,10 +230,10 @@ class DoubleQLearningEngine(
      * Discretise a continuous [ForwardingState] into a string key.
      *
      * Each dimension uses its own bucket count from [QLearningConfig], producing
-     * a key like "1-0-2-1-4-3-1-0-1" where each position has a range determined
-     * by its feature's granularity.
+     * a key like "1-0-2-1-2-1-0-1-0-2-0-1" (12 positions) where each position has a range
+     * determined by its feature's granularity.
      *
-     * Effective state space with defaults: 5×5×3×3×3×2×2×2×2 = 10,800
+     * Effective state space with defaults: [QLearningConfig.effectiveStateSpace] = 10,368
      */
     fun discretise(state: ForwardingState): String {
         return buildString {
@@ -235,12 +245,15 @@ class DoubleQLearningEngine(
             append(bucket(state.remainingTtlFraction, config.bucketsRemainingTtl)); append('-')
             append(bucket(state.bufferOccupancy, config.bucketsBufferOccupancy)); append('-')
             append(bucket(state.historicalSuccessRate, config.bucketsHistoricalSuccess)); append('-')
-            append(bucket(state.duplicateCountNorm, config.bucketsDuplicateCount))
+            append(bucket(state.duplicateCountNorm, config.bucketsDuplicateCount)); append('-')
+            append(bucket(state.diMaxPropCost, config.bucketsDiMaxPropCost)); append('-')
+            append(bucket(state.hopCountNorm, config.bucketsHopCount)); append('-')
+            append(bucket(state.relayBufferOccupancy, config.bucketsRelayBuffer))
         }
     }
 
     private fun bucket(value: Double, numBuckets: Int): Int =
-        (value.coerceIn(0.0, 1.0) * (numBuckets - 1)).roundToInt()
+        if (numBuckets <= 1) 0 else (value.coerceIn(0.0, 1.0) * (numBuckets - 1)).roundToInt()
 
     // ──────────────────────────────────────────────────────────────────────
     // Snapshot / persistence
@@ -253,14 +266,26 @@ class DoubleQLearningEngine(
         episodeCount = _episodeCount,
         totalUpdates = _totalUpdates,
         capturedAtMs = System.currentTimeMillis(),
+        epsilon = _epsilon,
     )
 
-    /** Restore Q-tables from a previously exported snapshot. Allows warm-start. */
+    /** Restore Q-tables (and the exploration rate) from a previously exported snapshot. Warm start. */
     fun importSnapshot(snapshot: QTableSnapshot) {
         tableA.import(snapshot.tableA)
         tableB.import(snapshot.tableB)
         _episodeCount = snapshot.episodeCount
         _totalUpdates = snapshot.totalUpdates
+        _epsilon = snapshot.epsilon.coerceIn(config.epsilonMin, 1.0)
+    }
+
+    /** Serialised tables for saving to disk ([QTableCodec], tagged with the state schema). */
+    fun toBytes(): ByteArray = QTableCodec.encode(exportSnapshot(), config.stateSchema)
+
+    /** Load tables saved by [toBytes]. False (nothing changed) when the bytes don't match this schema. */
+    fun loadBytes(bytes: ByteArray): Boolean {
+        val snapshot = QTableCodec.decode(bytes, config.stateSchema) ?: return false
+        importSnapshot(snapshot)
+        return true
     }
 
     /** Reset both tables to zero. Useful for ablation experiments. */

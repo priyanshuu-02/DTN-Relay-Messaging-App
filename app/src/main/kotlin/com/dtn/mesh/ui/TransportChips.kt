@@ -59,7 +59,7 @@ fun transportChip(
         TransportKind.WIFI_DIRECT -> when {
             !radios.wifiOn -> chip(LinkHealth.PROBLEM, "Wi-Fi off")
             state == MeshConnectionState.CONNECTED -> chip(LinkHealth.ON, if (n > 0) "Linked · ${phones(n)}" else "Linked")
-            state == MeshConnectionState.CONNECTING -> chip(LinkHealth.BUSY, "Searching")
+            state == MeshConnectionState.CONNECTING -> chip(LinkHealth.BUSY, "Searching for phones to link")
             else -> chip(LinkHealth.PROBLEM, "Unavailable · retry")
         }
         TransportKind.HUB -> when {

@@ -141,13 +141,10 @@ fun MessageInfoDialog(viewModel: DtnViewModel, msgId8: String, onDismiss: () -> 
         DeliveryState.DROPPED -> "It left the buffer before delivery (cleared, or evicted while the buffer was full)."
     }
 
-    // Forwarding math is only meaningful for a DM this phone routes onward (not one addressed to
-    // us, and not a broadcast, which floods without per-carrier scoring).
-    val explanation = remember(route?.destination, peers, myId8) {
-        val dest = route?.destination
-        if (route == null || route.isBroadcast || dest == null || dest == myId8) null
-        else peers.firstOrNull { it.nodeId.takeLast(8) == dest }?.nodeId?.let { viewModel.explainRoute(it) }
-    }
+    // The routing decision is the one SAVED when this phone handed the message on (algorithm and
+    // every number it used then). It is never recomputed with whatever algorithm is selected now.
+    val activeStrategy by viewModel.activeStrategy.collectAsState()
+    val routedOnward = route != null && !route.isBroadcast && route.destination != myId8
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -214,6 +211,8 @@ fun MessageInfoDialog(viewModel: DtnViewModel, msgId8: String, onDismiss: () -> 
                     if (hops > 0) DetailRow("Hops travelled", if (hops == 1) "1 (came straight from the sender)" else "$hops")
                     // A relay hand-off isn't a routing decision (and the link line already says it).
                     if (route.strategy.isNotBlank() && route.strategy != "INTERNET RELAY") DetailRow("Routed by", route.strategy)
+                    // Received DMs carry the sender's algorithm (inside the encryption).
+                    if (route.senderStrategy.isNotBlank()) DetailRow("Sender's algorithm", route.senderStrategy)
                     DetailRow("Path seen from this phone", formatObservedPath(route, peers, myId8), mono = true)
                 } else {
                     Text("No journey recorded for this message — it was sent before this version of the app, " +
@@ -228,15 +227,40 @@ fun MessageInfoDialog(viewModel: DtnViewModel, msgId8: String, onDismiss: () -> 
                     events.forEachIndexed { i, e -> JourneyRow(e, isLast = i == events.lastIndex) }
                 }
 
-                if (explanation != null && route != null) {
+                if (route != null && routedOnward) {
                     HorizontalDivider(color = Palette.Divider, modifier = Modifier.padding(vertical = 8.dp))
-                    RoutingMathSection(
-                        exp = explanation,
-                        destLabel = peerLabelFor(route.destination, peers, myId8) ?: route.destination,
-                        retrospective = route.delivered,
-                        prevHop = route.prevHop,
-                        nextHop = route.nextHop,
-                    )
+                    Text("ROUTING DECISION", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Palette.Primary, letterSpacing = 0.8.sp)
+                    Spacer(Modifier.height(4.dp))
+                    when {
+                        route.decision.isNotBlank() -> {
+                            Text(
+                                "Made by this phone" +
+                                    (route.decisionAtMs.takeIf { it > 0 }?.let { " at ${UiText.fullTime(it)}" } ?: "") +
+                                    " — the numbers as they were then",
+                                fontSize = 11.sp, color = Palette.TextMuted,
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Surface(shape = RoundedCornerShape(8.dp), color = Palette.Surface, modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    route.decision, fontSize = 11.sp, color = Palette.TextPrimary,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                )
+                            }
+                        }
+                        route.nextHop == null && !route.delivered ->
+                            Text(
+                                "Not handed to anyone yet. The algorithm selected when it is forwarded decides " +
+                                    "(now: $activeStrategy), and that decision will show here.",
+                                fontSize = 11.sp, color = Palette.TextSecondary,
+                            )
+                        else ->
+                            Text(
+                                "The routing numbers weren't recorded for this message — it was handed on by an " +
+                                    "older version of the app.",
+                                fontSize = 11.sp, color = Palette.TextSecondary,
+                            )
+                    }
                 }
             }
         },

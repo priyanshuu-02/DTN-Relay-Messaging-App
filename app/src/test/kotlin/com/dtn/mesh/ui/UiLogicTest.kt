@@ -100,7 +100,7 @@ class UiLogicTest {
         val status = TransportStatus(wifiDirect = MeshConnectionState.CONNECTING, wanted = setOf(TransportKind.WIFI_DIRECT))
         val h = connectionHeadline(TransportKind.entries.map { transportChip(it, status, allOn, 0) })
         assertEquals(LinkHealth.BUSY, h.health)
-        assertEquals("Wi-Fi Direct: Searching", h.detail)
+        assertEquals("Wi-Fi Direct: Searching for phones to link", h.detail)
     }
 
     @Test

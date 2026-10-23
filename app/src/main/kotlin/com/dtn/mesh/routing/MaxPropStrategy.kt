@@ -241,6 +241,28 @@ class MaxPropStrategy(
         }
     }.sortedByDescending { it.priority }
 
+    /**
+     * Why [rankForForwardingWithTopology] hands [msg] to [peerId], with the numbers it used. Saved
+     * with the forward so Message info shows the decision as it was made, not today's values.
+     */
+    fun explain(msg: DtnMessage, peerId: NodeId, onlinePeers: Set<String>): String {
+        val dest = msg.destinationNodeId.value
+        val peer = peerId.value
+        val (nextHop, cost) = findMinCostNextHop(dest, onlinePeers)
+        val peerF = peerFTables[peer]?.get(dest)
+        val f3 = { v: Double -> "%.3f".format(v) }
+        val costText = if (cost == Double.MAX_VALUE) "no known path" else f3(cost)
+        val why = when {
+            nextHop == peer -> "${peer.takeLast(8)} is the first hop of the cheapest path"
+            nextHop != null -> "the cheapest path starts at ${nextHop.takeLast(8)} (not this carrier)"
+            peerF != null && peerF > 0.0 -> "no known path; ${peer.takeLast(8)} reports f→dest ${f3(peerF)}"
+            else -> "no known path yet: low-priority exploratory copy"
+        }
+        return "MAXPROP · cheapest path cost from here $costText (Σ 1 − f per hop)\n" +
+            "f(me→${peer.takeLast(8)}) ${f3(fTable[peer] ?: 0.0)} · f(me→${dest.takeLast(8)}) ${f3(fTable[dest] ?: 0.0)}\n" +
+            "Decision: $why"
+    }
+
     override fun rankForDrop(candidates: List<DtnMessage>, bytesToFree: Long): List<DtnMessage> {
         // MaxProp drop policy: highest delivery cost first (least likely to succeed).
         // Cost = 1 - f(dest). Messages to rarely-seen destinations are dropped first.

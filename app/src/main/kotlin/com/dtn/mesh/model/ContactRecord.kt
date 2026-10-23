@@ -24,4 +24,6 @@ data class ContactRecord(
      * missing reading doesn't corrupt the predictability table.
      */
     val distanceMeters: Double = -1.0,
+    /** The radio [distanceMeters] was measured on (sets its effective range); null when unknown. */
+    val radio: com.dtn.mesh.routing.RadioDistanceEstimator.Transport? = null,
 )

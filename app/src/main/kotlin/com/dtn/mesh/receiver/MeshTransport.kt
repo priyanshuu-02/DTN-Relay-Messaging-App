@@ -104,6 +104,14 @@ interface MeshTransport {
     val hubPeers: StateFlow<Set<String>>
 
     /**
+     * Phones on the OTHER LoRa hubs our hub hears over LoRa (phone id → that hub's id), from our
+     * hub's MESH_ROSTER. Presence only: they're reachable over the LoRa backbone (a DM goes to our
+     * hub, which floods it; delivery still needs the end-to-end receipt), but they are not online
+     * peers — no link of ours ends at them and they don't train the routing tables.
+     */
+    val meshPeers: StateFlow<Map<String, String>>
+
+    /**
      * True when a local radio reaches [peer] right now: BLE, Wi-Fi Direct, the hub itself, or a
      * phone on our hub (through it). When false but the peer is in [internetPeers], a send goes
      * over the relay — callers use this to apply relay semantics (wait for the end-to-end
@@ -184,6 +192,12 @@ data class NodeEncounterEvent(
     val shortName: String? = null,
     /** Hardware model string, if available. */
     val hwModel: String? = null,
+    /**
+     * The link that saw the peer. Only BLE reports a real per-peer signal strength (from scans):
+     * Wi-Fi Direct and the hub report fixed placeholder values, so distance is estimated for BLE
+     * sightings only.
+     */
+    val transport: TransportKind? = null,
 )
 
 /**

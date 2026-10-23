@@ -11,4 +11,6 @@ data class QTableSnapshot(
     val episodeCount: Long,
     val totalUpdates: Long,
     val capturedAtMs: Long,
+    /** Exploration rate when captured, so a restart doesn't go back to fully random choices. */
+    val epsilon: Double = 1.0,
 )

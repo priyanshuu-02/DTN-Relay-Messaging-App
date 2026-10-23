@@ -10,7 +10,10 @@ custom **ESP32-S3 LoRa hub** (Heltec WiFi LoRa 32 V3). Hubs flood bundles hub-to
 over LoRa. An optional **internet relay** (MQTT, public HiveMQ by default) reaches contacts
 anywhere. It is **independent of Meshtastic** — `docs/meshtastic-ref/` is read-only reference only.
 
-Routing on phones: PRoPHET (RFC 6693), MaxProp (Dijkstra), Epidemic, Double Q-learning.
+Routing on phones (6 selectable): PRoPHET (RFC 6693), Stable PRoPHET, MaxProp (Dijkstra),
+DiMaxProp (MaxProp + per-hop distance penalty, `routing/DiMaxPropStrategy.kt`, from the team's paper),
+Epidemic, Double Q-learning (12-feature state incl. DiMaxProp cost C(B,D), hops, relay buffer; per-hop
+progress reward η·ΔC; tables saved in `filesDir/q_tables_v2.bin`). λ / η are in Settings.
 End-to-end delivery receipts let carriers drop custody copies.
 
 ## Layout
@@ -60,6 +63,13 @@ End-to-end delivery receipts let carriers drop custody copies.
   phone on the same hub (`SendPath.HUB_LOCAL`).
 - Buffer counter / list / history show only DMs: anything addressed to `^all` (announces,
   broadcasts, group messages) spreads until its TTL and stays out of them (the event log keeps it).
+- Message info shows the routing decision SAVED at forward time (`RouteRecord.decision`), never a
+  live recomputation with the currently selected algorithm.
+- Chat list = contacts with `is_added` (QR, Add, a DM either way); other announced phones are in
+  "Discovered". Discover (broadcast announces) is off by default. DB is v4 (`AutoMigration 3→4`,
+  instrumented `MigrationTest` under `app/src/androidTest`: `./gradlew.bat :app:connectedDebugAndroidTest`).
+- Distance (BLE RSSI → metres) is only estimated for BLE encounters; Wi-Fi Direct / hub signal values
+  are placeholders. Phones seen only through the hub roster don't train the routing tables.
 - Announces issued before this phone's identity was created (`DtnIdentity.createdAtMs`) are
   ignored — they're this phone's old identity from before a data clear.
 - Never block the main thread on network I/O (the MQTT publish-on-disconnect ANR). Never log

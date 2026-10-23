@@ -28,6 +28,31 @@ class RosterParsingTest {
         assertNull(LoRaHubTransportAdapter.parseRoster(byteArrayOf(2, 1, 2, 3, 4, 5)))
     }
 
+    // ── Hub MESH_ROSTER (0x06): [1B n][n × (4B phone id, 4B hub id)] ──────
+
+    @Test
+    fun meshRoster_parsesPhoneAndItsHub() {
+        val payload = byteArrayOf(
+            1,
+            0xd4.toByte(), 0x37, 0x7a, 0xb4.toByte(),          // phone !d4377ab4
+            0xda.toByte(), 0x65, 0xbd.toByte(), 0xb8.toByte(), // on hub !da65bdb8
+        )
+        assertEquals(listOf(NodeId("!d4377ab4") to NodeId("!da65bdb8")), LoRaHubTransportAdapter.parseMeshRoster(payload))
+    }
+
+    @Test
+    fun meshRoster_emptyAndMalformed() {
+        assertEquals(emptyList<Pair<NodeId, NodeId>>(), LoRaHubTransportAdapter.parseMeshRoster(byteArrayOf(0)))
+        assertNull(LoRaHubTransportAdapter.parseMeshRoster(ByteArray(0)))
+        assertNull(LoRaHubTransportAdapter.parseMeshRoster(byteArrayOf(1, 1, 2, 3, 4)))   // hub id missing
+    }
+
+    @Test
+    fun hubLabel_matchesTheHubWifiName() {
+        assertEquals("hub BDB8", hubLabel("!da65bdb8"))
+        assertEquals("hub A9B0", hubLabel("da64a9b0"))
+    }
+
     // ── Wi-Fi Direct ROSTER text: "hex@ip,hex@ip" ─────────────────────────
 
     @Test

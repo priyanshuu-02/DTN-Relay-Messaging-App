@@ -5,12 +5,16 @@ import com.dtn.mesh.crypto.DtnIdentity
 import com.dtn.mesh.crypto.EnvelopeService
 import com.dtn.mesh.crypto.Fragmenter
 import com.dtn.mesh.database.dao.ChatDao
+import com.dtn.mesh.database.dao.ContactDao
 import com.dtn.mesh.database.entity.ChatMessageEntity
 import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.DtnMessageType
 import com.dtn.mesh.model.NodeId
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.receiver.InternetTransportAdapter
+import com.dtn.mesh.routing.AlgorithmCode
+import com.dtn.mesh.routing.StrategySelector
+import com.dtn.mesh.settings.SettingsRepository
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -29,7 +33,19 @@ class OutboundMessageService @Inject constructor(
     private val chatDao: ChatDao,
     private val internet: InternetTransportAdapter,
     private val lifecycle: MessageLifecycleLog,
+    private val strategySelector: StrategySelector,
+    private val settings: SettingsRepository,
+    private val contactDao: ContactDao,
 ) {
+    private companion object {
+        /** Lifetime of an announce broadcast to everyone (Discover on). */
+        const val BROADCAST_ANNOUNCE_TTL_MS = 10 * 60_000L
+        /** Lifetime of a direct announce to one contact; one is sent at most this often per contact. */
+        const val DIRECT_ANNOUNCE_TTL_MS = 30 * 60_000L
+    }
+
+    /** Contact node id → when we last queued our direct announce to them. */
+    private val lastDirectAnnounceMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
     sealed interface Result {
         data class Sent(val message: DtnMessage) : Result
         /** No encryption key for this peer/group yet (they haven't announced / you haven't joined). */
@@ -52,7 +68,10 @@ class OutboundMessageService @Inject constructor(
             else -> dest.value
         }
         val peer = if (channel > 0 || isBroadcast) null else dest.value
-        val plain = text.toByteArray(Charsets.UTF_8)
+        // A DM starts with one byte naming the routing algorithm selected here, inside the
+        // encryption, so the receiver's Message info can show it ([AlgorithmCode]).
+        val plain = if (peer != null) AlgorithmCode.prefix(strategySelector.activeType, text.toByteArray(Charsets.UTF_8))
+        else text.toByteArray(Charsets.UTF_8)
         val budget = envelope.maxPlaintextBytes(dest, channel)
 
         // ── Single frame (the common case) ──
@@ -110,24 +129,54 @@ class OutboundMessageService @Inject constructor(
         return first?.let { Result.Sent(it) } ?: Result.Error
     }
 
-    /** Broadcast a signed identity announce so peers can learn our keys (TOFU). */
-    suspend fun sendAnnounce(displayName: String, ttlMs: Long = 10 * 60_000L): DtnMessage {
+    /**
+     * Publish our signed identity (name + keys) so peers can encrypt to us (TOFU).
+     *
+     * - Discover on: broadcast to everyone — nearby phones, hubs and the internet relay.
+     * - Discover off: a direct announce to each contact in the chat list, at most once per
+     *   [DIRECT_ANNOUNCE_TTL_MS] per contact ([force] sends one now, e.g. after a name change).
+     *   Nobody else learns who we are; people add us by scanning our QR.
+     */
+    suspend fun sendAnnounce(displayName: String, force: Boolean = false) {
+        if (runCatching { settings.discoverableOnce() }.getOrDefault(false)) {
+            val msg = buildAnnounce(displayName, NodeId.BROADCAST, BROADCAST_ANNOUNCE_TTL_MS)
+            queueManager.ingest(msg)
+            bridgeToRelay(msg) // propagate our keys over the internet relay too (if connected)
+            return
+        }
+        val now = System.currentTimeMillis()
+        val me = identity.nodeId.value
+        for (c in runCatching { contactDao.getAddedContacts() }.getOrDefault(emptyList())) {
+            if (c.nodeId == me || !c.nodeId.startsWith("!")) continue
+            if (!force && now - (lastDirectAnnounceMs[c.nodeId] ?: 0L) < DIRECT_ANNOUNCE_TTL_MS) continue
+            sendAnnounceTo(NodeId(c.nodeId), displayName)
+        }
+    }
+
+    /**
+     * Queue our signed identity for one contact only (just added them, or Discover is off). It
+     * travels like a DM: carriers pass it on but only [peer] pins the keys.
+     */
+    suspend fun sendAnnounceTo(peer: NodeId, displayName: String) {
+        if (peer == identity.nodeId) return
+        lastDirectAnnounceMs[peer.value] = System.currentTimeMillis()
+        queueManager.ingest(buildAnnounce(displayName, peer, DIRECT_ANNOUNCE_TTL_MS))
+    }
+
+    private fun buildAnnounce(displayName: String, dest: NodeId, ttlMs: Long): DtnMessage {
         val payload = Announce.build(
             xPub = identity.xPub, edPub = identity.edPub, edSeed = identity.edSeed,
             name = displayName, issuedAtSec = (System.currentTimeMillis() / 1000L).toInt(),
         )
-        val msg = DtnMessage(
+        return DtnMessage(
             id = UUID.randomUUID().toString(),
             originNodeId = identity.nodeId,
-            destinationNodeId = NodeId.BROADCAST,
+            destinationNodeId = dest,
             payloadBytes = payload,
             createdAtMs = System.currentTimeMillis(),
             ttlMs = ttlMs,
             messageType = DtnMessageType.ANNOUNCE,
         )
-        queueManager.ingest(msg)
-        bridgeToRelay(msg) // propagate our keys over the internet relay too (if connected)
-        return msg
     }
 
     /**

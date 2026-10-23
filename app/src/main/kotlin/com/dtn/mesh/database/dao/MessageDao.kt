@@ -150,10 +150,13 @@ interface MessageDao {
         DELETE FROM messages
         WHERE message_type = 'ANNOUNCE'
           AND origin_node_id = :origin
+          AND destination_node_id = :dest
           AND id != :keepId
           AND status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
     """)
-    suspend fun supersedeAnnounces(origin: String, keepId: String)
+    // Per destination: with Discover off, a phone sends one direct announce to each contact, and a
+    // fresh one to Alice must not delete the one still waiting to reach Bob.
+    suspend fun supersedeAnnounces(origin: String, dest: String, keepId: String)
 
     // ──────────────────────────────────────────────────────────────────────
     // Status transitions

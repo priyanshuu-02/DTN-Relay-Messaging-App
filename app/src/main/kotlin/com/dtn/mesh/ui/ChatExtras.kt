@@ -18,6 +18,9 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import kotlin.math.roundToInt
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -121,9 +124,14 @@ fun SettingsDialog(viewModel: DtnViewModel, onDismiss: () -> Unit) {
     val relayPeers by viewModel.internetPeers.collectAsState()
     val relayDiagnostics by viewModel.relayDiagnostics.collectAsState()
 
+    val savedLambda by viewModel.diMaxPropLambda.collectAsState()
+    val savedEta by viewModel.qShapingEta.collectAsState()
+
     var name by remember(savedName) { mutableStateOf(savedName) }
     var broker by remember(savedBroker) { mutableStateOf(savedBroker) }
     var internet by remember(savedInternet) { mutableStateOf(savedInternet) }
+    var lambda by remember(savedLambda) { mutableStateOf(savedLambda.toFloat()) }
+    var eta by remember(savedEta) { mutableStateOf(savedEta.toFloat()) }
 
     val relayLine = when (status.internet) {
         MeshConnectionState.CONNECTED -> "Relay connected · ${relayPeers.size} contact${if (relayPeers.size == 1) "" else "s"} online"
@@ -136,6 +144,9 @@ fun SettingsDialog(viewModel: DtnViewModel, onDismiss: () -> Unit) {
         confirmButton = {
             TextButton(onClick = {
                 viewModel.saveSettings(name.trim(), broker.trim(), internet)
+                if (lambda.toDouble() != savedLambda || eta.toDouble() != savedEta) {
+                    viewModel.saveRoutingTuning(lambda.toDouble(), eta.toDouble())
+                }
                 onDismiss()
             }) { Text("Save") }
         },
@@ -175,6 +186,30 @@ fun SettingsDialog(viewModel: DtnViewModel, onDismiss: () -> Unit) {
                         "but it does see who is online and message headers.",
                     fontSize = 10.sp, color = Palette.TextMuted, modifier = Modifier.padding(top = 4.dp),
                 )
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider(color = Palette.Divider)
+                Spacer(Modifier.height(12.dp))
+                Text("Routing tuning", fontWeight = FontWeight.SemiBold)
+                Text("For experiments. Both apply right away to the running algorithms.",
+                    fontSize = 11.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(6.dp))
+                Text("DiMaxProp distance weight λ = %.2f".format(lambda), fontSize = 12.sp, color = Palette.TextSecondary)
+                androidx.compose.material3.Slider(
+                    value = lambda, onValueChange = { lambda = (it * 20).roundToInt() / 20f },
+                    valueRange = 0f..1f, steps = 19,
+                    modifier = Modifier.semantics { contentDescription = "DiMaxProp distance weight" },
+                )
+                Text("0 = plain MaxProp. Higher = prefer carriers that were physically closer (BLE distance).",
+                    fontSize = 10.sp, color = Palette.TextMuted)
+                Spacer(Modifier.height(8.dp))
+                Text("Q-learning progress reward η = %.2f".format(eta), fontSize = 12.sp, color = Palette.TextSecondary)
+                androidx.compose.material3.Slider(
+                    value = eta, onValueChange = { eta = (it * 20).roundToInt() / 20f },
+                    valueRange = 0f..1f, steps = 19,
+                    modifier = Modifier.semantics { contentDescription = "Q-learning progress reward" },
+                )
+                Text("Reward per forward for moving a message closer to its destination (DiMaxProp cost). 0 = off.",
+                    fontSize = 10.sp, color = Palette.TextMuted)
                 Spacer(Modifier.height(12.dp))
                 HorizontalDivider(color = Palette.Divider)
                 Spacer(Modifier.height(12.dp))
@@ -370,6 +405,7 @@ fun ContactInfoDialog(
     val reach = when {
         peer.isOnline -> "Nearby (radio)"
         peer.internetOnline -> "Online via the internet relay"
+        peer.viaOtherHub -> "Online via LoRa: on ${peer.meshHubLabel}, reached through the hubs"
         else -> "Not reachable right now — messages wait in the buffer"
     }
     AlertDialog(

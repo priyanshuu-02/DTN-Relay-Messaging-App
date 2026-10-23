@@ -4,6 +4,7 @@ import com.dtn.mesh.learning.DoubleQLearningEngine
 import com.dtn.mesh.learning.QLearningConfig
 import com.dtn.mesh.queue.BufferConfig
 import com.dtn.mesh.queue.MessageQueueManager
+import com.dtn.mesh.routing.DiMaxPropStrategy
 import com.dtn.mesh.routing.EpidemicStrategy
 import com.dtn.mesh.routing.MaxPropStrategy
 import com.dtn.mesh.routing.ProphetConfig
@@ -49,6 +50,7 @@ object SchedulerModule {
             epidemic = EpidemicStrategy(),
             stableProphet = ProphetStrategy(ProphetConfig(stabilityAware = true)),
             qLearning = QLearningStrategy(),
+            diMaxPropStrategy = DiMaxPropStrategy(),
             initialStrategy = StrategySelector.StrategyType.PROPHET,
         )
 

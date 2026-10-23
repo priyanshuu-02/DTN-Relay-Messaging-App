@@ -85,12 +85,16 @@ class WifiDirectTransportAdapter @Inject constructor(
         private const val DISCOVERY_INTERVAL_MS = 12_000L
         /** Decision loop tick. */
         private const val TICK_MS = 3_000L
+        /** Faster tick while a group is forming / being joined, and right after joining. */
+        private const val FAST_TICK_MS = 1_000L
+        /** After joining, greet the owner every fast tick for this long (its first HELLO often fails). */
+        private const val FAST_PHASE_MS = 15_000L
         /** A phone / group not heard for this long is forgotten. */
         private const val SEEN_TTL_MS = 45_000L
         /** Joining or creating a group that hasn't formed by now is abandoned. */
         private const val FORM_TIMEOUT_MS = 30_000L
-        /** A group we failed to join is skipped for this long. */
-        private const val FAILED_GROUP_BACKOFF_MS = 30_000L
+        /** A group we failed to join is skipped for this long, then tried again. */
+        private const val FAILED_GROUP_BACKOFF_MS = 8_000L
         /** No HELLO/DATA from a linked phone for this long → offline. */
         private const val PEER_STALE_THRESHOLD_MS = 30_000L
         /** HELLO heartbeats (and the owner's roster) cadence. */
@@ -274,10 +278,19 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     private suspend fun decisionLoop() {
         while (scope.isActive && running) {
-            delay(TICK_MS)
+            delay(if (inFastPhase(System.currentTimeMillis())) FAST_TICK_MS else TICK_MS)
             runCatching { tick(System.currentTimeMillis()) }.onFailure { Log.w(TAG, "tick failed", it) }
         }
     }
+
+    /** A group is forming or being joined, or we just joined and the owner doesn't know us yet. */
+    private fun inFastPhase(now: Long): Boolean = when (role) {
+        Role.JOINING, Role.CREATING -> true
+        Role.MEMBER -> !ownerLinked() && now - roleSinceMs < FAST_PHASE_MS
+        else -> false
+    }
+
+    private fun ownerLinked(): Boolean = groupOwnerAddress?.let { it in connectedPeers.values } ?: false
 
     private fun tick(now: Long) {
         if (p2pEnabled == false) { refreshState(); publishLinkInfo(); return }
@@ -300,7 +313,13 @@ class WifiDirectTransportAdapter @Inject constructor(
             setRole(Role.SEARCHING)
         }
 
-        if (now - lastHeartbeatMs >= HEARTBEAT_MS || rosterDirty) heartbeat(now)
+        if (now - lastHeartbeatMs >= HEARTBEAT_MS || rosterDirty) {
+            heartbeat(now)
+        } else if (role == Role.MEMBER && !ownerLinked() && now - roleSinceMs < FAST_PHASE_MS) {
+            // Just joined: keep greeting the owner every fast tick instead of every 10 s, so the
+            // link comes up as soon as the group interface has its address.
+            groupOwnerAddress?.let { ip -> scope.launch { sendHello(ip) } }
+        }
 
         val groups = freshGroups(now)
         val phones = freshPhones(now, groups)
@@ -537,9 +556,10 @@ class WifiDirectTransportAdapter @Inject constructor(
     private fun emitPeer(id: String, online: Boolean) {
         _nodeEvents.tryEmit(NodeEncounterEvent(
             nodeId = NodeId(id),
-            rssi = if (online) -30 else 0, snr = if (online) 20f else 0f,
+            rssi = if (online) -30 else 0, snr = if (online) 20f else 0f, // placeholders, not measured
             timestampMs = System.currentTimeMillis(),
             isOnline = online,
+            transport = TransportKind.WIFI_DIRECT,
         ))
     }
 
@@ -564,7 +584,7 @@ class WifiDirectTransportAdapter @Inject constructor(
             role == Role.MEMBER -> "Joined a group — saying hello to its phones…"
             role == Role.JOINING -> "Joining !${groupOwnerHex.orEmpty()}'s group…"
             role == Role.CREATING -> "Creating a group…"
-            else -> "Searching for DTN phones nearby…"
+            else -> "Searching for phones to link…"
         }
         val facts = buildList {
             groupName?.let { add("Group $it") }

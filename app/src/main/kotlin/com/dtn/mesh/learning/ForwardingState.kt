@@ -25,4 +25,13 @@ data class ForwardingState(
     val historicalSuccessRate: Double,
     /** Duplicate count (same message ID seen): normalised. */
     val duplicateCountNorm: Double,
+    /**
+     * The relay's DiMaxProp path cost to the destination, C(B,D) (DiMaxProp paper §VI-A),
+     * normalised: 0 = right next to it, 1 = unreachable / unknown.
+     */
+    val diMaxPropCost: Double = 1.0,
+    /** The bundle's hop count over the hop limit. */
+    val hopCountNorm: Double = 0.0,
+    /** The relay's reported buffer occupancy (0 when it hasn't reported one). */
+    val relayBufferOccupancy: Double = 0.0,
 )

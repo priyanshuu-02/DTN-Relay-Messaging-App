@@ -51,6 +51,9 @@ import javax.inject.Singleton
  * - ROSTER   (0x05): hub → phone, `[1B n][n × 4B node id]` of every phone registered at the hub
  *   (firmware v3+). Those phones are reachable through the hub right now: they're reported as
  *   online peers ([hubPeers]) and DMs to them go straight through the hub.
+ * - MESH_ROSTER (0x06): hub → phone, `[1B n][n × (4B phone id, 4B hub id)]` of the phones on the
+ *   other hubs ours hears over LoRa (from their heartbeats). Shown as reachable over LoRa
+ *   ([meshPeers]); not online peers — a DM to one still goes to our hub, which floods it.
  *
  * ## Auto-join
  * On API 29+ we request the hub network via [WifiNetworkSpecifier] (SSID prefix "DTN-HUB-") and
@@ -80,6 +83,7 @@ class LoRaHubTransportAdapter @Inject constructor(
         private const val FRAME_HELLO: Byte = 0x03
         private const val FRAME_PING: Byte = 0x04
         private const val FRAME_ROSTER: Byte = 0x05
+        private const val FRAME_MESH_ROSTER: Byte = 0x06
 
         private const val CONNECT_TIMEOUT_MS = 8_000
         /** A hub reboot takes ~6 s before its Wi-Fi is back; asking sooner ends in "No devices found". */
@@ -92,14 +96,26 @@ class LoRaHubTransportAdapter @Inject constructor(
             if (payload.isEmpty()) return null
             val n = payload[0].toInt() and 0xFF
             if (payload.size < 1 + n * 4) return null
+            return (0 until n).map { i -> NodeId.fromNodeNum(be32(payload, 1 + i * 4)) }
+        }
+
+        /**
+         * (phone, its hub) pairs in a MESH_ROSTER payload (`[1B n][n × (4B phone id, 4B hub id)]`),
+         * or null when malformed. Pure (tested).
+         */
+        fun parseMeshRoster(payload: ByteArray): List<Pair<NodeId, NodeId>>? {
+            if (payload.isEmpty()) return null
+            val n = payload[0].toInt() and 0xFF
+            if (payload.size < 1 + n * 8) return null
             return (0 until n).map { i ->
-                val o = 1 + i * 4
-                NodeId.fromNodeNum(
-                    ((payload[o].toInt() and 0xFF) shl 24) or ((payload[o + 1].toInt() and 0xFF) shl 16) or
-                        ((payload[o + 2].toInt() and 0xFF) shl 8) or (payload[o + 3].toInt() and 0xFF),
-                )
+                val o = 1 + i * 8
+                NodeId.fromNodeNum(be32(payload, o)) to NodeId.fromNodeNum(be32(payload, o + 4))
             }
         }
+
+        private fun be32(b: ByteArray, o: Int): Int =
+            ((b[o].toInt() and 0xFF) shl 24) or ((b[o + 1].toInt() and 0xFF) shl 16) or
+                ((b[o + 2].toInt() and 0xFF) shl 8) or (b[o + 3].toInt() and 0xFF)
 
         private var packetIdCounter = 3_000_000
     }
@@ -137,6 +153,13 @@ class LoRaHubTransportAdapter @Inject constructor(
     /** Whether [peer] is another phone on our hub (reachable through it right now). */
     fun isHubPeer(peer: NodeId): Boolean = isConnected && peer.value in _hubPeers.value
 
+    private val _meshPeers = MutableStateFlow<Map<String, String>>(emptyMap())
+    /**
+     * Phones on the other hubs our hub hears over LoRa (phone id → that hub's id), from its
+     * MESH_ROSTER. Never ourselves, our hub, or a phone on our own hub.
+     */
+    val meshPeers: StateFlow<Map<String, String>> = _meshPeers.asStateFlow()
+
     // ── Flows ────────────────────────────────────────────────────────────
 
     private val _inboundMessages = MutableSharedFlow<InboundPacket>(
@@ -154,20 +177,23 @@ class LoRaHubTransportAdapter @Inject constructor(
     private val _connectionState = MutableStateFlow(MeshConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<MeshConnectionState> = _connectionState.asStateFlow()
 
-    /** Hub + the phones on it, for the link details sheet. */
-    val linkInfo: StateFlow<LinkInfo> = combine(_connectionState, _hubId, _hubPeers) { st, hub, peers ->
+    /** Hub + the phones on it (and on the hubs it hears over LoRa), for the link details sheet. */
+    val linkInfo: StateFlow<LinkInfo> = combine(_connectionState, _hubId, _hubPeers, _meshPeers) { st, hub, peers, mesh ->
         when {
             st == MeshConnectionState.CONNECTED && hub != null -> LinkInfo(
                 summary = "Connected to hub $hub · " + when (peers.size) {
                     0 -> "no other phones on it"
                     1 -> "1 other phone on it"
                     else -> "${peers.size} other phones on it"
-                },
+                } + if (mesh.isEmpty()) "" else " · ${mesh.size} on other hubs",
                 facts = listOf(
                     "Phones on this hub reach each other through it; the hub also floods messages " +
                         "over LoRa to other hubs.",
                 ),
-                peers = peers.sorted().map { LinkPeer(it, role = "On this hub") },
+                peers = peers.sorted().map { LinkPeer(it, role = "On this hub") } +
+                    mesh.entries.sortedBy { it.key }.map { (phone, viaHub) ->
+                        LinkPeer(phone, role = "On ${hubLabel(viaHub)} · over LoRa")
+                    },
             )
             st == MeshConnectionState.CONNECTED -> LinkInfo(summary = "Connected — waiting for the hub to answer")
             st == MeshConnectionState.CONNECTING -> LinkInfo(summary = "Joining the hub's Wi-Fi (DTN-HUB-…)")
@@ -237,6 +263,7 @@ class LoRaHubTransportAdapter @Inject constructor(
     private fun linkDown() {
         runCatching { pingJob?.cancel() }; pingJob = null
         updateRoster(emptyList())
+        _meshPeers.value = emptyMap()
         hubNodeId?.let { emitHubEncounter(it, online = false) }
         hubNodeId = null
         _hubId.value = null
@@ -251,12 +278,27 @@ class LoRaHubTransportAdapter @Inject constructor(
         _hubPeers.value = now // update first: offline handling checks reachability
         val ts = System.currentTimeMillis()
         (now - before).forEach { id ->
-            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = -200, snr = 0f, timestampMs = ts, isOnline = true))
+            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = -200, snr = 0f, timestampMs = ts,
+                isOnline = true, transport = TransportKind.HUB))
         }
         (before - now).forEach { id ->
-            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = 0, snr = 0f, timestampMs = ts, isOnline = false))
+            _nodeEvents.tryEmit(NodeEncounterEvent(nodeId = NodeId(id), rssi = 0, snr = 0f, timestampMs = ts,
+                isOnline = false, transport = TransportKind.HUB))
         }
         Log.i(TAG, "Hub roster: ${now.size} other phone(s) ${now.joinToString { it.takeLast(8) }}")
+    }
+
+    /** Apply a MESH_ROSTER: the phones on the other hubs ours hears (presence only, no encounters). */
+    private fun updateMeshRoster(pairs: List<Pair<NodeId, NodeId>>) {
+        val me = identity.nodeId.value
+        val local = _hubPeers.value
+        val now = pairs.map { (phone, hub) -> phone.value to hub.value }
+            .filter { (phone, _) -> phone != me && phone != hubNodeId?.value && phone !in local }
+            .toMap()
+        if (now == _meshPeers.value) return
+        _meshPeers.value = now
+        Log.i(TAG, "Other hubs: ${now.size} phone(s) " +
+            now.entries.joinToString { "${it.key.takeLast(8)}@${it.value.takeLast(8)}" })
     }
 
     /**
@@ -389,6 +431,7 @@ class LoRaHubTransportAdapter @Inject constructor(
                     emitHubEncounter(hub, online = true)
                 }
                 FRAME_ROSTER -> parseRoster(payload)?.let { updateRoster(it) }
+                FRAME_MESH_ROSTER -> parseMeshRoster(payload)?.let { updateMeshRoster(it) }
                 FRAME_BUNDLE -> {
                     val msg = DtnWireCodec.decode(payload, rssi = -40, snr = 15f) ?: continue
                     // The hub is our immediate previous hop — attribute it so the orchestrator's
@@ -448,6 +491,7 @@ class LoRaHubTransportAdapter @Inject constructor(
             isOnline = online,
             longName = "LoRa Hub",
             shortName = "HUB",
+            transport = TransportKind.HUB,
         ))
     }
 

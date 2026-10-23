@@ -28,6 +28,7 @@ import com.dtn.mesh.receiver.MeshTransport
 import com.dtn.mesh.receiver.NodeEncounterEvent
 import com.dtn.mesh.receiver.SendPath
 import com.dtn.mesh.receiver.journalLabel
+import com.dtn.mesh.routing.DiMaxPropStrategy
 import com.dtn.mesh.routing.RadioDistanceEstimator
 import com.dtn.mesh.routing.RoutingSummary
 import com.dtn.mesh.routing.StrategySelector
@@ -78,6 +79,8 @@ class DtnOrchestrator @Inject constructor(
     private val lifecycle: MessageLifecycleLog,
     private val benchmark: com.dtn.mesh.learning.BenchmarkTracker,
     private val localIdentity: com.dtn.mesh.model.LocalNodeIdentity,
+    private val settings: com.dtn.mesh.settings.SettingsRepository,
+    private val qStore: QTableStore,
 ) {
     companion object {
         private const val TAG = "DtnOrchestrator"
@@ -126,6 +129,15 @@ class DtnOrchestrator @Inject constructor(
         private const val REWARD_BASELINE_DELIVERED = 0.3  // any decision on a delivered msg
         private const val REWARD_FORWARD_DELIVERED = 1.0   // the FORWARD that reached the deliverer
         const val REWARD_EXPIRED = -0.3                    // message expired before delivery
+
+        /**
+         * In the DiMaxProp progress reward η·(C(A,D) − C(B,D)), a side that knows no path counts as
+         * this far away (a few hops of `1 + λ`), so moving a bundle to a relay that knows a path
+         * earns a bounded reward rather than an infinite one.
+         */
+        private const val UNREACHABLE_COST = 3.0
+        /** Saved Q-tables are rewritten at most this often (and on stop). */
+        private const val Q_SAVE_DELAY_MS = 5_000L
     }
 
     private sealed class OrchestratorEvent {
@@ -136,6 +148,8 @@ class DtnOrchestrator @Inject constructor(
         data object FlushBuffer : OrchestratorEvent()
         /** Apply any reward-assigned-but-unapplied Q decisions now (real-time training). */
         data object DrainQUpdates : OrchestratorEvent()
+        /** Immediate DiMaxProp progress rewards for FORWARD decisions just made (paper eq. 13). */
+        data class QShaping(val updates: List<Pair<ForwardingState, Double>>) : OrchestratorEvent()
     }
 
     /**
@@ -168,8 +182,24 @@ class DtnOrchestrator @Inject constructor(
     /** Reassembles multi-fragment messages for THIS node, keyed by canonical parent id. */
     private val reassembler = FragmentReassembler()
 
-    /** "$msgId|$peer" → last time we recorded a Q-learning decision, to throttle table growth. */
-    private val qLogged = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** msgId8 → the sender's routing algorithm read from a DM we just decrypted (for its route record). */
+    private val senderAlgorithm = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * "$msgId|$peer" → the Q-learning choice for that pair, kept for [SEND_RETRY_INTERVAL_MS]. The
+     * flush runs every 4 s; re-drawing an ε-greedy action each time (but recording only one per
+     * 30 s) meant the forward that actually happened was often not the decision that got the reward.
+     */
+    private data class QChoice(val action: ForwardingAction, val exploratory: Boolean, val atMs: Long, val note: String)
+    private val qChoice = java.util.concurrent.ConcurrentHashMap<String, QChoice>()
+
+    /** η of the progress reward, kept in sync with Settings. */
+    @Volatile private var shapingEta: Double = qEngine.config.shapingEta
+    /** The saved Q-tables are loaded once per process (a stop/start must not roll them back). */
+    @Volatile private var qLoaded = false
+    /** Saves outlive [stop] (it cancels [scope]), so the last updates always reach the disk. */
+    private val persistScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    @Volatile private var qSaveJob: kotlinx.coroutines.Job? = null
 
     // ── Concurrency control for the send path (multi-phone hardening) ──
     /** Only one flush runs at a time; overlapping requests coalesce via [flushPending]. */
@@ -313,11 +343,23 @@ class DtnOrchestrator @Inject constructor(
                 ch.trySend(OrchestratorEvent.FlushBuffer)
             }
         }
+        // DiMaxProp λ and the Q-learning progress-reward η follow Settings.
+        strategySelector.diMaxProp.selfId = localIdentity.nodeId.value
+        sc.launch { settings.diMaxPropLambda.collect { strategySelector.diMaxProp.lambda = it } }
+        sc.launch { settings.qShapingEta.collect { shapingEta = it } }
         sc.launch {
             // Restore learned PROPHET predictability from the DB BEFORE processing events, so a
             // restart doesn't begin from a blank routing table. Runs on this single consumer
             // coroutine so it can't race the pTable mutations that onEncounter performs.
             seedRoutingProbabilitiesFromDb()
+            // Same for the Q-tables (and ε): before this they were lost on every restart.
+            if (!qLoaded) {
+                qLoaded = true
+                if (qStore.load(qEngine)) {
+                    lifecycle.console("Q-LEARNING: loaded saved tables (ε=%.3f, updates=${qEngine.totalUpdates})"
+                        .format(qEngine.currentEpsilon))
+                }
+            }
             for (ev in ch) {
                 try {
                     when (ev) {
@@ -331,6 +373,12 @@ class DtnOrchestrator @Inject constructor(
                             // double-apply; markApplied inside processBatchQUpdates dedups.
                             val pending = decisionDao.getPendingUpdates()
                             if (pending.isNotEmpty()) processBatchQUpdates(pending)
+                        }
+                        is OrchestratorEvent.QShaping -> {
+                            for ((state, reward) in ev.updates) {
+                                qEngine.update(state, ForwardingAction.FORWARD, reward, nextState = null)
+                            }
+                            scheduleQSave()
                         }
                     }
                 } catch (e: Exception) {
@@ -347,7 +395,17 @@ class DtnOrchestrator @Inject constructor(
         runCatching { scope?.cancel() }
         eventChannel = null
         scope = null
+        if (qLoaded) persistScope.launch { qStore.save(qEngine) }
         Log.i(TAG, "Stopped")
+    }
+
+    /** Write the Q-tables to disk shortly (coalesced), off the event loop. */
+    private fun scheduleQSave() {
+        if (qSaveJob?.isActive == true) return
+        qSaveJob = persistScope.launch {
+            delay(Q_SAVE_DELAY_MS)
+            qStore.save(qEngine)
+        }
     }
 
     /** Non-suspending: uses trySend so callers never crash on a stopped orchestrator. */
@@ -434,14 +492,26 @@ class DtnOrchestrator @Inject constructor(
 
         Log.d(TAG, "ONLINE: ${peerId.value.takeLast(8)}")
 
-        // Feed the routing strategy so PROPHET's P-table (and MaxProp's path likelihoods)
-        // learn from this contact. Distance is derived from the observed RSSI via the
-        // log-distance path-loss model — if RSSI is unavailable the estimator returns the
-        // "unknown" sentinel and the distance-boost term is skipped.
-        val distanceM = RadioDistanceEstimator.estimateMeters(
-            rssi = event.rssi,
-            transport = RadioDistanceEstimator.Transport.BLE, // TODO: source per-encounter when multi-transport metadata lands
-        )
+        // A phone we only see in our hub's roster was never met: it's two hops away through the
+        // hub, like a contact present on the internet relay. It must not train the encounter-based
+        // models (PRoPHET P, MaxProp / DiMaxProp f), or they'd treat the hub as a direct meeting.
+        if (event.transport == com.dtn.mesh.receiver.TransportKind.HUB && !transport.isHub(peerId)) {
+            lifecycle.console("ON HUB ${peerId.value.takeLast(8)}: reachable through our LoRa hub (not an encounter)")
+            requestFlush()
+            return
+        }
+
+        // Feed the routing strategy so PROPHET's P-table (and MaxProp / DiMaxProp's likelihoods)
+        // learn from this contact. Distance comes from the RSSI via the log-distance path-loss
+        // model, and only for BLE: it is the one link with a real per-peer signal (scans). Wi-Fi
+        // Direct and the hub report fixed placeholder values, so for them it stays unknown and
+        // every distance term is skipped (DiMaxProp then uses plain MaxProp cost for that link).
+        val measured = event.transport == com.dtn.mesh.receiver.TransportKind.BLE && event.rssi > -200
+        val distanceM = if (measured) {
+            RadioDistanceEstimator.estimateMeters(event.rssi, RadioDistanceEstimator.Transport.BLE)
+        } else {
+            RadioDistanceEstimator.UNKNOWN_DISTANCE
+        }
         val activeStrat = strategySelector.active
         val pBefore = (activeStrat as? com.dtn.mesh.routing.ProphetStrategy)?.getDeliveryProbability(peerId)
         strategySelector.onEncounter(
@@ -452,6 +522,7 @@ class DtnOrchestrator @Inject constructor(
                 rssi = event.rssi,
                 snr = event.snr,
                 distanceMeters = distanceM,
+                radio = if (distanceM >= 0.0) RadioDistanceEstimator.Transport.BLE else null,
             ),
         )
         // Persist the canonical PROPHET delivery predictability so the contacts table reflects it
@@ -469,8 +540,9 @@ class DtnOrchestrator @Inject constructor(
         // and the resulting per-strategy value with the formula that produced it.
         val peer8 = peerId.value.takeLast(8)
         val sinceLastMs = if (lastEnc != null) now - lastEnc.startTimeMs else -1L
-        lifecycle.console("ENCOUNTER $peer8: new=$isNew sinceLast=${sinceLastMs}ms " +
-            "rssi=${event.rssi} snr=${event.snr} dist≈%.1fm".format(distanceM))
+        lifecycle.console("ENCOUNTER $peer8 via ${event.transport.journalLabel()}: new=$isNew sinceLast=${sinceLastMs}ms " +
+            "rssi=${event.rssi} snr=${event.snr} " +
+            if (distanceM >= 0.0) "dist≈%.1fm".format(distanceM) else "dist=unknown")
         when (activeStrat) {
             is com.dtn.mesh.routing.ProphetStrategy -> {
                 val cfg = activeStrat.config
@@ -487,6 +559,11 @@ class DtnOrchestrator @Inject constructor(
             }
             is com.dtn.mesh.routing.EpidemicStrategy -> {
                 lifecycle.console("  EPIDEMIC: floods to every peer — no per-peer probability model")
+            }
+            is com.dtn.mesh.routing.DiMaxPropStrategy -> {
+                val e = activeStrat.edgeInfo(com.dtn.mesh.routing.DiMaxPropStrategy.ME_LABEL, peerId.value)
+                lifecycle.console("  DIMAXPROP me→$peer8: f=%.3f d=%s → hop cost %.3f  [(1−f) + λ·d, λ=%.2f]".format(
+                    e?.f ?: 0.0, e?.dNorm?.let { "%.2f".format(it) } ?: "none", e?.weight ?: 1.0, activeStrat.lambda))
             }
         }
 
@@ -517,6 +594,9 @@ class DtnOrchestrator @Inject constructor(
      * never persisted in the peer's forwarding buffer.
      */
     private suspend fun sendRoutingSummary(peerId: NodeId) {
+        // DiMaxProp summaries carry our buffer occupancy (a Q-learning input on the other side).
+        strategySelector.diMaxProp.localBufferOccupancy =
+            runCatching { queueManager.getBufferOccupancy() }.getOrDefault(0.0)
         val summary = strategySelector.buildRoutingSummary()
         if (summary.payload.isEmpty()) return
         // Guard: the summary is a self-describing binary vector — truncating mid-entry
@@ -655,22 +735,25 @@ class DtnOrchestrator @Inject constructor(
         // strategies have nothing to rank it by: it bypasses them (like a direct delivery).
         val peerIsHub = transport.isHub(peerId)
         val hubOnly = !peerIsHub && isHubOnly(peerId)
+        // Q-learning's per-message reasoning, saved with each forward it approves (Message info).
+        val qNotes = HashMap<String, String>()
+        // The strategy that decides this pass: the one active NOW, captured once, so every
+        // forward is attributed to (and explained by) the algorithm that actually made it.
+        val active = strategySelector.active
         val relayApproved: Set<String> = if (relay || peerIsHub || hubOnly) emptySet() else try {
-            when {
+            when (active) {
                 // Q-learning: the engine decides FORWARD vs STORE per (message, peer) from the
-                // live 9-feature state, and each decision is recorded for training.
-                strategySelector.activeType == StrategySelector.StrategyType.QLEARNING ->
-                    qDecisionApproved(snapshot, peerId)
-                strategySelector.active is com.dtn.mesh.routing.ProphetStrategy ->
-                    (strategySelector.active as com.dtn.mesh.routing.ProphetStrategy)
-                        .rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds)
-                        .map { it.message.id }.toSet()
-                strategySelector.active is com.dtn.mesh.routing.MaxPropStrategy ->
-                    (strategySelector.active as com.dtn.mesh.routing.MaxPropStrategy)
-                        .rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds)
-                        .map { it.message.id }.toSet()
+                // live 12-feature state, and each decision is recorded for training.
+                is com.dtn.mesh.routing.QLearningStrategy ->
+                    qDecisionApproved(snapshot, peerId, onlinePeerIds, qNotes)
+                is com.dtn.mesh.routing.ProphetStrategy ->
+                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
+                is com.dtn.mesh.routing.MaxPropStrategy ->
+                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
+                is com.dtn.mesh.routing.DiMaxPropStrategy ->
+                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
                 else ->
-                    strategySelector.rankForForwarding(snapshot, peerId).map { it.message.id }.toSet()
+                    active.rankForForwarding(snapshot, peerId).map { it.message.id }.toSet()
             }
         } catch (e: Exception) {
             Log.e(TAG, "rankForForwarding threw, falling back to unfiltered", e)
@@ -679,7 +762,20 @@ class DtnOrchestrator @Inject constructor(
 
         // Active routing algorithm name — stamped onto each forward for the lifecycle feed and
         // the message-details view so it's clear which strategy made the decision.
-        val strat = strategySelector.name
+        val strat = active.name
+
+        // The saved "why" for handing a bundle to this peer as a carrier, with the numbers used.
+        fun carrierDecision(msg: DtnMessage): String = runCatching {
+            when (active) {
+                is com.dtn.mesh.routing.ProphetStrategy -> active.explain(msg, peerId, onlinePeerIds)
+                is com.dtn.mesh.routing.MaxPropStrategy -> active.explain(msg, peerId, onlinePeerIds)
+                is com.dtn.mesh.routing.DiMaxPropStrategy -> active.explain(msg, peerId, onlinePeerIds)
+                is com.dtn.mesh.routing.QLearningStrategy -> qNotes[msg.id].orEmpty()
+                is com.dtn.mesh.routing.EpidemicStrategy ->
+                    "EPIDEMIC · every carrier met gets a copy (hop limit 10)\nDecision: copy to ${peerId.value.takeLast(8)}"
+                else -> ""
+            }
+        }.getOrDefault("")
 
         var sentCount = 0
         for (msg in snapshot) {
@@ -764,6 +860,15 @@ class DtnOrchestrator @Inject constructor(
             // it never shows up as mystery "broadcast messages in transit".
             if (msg.messageType != DtnMessageType.DATA) {
                 lifecycle.console("CTRL ${msg.messageType.name} ${msg.id.take(8)} → $peer8 via ${path.label}")
+                // A direct announce handed to its own contact (straight, through our hub, or over
+                // the relay while they're present) has done its job: no receipt comes back for
+                // control traffic, so drop it instead of re-sending it every 30 s until it expires.
+                if (msg.messageType == DtnMessageType.ANNOUNCE && isDirectDelivery &&
+                    (path.reachesTargetDirectly || path == SendPath.HUB_LOCAL || path == SendPath.INTERNET)
+                ) {
+                    runCatching { queueManager.markDelivered(msg.id) }
+                    forgetSentTo(msg.id)
+                }
                 continue
             }
 
@@ -824,6 +929,9 @@ class DtnOrchestrator @Inject constructor(
                         dest = msg.destinationNodeId.value, me = myId,
                         nextHop = peerId.value, delivered = true, strategy = strat,
                         path = path.label, channel = msg.channel,
+                        decision = "The destination ${msg.destinationNodeId.value.takeLast(8)} was in range: " +
+                            "delivered straight over ${path.label}. No routing decision was needed " +
+                            "($strat was selected).",
                     )
                     Log.d(TAG, "DELIVERED-DIRECT: ${msg.id.take(8)} → $peer8 via ${path.label}")
                 }
@@ -857,11 +965,24 @@ class DtnOrchestrator @Inject constructor(
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
                         extra = "$how · awaiting receipt [$strat]")
+                    val decision = when {
+                        path == SendPath.HUB_LOCAL ->
+                            "The destination ${peer8} is on the same LoRa hub as this phone: handed to the " +
+                                "hub, which passes it straight on. Not an algorithm decision."
+                        peerIsHub ->
+                            "Handed to LoRa hub $peer8: the hub floods it over LoRa to other hubs and gives " +
+                                "it to the destination's phone when it connects. Hub hand-offs skip the " +
+                                "routing algorithm ($strat was selected)."
+                        isDirectDelivery ->
+                            "No direct link to ${peer8}: sent toward it via ${path.label} " +
+                                "(the hub floods it). Not an algorithm decision."
+                        else -> carrierDecision(msg)
+                    }
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = msg.destinationNodeId.value, me = myId,
                         nextHop = peerId.value, delivered = false, strategy = strat,
-                        path = path.label, channel = msg.channel,
+                        path = path.label, channel = msg.channel, decision = decision,
                     )
                     Log.d(TAG, "RELAYED: ${msg.id.take(8)} → $peer8 via ${path.label}")
                 }
@@ -1009,10 +1130,18 @@ class DtnOrchestrator @Inject constructor(
             // tables (a blackhole attack) or rebind another node's identity.
             val via = packet.viaPeer
             if (via != null && via == msg.originNodeId) {
+                // The tag isn't on the wire: a DiMaxProp summary is recognised by its first byte
+                // (sent by DiMaxProp and Q-learning phones); anything else is read as our own
+                // strategy's format, as before.
+                val tag = if (com.dtn.mesh.routing.DiMaxPropStrategy.isSummary(msg.payloadBytes)) {
+                    com.dtn.mesh.routing.DiMaxPropStrategy.TAG
+                } else {
+                    strategySelector.name
+                }
                 runCatching {
                     strategySelector.onRoutingSummaryReceived(
                         peerId = msg.originNodeId,
-                        summary = RoutingSummary(strategyTag = strategySelector.name, payload = msg.payloadBytes),
+                        summary = RoutingSummary(strategyTag = tag, payload = msg.payloadBytes),
                     )
                     Log.d(TAG, "ROUTING-SUMMARY-IN from ${msg.originNodeId.value.takeLast(8)}")
                 }.onFailure { Log.w(TAG, "routing-summary decode failed from ${msg.originNodeId.value}", it) }
@@ -1025,7 +1154,17 @@ class DtnOrchestrator @Inject constructor(
         // ANNOUNCE: a signed identity/key broadcast. Verify + pin the peer's keys (TOFU), then
         // let it keep flooding so keys propagate across the mesh.
         if (msg.messageType.isAnnounce) {
-            if (!processAnnounce(msg)) return
+            // A direct announce (Discover off on the sender) travels like a DM: only the phone it is
+            // addressed to pins the keys; carriers just pass it on without learning who it is.
+            val announceForMe = me != null && msg.destinationNodeId == me
+            val announceForAll = msg.destinationNodeId == NodeId.BROADCAST
+            if (announceForMe || announceForAll) {
+                if (!processAnnounce(msg)) return
+            }
+            if (announceForMe) {
+                lifecycle.console("ANNOUNCE (direct) from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — keys pinned")
+                return
+            }
             val stored = queueManager.ingest(msg)
             // The peer that handed it to us already has it — don't push it straight back.
             packet.viaPeer?.let { markSentTo(msg.id, it.value) }
@@ -1076,6 +1215,8 @@ class DtnOrchestrator @Inject constructor(
                 }
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // propagate an end-to-end receipt
+                // Someone who messages us is a contact from now on (e.g. they added us by QR).
+                runCatching { contactDao.markAdded(msg.originNodeId.value) }
                 rememberTombstone(msg.id, msg.originNodeId.value, msg.destinationNodeId.value,
                     SeenBundleEntity.Status.DELIVERED, msg.createdAtMs + msg.ttlMs)
                 benchmark.recordDelivery(strategySelector.name, msg.hopCount,
@@ -1091,6 +1232,7 @@ class DtnOrchestrator @Inject constructor(
                     msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
                     me = transport.localNodeId?.value ?: "", delivered = true, path = via,
+                    senderStrategy = senderAlgorithm.remove(msg.id.take(8)).orEmpty(),
                 )
                 lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id, extra = "delivery receipt queued for the sender")
                 Log.d(TAG, "RX-MINE: ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}")
@@ -1211,13 +1353,24 @@ class DtnOrchestrator @Inject constructor(
             return false
         }
         if (msg.fragmentTotal <= 1) {
-            persistInboundChat(msg.id, msg.channel, convKey, peer, String(bytes, Charsets.UTF_8))
+            persistInboundChat(msg.id, msg.channel, convKey, peer, text(msg, bytes))
             return true
         }
         val parentKey = com.dtn.mesh.crypto.Fragmenter.canonicalParent(msg.id)
         val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return true
-        persistInboundChat(parentKey, msg.channel, convKey, peer, String(full, Charsets.UTF_8))
+        persistInboundChat(parentKey, msg.channel, convKey, peer, text(msg, full))
         return true
+    }
+
+    /**
+     * The text of a decrypted message. A DM starts with the sender's routing-algorithm byte
+     * ([com.dtn.mesh.routing.AlgorithmCode]); it is noted for the route record and removed.
+     */
+    private fun text(msg: DtnMessage, plain: ByteArray): String {
+        if (msg.destinationNodeId == NodeId.BROADCAST) return String(plain, Charsets.UTF_8)
+        val (algorithm, body) = com.dtn.mesh.routing.AlgorithmCode.split(plain)
+        if (algorithm != null) senderAlgorithm[msg.id.take(8)] = algorithm
+        return String(body, Charsets.UTF_8)
     }
 
     /** Persist a decrypted inbound message into the user-visible chat log (dedup-by-id via REPLACE). */
@@ -1297,14 +1450,18 @@ class DtnOrchestrator @Inject constructor(
                 d.stateRssiNorm, d.stateSnrNorm, d.stateEncounterFrequency,
                 d.stateEncounterDuration, d.stateDeliveryProbability, d.stateRemainingTtlFraction,
                 d.stateBufferOccupancy, d.stateHistoricalSuccessRate, d.stateDuplicateCountNorm,
+                diMaxPropCost = d.stateDiMaxPropCost, hopCountNorm = d.stateHopCountNorm,
+                relayBufferOccupancy = d.stateRelayBuffer,
             )
             val reward = d.reward ?: continue
-            qEngine.update(state, ForwardingAction.valueOf(d.action), reward, nextState = null)
+            val action = runCatching { ForwardingAction.valueOf(d.action) }.getOrNull() ?: continue
+            qEngine.update(state, action, reward, nextState = null)
             applied.add(d.id)
         }
         // Mark consumed so getPendingUpdates() doesn't hand them back next cycle (which would
         // over-train the engine on the same experiences).
         if (applied.isNotEmpty()) runCatching { decisionDao.markApplied(applied) }
+        if (applied.isNotEmpty()) scheduleQSave()
         if (applied.isNotEmpty()) lifecycle.console("Q-LEARNING: applied ${applied.size} reward updates " +
             "(ε=%.3f, updates=${qEngine.totalUpdates})".format(qEngine.currentEpsilon))
     }
@@ -1314,12 +1471,14 @@ class DtnOrchestrator @Inject constructor(
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Build the 9-feature [ForwardingState] for deciding whether to forward [msg] to [peer].
-     * All features are normalised to [0,1]. Pulls per-peer stats from the contacts table and
-     * live buffer occupancy — data only the orchestrator has, which is why the Q decision lives
-     * here rather than inside [QLearningStrategy].
+     * Build the 12-feature [ForwardingState] for deciding whether to forward [msg] to [peer]: the 9
+     * link/peer features plus the DiMaxProp paper's three (§VI-A) — the relay's DiMaxProp cost to
+     * the destination ([peerCost], +∞ when it knows no path), the bundle's hop count, and the
+     * relay's reported buffer occupancy. All features are normalised to [0,1]. Pulls per-peer stats
+     * from the contacts table and live buffer occupancy — data only the orchestrator has, which is
+     * why the Q decision lives here rather than inside [QLearningStrategy].
      */
-    private suspend fun buildForwardingState(msg: DtnMessage, peer: NodeId): ForwardingState {
+    private suspend fun buildForwardingState(msg: DtnMessage, peer: NodeId, peerCost: Double): ForwardingState {
         val c = runCatching { contactDao.getByNodeId(peer.value) }.getOrNull()
         // Feed the CANONICAL PROPHET predictability (not the active strategy's) — under Q-learning
         // the active strategy's getDeliveryProbability is a constant 0.5 stub, which starved this
@@ -1337,52 +1496,133 @@ class DtnOrchestrator @Inject constructor(
             deliverySuccessCount = c?.deliverySuccessCount ?: 0,
             deliveryAttemptCount = c?.deliveryAttemptCount ?: 0,
             duplicateCount = msg.duplicateCount,
+            diMaxPropCost = peerCost,
+            hopCount = msg.hopCount,
+            relayBufferOccupancy = strategySelector.diMaxProp.peerBufferOccupancy(peer.value),
         )
     }
 
     /**
-     * Q-learning relay decision for [peerId] over [snapshot]. For each relay candidate it builds
-     * the state, asks the Double-Q engine (ε-greedy) whether to FORWARD, and records a
-     * [ForwardingDecisionEntity] for later reward backfill + batch training. Direct delivery and
-     * broadcast are always approved (they aren't relay decisions). Recording is throttled per
-     * (message, peer) so the table doesn't flood on every 4s flush.
+     * Q-learning relay decision for [peerId] over [snapshot] (DiMaxProp paper §VI).
+     *
+     * For each bundle it could hand to this carrier it builds the 12-feature state and asks the
+     * Double-Q engine (ε-greedy) whether to FORWARD:
+     * - the choice is kept for [SEND_RETRY_INTERVAL_MS] per (bundle, carrier), so the forward that
+     *   actually happens is the decision that gets recorded and rewarded;
+     * - in a state the engine has never been rewarded in (both values equal) it takes the DiMaxProp
+     *   rule's choice, so a fresh table starts from a sensible policy instead of "never forward";
+     * - a FORWARD earns the immediate progress reward η·(C(A,D) − C(B,D)) (eq. 13), applied on the
+     *   event loop; the delivered / expired outcome rewards follow when known, as before.
+     * Each fresh decision is recorded as a [ForwardingDecisionEntity] (research export + reward
+     * backfill) and its reasoning goes into [notes] for Message info. Direct delivery and broadcast
+     * are always approved (they aren't relay decisions).
      */
-    private suspend fun qDecisionApproved(snapshot: List<DtnMessage>, peerId: NodeId): Set<String> {
+    private suspend fun qDecisionApproved(
+        snapshot: List<DtnMessage>,
+        peerId: NodeId,
+        onlinePeerIds: Set<String>,
+        notes: MutableMap<String, String>,
+    ): Set<String> {
         val approved = mutableSetOf<String>()
         val now = System.currentTimeMillis()
         val toRecord = mutableListOf<ForwardingDecisionEntity>()
+        val shaping = mutableListOf<Pair<ForwardingState, Double>>()
+        val dmp = strategySelector.diMaxProp
+        val peer = peerId.value
+        if (qChoice.size > 4_000) qChoice.entries.removeAll { now - it.value.atMs > 2 * SEND_RETRY_INTERVAL_MS }
         for (msg in snapshot) {
             if (msg.hopCount >= 10) continue
-            if (msg.destinationNodeId == NodeId.BROADCAST || msg.destinationNodeId.value == peerId.value) {
+            if (msg.destinationNodeId == NodeId.BROADCAST || msg.destinationNodeId.value == peer) {
                 approved.add(msg.id) // handled as broadcast/direct by the send loop
                 continue
             }
-            val state = buildForwardingState(msg, peerId)
-            val (action, exploratory) = qEngine.selectActionEpsilonGreedy(state)
-            if (action == ForwardingAction.FORWARD) approved.add(msg.id)
-
-            // Throttle decision logging to once per (msg,peer) per retry interval.
-            val logKey = "${msg.id}|${peerId.value}"
-            if (now - (qLogged[logKey] ?: 0L) >= SEND_RETRY_INTERVAL_MS) {
-                qLogged[logKey] = now
-                toRecord.add(ForwardingDecisionEntity(
-                    timestampMs = now, messageId = msg.id, peerNodeId = peerId.value,
-                    stateRssiNorm = state.rssiNorm, stateSnrNorm = state.snrNorm,
-                    stateEncounterFrequency = state.encounterFrequency,
-                    stateEncounterDuration = state.encounterDuration,
-                    stateDeliveryProbability = state.deliveryProbability,
-                    stateRemainingTtlFraction = state.remainingTtlFraction,
-                    stateBufferOccupancy = state.bufferOccupancy,
-                    stateHistoricalSuccessRate = state.historicalSuccessRate,
-                    stateDuplicateCountNorm = state.duplicateCountNorm,
-                    action = action.name, qValueSelected = qEngine.computeUtility(state),
-                    epsilon = qEngine.currentEpsilon, wasExploratory = exploratory,
-                    routingStrategy = "Q-LEARNING",
-                ))
+            // Bundles the send loop never hands to this carrier anyway (its own, or the one it gave
+            // us): deciding on them would only record decisions that never take effect.
+            if (msg.originNodeId.value == peer || receivedFrom[msg.id] == peer) continue
+            // Control traffic (a direct announce for someone else) never gets a delivery receipt,
+            // so learning from it would only ever teach "expired". The DiMaxProp rule carries it.
+            if (msg.messageType != DtnMessageType.DATA) {
+                val v = strategySelector.diMaxProp.decide(msg.destinationNodeId.value, peer, onlinePeerIds).verdict
+                if (v != DiMaxPropStrategy.Verdict.HOLD) approved.add(msg.id)
+                continue
             }
+
+            val key = "${msg.id}|$peer"
+            val kept = qChoice[key]?.takeIf { now - it.atMs < SEND_RETRY_INTERVAL_MS }
+            if (kept != null) {
+                if (kept.action == ForwardingAction.FORWARD) approved.add(msg.id)
+                notes[msg.id] = kept.note
+                continue
+            }
+
+            val dest = msg.destinationNodeId.value
+            val dm = dmp.decide(dest, peer, onlinePeerIds)
+            val state = buildForwardingState(msg, peerId, dm.theirs.cost)
+            val prior = if (dm.verdict == DiMaxPropStrategy.Verdict.HOLD) ForwardingAction.STORE else ForwardingAction.FORWARD
+            val (qf, qs) = qEngine.qValues(state)
+            val (action, exploratory) = qEngine.selectActionEpsilonGreedy(state, tieBreak = prior)
+            val reward = if (action == ForwardingAction.FORWARD) progressReward(dm.mine, dm.theirs) else null
+            val note = qNote(state, qf, qs, action, exploratory, dm, reward, dest)
+            qChoice[key] = QChoice(action, exploratory, now, note)
+            notes[msg.id] = note
+            if (action == ForwardingAction.FORWARD) approved.add(msg.id)
+            if (reward != null) shaping += state to reward
+
+            toRecord.add(ForwardingDecisionEntity(
+                timestampMs = now, messageId = msg.id, peerNodeId = peer,
+                stateRssiNorm = state.rssiNorm, stateSnrNorm = state.snrNorm,
+                stateEncounterFrequency = state.encounterFrequency,
+                stateEncounterDuration = state.encounterDuration,
+                stateDeliveryProbability = state.deliveryProbability,
+                stateRemainingTtlFraction = state.remainingTtlFraction,
+                stateBufferOccupancy = state.bufferOccupancy,
+                stateHistoricalSuccessRate = state.historicalSuccessRate,
+                stateDuplicateCountNorm = state.duplicateCountNorm,
+                stateDiMaxPropCost = state.diMaxPropCost,
+                stateHopCountNorm = state.hopCountNorm,
+                stateRelayBuffer = state.relayBufferOccupancy,
+                action = action.name, qValueSelected = qEngine.computeUtility(state),
+                epsilon = qEngine.currentEpsilon, wasExploratory = exploratory,
+                routingStrategy = "Q-LEARNING", shapingReward = reward,
+            ))
         }
         if (toRecord.isNotEmpty()) runCatching { decisionDao.insertAll(toRecord) }
+        if (shaping.isNotEmpty()) eventChannel?.trySend(OrchestratorEvent.QShaping(shaping))
         return approved
+    }
+
+    /**
+     * DiMaxProp progress reward η·(C(A,D) − C(B,D)) (paper eq. 13): positive when the bundle moves
+     * to a relay that is closer, in DiMaxProp cost, to its destination. A side that knows no path
+     * counts as [UNREACHABLE_COST] away; null when neither knows one (nothing to measure).
+     */
+    private fun progressReward(mine: DiMaxPropStrategy.Path, theirs: DiMaxPropStrategy.Path): Double? {
+        if (!mine.reachable && !theirs.reachable) return null
+        val a = if (mine.reachable) mine.cost.coerceAtMost(UNREACHABLE_COST) else UNREACHABLE_COST
+        val b = if (theirs.reachable) theirs.cost.coerceAtMost(UNREACHABLE_COST) else UNREACHABLE_COST
+        return shapingEta * (a - b)
+    }
+
+    /** Q-learning's reasoning for one decision, saved with the forward for Message info. */
+    private fun qNote(
+        s: ForwardingState, qf: Double, qs: Double, action: ForwardingAction, exploratory: Boolean,
+        dm: DiMaxPropStrategy.Decision, reward: Double?, dest: String,
+    ): String {
+        fun cost(p: DiMaxPropStrategy.Path) = if (p.reachable) "%.2f".format(p.cost) else "no path"
+        return buildString {
+            appendLine("Q-LEARNING · ε %.2f · %s".format(qEngine.currentEpsilon,
+                if (exploratory) "explored (random pick)" else "greedy on (Q_A+Q_B)/2"))
+            appendLine("Q(forward) %.3f · Q(hold) %.3f".format(qf, qs) +
+                if (qf == qs && !exploratory) " · state not learned yet: DiMaxProp rule decides" else "")
+            appendLine("DiMaxProp cost to ${dest.takeLast(8)}: mine ${cost(dm.mine)} · carrier ${cost(dm.theirs)}")
+            appendLine("Inputs: rssi %.2f · enc %.2f · dur %.2f · P %.2f · ttl %.2f · buf %.2f · succ %.2f · dup %.2f"
+                .format(s.rssiNorm, s.encounterFrequency, s.encounterDuration, s.deliveryProbability,
+                    s.remainingTtlFraction, s.bufferOccupancy, s.historicalSuccessRate, s.duplicateCountNorm))
+            appendLine("        cost %.2f · hops %.2f · relay buffer %.2f"
+                .format(s.diMaxPropCost, s.hopCountNorm, s.relayBufferOccupancy))
+            if (reward != null) appendLine("Progress reward η·(C_mine − C_carrier) = %+.3f".format(reward))
+            append("Decision: ${if (action == ForwardingAction.FORWARD) "forward" else "hold"}")
+        }
     }
 
     /**

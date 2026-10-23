@@ -492,6 +492,7 @@ class BleTransportAdapter @Inject constructor(
             timestampMs = now,
             isOnline = true,
             shortName = "BLE",
+            transport = TransportKind.BLE,
         ))
     }
 
