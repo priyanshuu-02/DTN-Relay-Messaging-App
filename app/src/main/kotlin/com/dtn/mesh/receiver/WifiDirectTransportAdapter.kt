@@ -73,7 +73,25 @@ class WifiDirectTransportAdapter @Inject constructor(
     @ApplicationContext private val context: Context,
     private val identity: com.dtn.mesh.model.LocalNodeIdentity,
     private val hints: WifiDirectHints,
+    private val diagnostics: com.dtn.mesh.service.DiagnosticsLog,
 ) : DtnTransport {
+
+    private fun diag(level: com.dtn.mesh.service.DiagLevel, text: String) =
+        diagnostics.log(level, com.dtn.mesh.service.DiagSource.WIFID, text)
+    private fun diagInfo(text: String) = diag(com.dtn.mesh.service.DiagLevel.INFO, text)
+    private fun diagWarn(text: String) = diag(com.dtn.mesh.service.DiagLevel.WARN, text)
+
+    /** When this phone started looking for a group (0 = linked, or not running): time-to-link. */
+    @Volatile private var searchStartedMs = 0L
+
+    /** Logs how long it took from starting to search to the first linked phone, once per search. */
+    private fun logTimeToLink(peer8: String) {
+        val started = searchStartedMs
+        if (started <= 0L) return
+        searchStartedMs = 0L
+        diagInfo("Time to link: %.1f s (first phone %s, as %s)"
+            .format((System.currentTimeMillis() - started) / 1000.0, peer8, role.name.lowercase()))
+    }
 
     companion object {
         private const val TAG = "WifiDirectTransport"
@@ -91,10 +109,20 @@ class WifiDirectTransportAdapter @Inject constructor(
         private const val FAST_PHASE_MS = 15_000L
         /** A phone / group not heard for this long is forgotten. */
         private const val SEEN_TTL_MS = 45_000L
-        /** Joining or creating a group that hasn't formed by now is abandoned. */
-        private const val FORM_TIMEOUT_MS = 30_000L
+        /**
+         * Joining a group that hasn't formed by now is abandoned and tried again. Joins that work take
+         * 1–6 s; a silent failure used to wait out 30 s (fix 2, `_diag/fix2_report.md`).
+         */
+        private const val JOIN_TIMEOUT_MS = 12_000L
+        /** Creating a group that hasn't formed by now is abandoned (it takes under a second). */
+        private const val CREATE_TIMEOUT_MS = 15_000L
         /** A group we failed to join is skipped for this long, then tried again. */
-        private const val FAILED_GROUP_BACKOFF_MS = 8_000L
+        private const val FAILED_GROUP_BACKOFF_MS = 2_000L
+        /**
+         * A new group's owner doesn't scan for this long: discovery takes its radio off the group's
+         * channel, right when the phone that triggered the election is trying to join.
+         */
+        private const val OWNER_QUIET_MS = 20_000L
         /** No HELLO/DATA from a linked phone for this long → offline. */
         private const val PEER_STALE_THRESHOLD_MS = 30_000L
         /** HELLO heartbeats (and the owner's roster) cadence. */
@@ -144,6 +172,18 @@ class WifiDirectTransportAdapter @Inject constructor(
     @Volatile private var waitingSinceMs: Long? = null
     @Volatile private var idleSinceMs: Long? = null
     private val failedGroups = ConcurrentHashMap<String, Long>()
+    /**
+     * The password nonce of every group this phone creates: one per app run, so a group that is
+     * re-created (Wi-Fi Direct off / on, a merge) keeps its password and a join already under way on
+     * another phone still fits it. It was new per group, and joins with the old one never finished.
+     */
+    private val sessionNonce: Int = Random.nextInt().let { if (it == 0) 1 else it }
+    /** Operating frequency (MHz) of the group we own, 0 = unknown: advertised so joiners scan only that channel. */
+    @Volatile private var ownFrequencyMhz = 0
+    /** The frequency the join under way is restricted to (0 = every channel). */
+    @Volatile private var joinFrequencyMhz = 0
+    /** Owner hex → a frequency a join timed out on: the next try scans every channel. */
+    private val failedFrequency = ConcurrentHashMap<String, Int>()
     /** Groups / phones heard via Wi-Fi P2P service discovery (node hex → …). */
     private val sdGroups = ConcurrentHashMap<String, Group>()
     private val sdPhones = ConcurrentHashMap<String, Long>()
@@ -191,23 +231,51 @@ class WifiDirectTransportAdapter @Inject constructor(
     /** Check if a specific peer is reachable via WiFi Direct. */
     fun isPeerReachable(peerId: NodeId): Boolean = connectedPeers.containsKey(peerId.value)
 
+    /** When peer + service discovery last started (0 = not since Wi-Fi Direct started). */
+    val lastDiscoveryAtMs: Long get() = lastDiscoveryMs
+
+    /** Discovery runs this often while looking for a group, for the Wi-Fi Direct page's facts. */
+    val discoveryIntervalMs: Long get() = DISCOVERY_INTERVAL_MS
+
+    /**
+     * Refresh scan (Wi-Fi Direct page): look for DTN phones now instead of at the next interval.
+     * Only while searching (or owning an empty group): a linked phone doesn't scan, because
+     * discovery makes the radio hop channels and disturbs the group. @return whether it started.
+     */
+    fun rescan(): Boolean {
+        if (!running || p2pEnabled == false) return false
+        val searching = role == Role.SEARCHING || (role == Role.OWNER && connectedPeers.isEmpty())
+        if (!searching) return false
+        lastDiscoveryMs = System.currentTimeMillis()
+        diagInfo("Rescan requested: peer and service discovery started now")
+        startDiscovery()
+        return true
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     override suspend fun connect(): Boolean {
         if (!SUPPORTED) {
             Log.w(TAG, "Wi-Fi Direct groups need Android 10+ — not starting")
+            diagWarn("Not started: Wi-Fi Direct groups need Android 10+")
             _connectionState.value = MeshConnectionState.DISCONNECTED
             return false
         }
         if (running) return true
         val m = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager ?: run {
             Log.e(TAG, "WiFi P2P not supported on this device")
+            diag(com.dtn.mesh.service.DiagLevel.ERROR, "Not started: this phone has no Wi-Fi P2P")
             _connectionState.value = MeshConnectionState.DISCONNECTED
             return false
         }
         Log.i(TAG, "Starting Wi-Fi Direct (groups, no invitations)")
+        diagInfo("Starting: searching for a DTN group (no invitations)")
+        searchStartedMs = System.currentTimeMillis()
         manager = m
-        channel = m.initialize(context, context.mainLooper) { Log.w(TAG, "Wi-Fi P2P channel lost") }
+        channel = m.initialize(context, context.mainLooper) {
+            Log.w(TAG, "Wi-Fi P2P channel lost")
+            diagWarn("Wi-Fi P2P channel lost")
+        }
         return try {
             running = true
             p2pEnabled = null
@@ -226,10 +294,12 @@ class WifiDirectTransportAdapter @Inject constructor(
             true
         } catch (e: SecurityException) {
             Log.e(TAG, "Wi-Fi Direct permission missing: ${e.message}")
+            diag(com.dtn.mesh.service.DiagLevel.ERROR, "Start failed: Nearby devices / location permission missing")
             disconnect()
             false
         } catch (e: Exception) {
             Log.e(TAG, "Wi-Fi Direct startup failed: ${e.message}", e)
+            diag(com.dtn.mesh.service.DiagLevel.ERROR, "Start failed: ${e.javaClass.simpleName} ${e.message.orEmpty()}")
             disconnect()
             false
         }
@@ -237,6 +307,8 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     override fun disconnect() {
         Log.i(TAG, "Stopping Wi-Fi Direct")
+        if (running) diagInfo("Stopped (was ${role.name.lowercase()})")
+        searchStartedMs = 0L
         running = false
         runCatching { loopJob?.cancel() }; loopJob = null
         dropGroupPeers()
@@ -254,7 +326,7 @@ class WifiDirectTransportAdapter @Inject constructor(
         runCatching { serverSocket?.close() }; serverSocket = null
         hints.setLocal(WifiDirectHints.Local())
         hints.clear()
-        sdGroups.clear(); sdPhones.clear(); failedGroups.clear()
+        sdGroups.clear(); sdPhones.clear(); failedGroups.clear(); failedFrequency.clear()
         advertisedTxt = null
         clearGroup()
         role = Role.SEARCHING
@@ -263,7 +335,15 @@ class WifiDirectTransportAdapter @Inject constructor(
     }
 
     private fun setRole(r: Role) {
-        if (role != r) Log.i(TAG, "Role: $role → $r")
+        if (role != r) {
+            Log.i(TAG, "Role: $role → $r")
+            if (running) diagInfo("Role: ${role.name.lowercase()} → ${r.name.lowercase()}")
+            // A group ended and we look again: the next first link measures time-to-link afresh.
+            // (A failed join / create keeps the original start, so retries count toward it.)
+            if (r == Role.SEARCHING && (role == Role.OWNER || role == Role.MEMBER)) {
+                searchStartedMs = System.currentTimeMillis()
+            }
+        }
         role = r
         roleSinceMs = System.currentTimeMillis()
         if (r != Role.SEARCHING) waitingSinceMs = null
@@ -272,6 +352,7 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     private fun clearGroup() {
         groupOwnerHex = null; groupName = null; groupPassphrase = null; ownNonce = null; groupOwnerAddress = null
+        ownFrequencyMhz = 0; joinFrequencyMhz = 0
     }
 
     // ── Decision loop ────────────────────────────────────────────────────
@@ -285,7 +366,8 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     /** A group is forming or being joined, or we just joined and the owner doesn't know us yet. */
     private fun inFastPhase(now: Long): Boolean = when (role) {
-        Role.JOINING, Role.CREATING -> true
+        // Searching too: a group heard over BLE is joined within a second, not at the next 3 s tick.
+        Role.SEARCHING, Role.JOINING, Role.CREATING -> true
         Role.MEMBER -> !ownerLinked() && now - roleSinceMs < FAST_PHASE_MS
         else -> false
     }
@@ -297,18 +379,33 @@ class WifiDirectTransportAdapter @Inject constructor(
 
         // Look around while we have no group (or own an empty one). Members and owners with
         // members don't scan: discovery makes the radio hop channels and disturbs the group.
-        val wantDiscovery = role == Role.SEARCHING || (role == Role.OWNER && connectedPeers.isEmpty())
+        // A new owner stays on its channel for a while (the phone that made it create is joining).
+        val wantDiscovery = role == Role.SEARCHING ||
+            (role == Role.OWNER && connectedPeers.isEmpty() && now - roleSinceMs >= OWNER_QUIET_MS)
         if (wantDiscovery && now - lastDiscoveryMs >= DISCOVERY_INTERVAL_MS) {
             lastDiscoveryMs = now
             startDiscovery()
         }
 
+        // Joining with credentials the owner no longer uses (it re-created or stopped its group).
+        if (role == Role.JOINING) checkJoin(now)
+
         // A join / create that never formed a group: give up and look again.
-        if ((role == Role.JOINING || role == Role.CREATING) && now - roleSinceMs > FORM_TIMEOUT_MS) {
-            Log.w(TAG, "${if (role == Role.JOINING) "Joining $groupOwnerHex" else "Creating a group"} timed out")
-            groupOwnerHex?.let { if (role == Role.JOINING) failedGroups[it] = now + FAILED_GROUP_BACKOFF_MS }
+        val formTimeout = if (role == Role.JOINING) JOIN_TIMEOUT_MS else CREATE_TIMEOUT_MS
+        if ((role == Role.JOINING || role == Role.CREATING) && now - roleSinceMs > formTimeout) {
+            val owner = groupOwnerHex
+            val onFreq = joinFrequencyMhz
+            Log.w(TAG, "${if (role == Role.JOINING) "Joining $owner" else "Creating a group"} timed out")
+            diagWarn("${if (role == Role.JOINING) "Joining ${owner?.takeLast(8)}'s group" else "Creating a group"} " +
+                "timed out after ${(now - roleSinceMs) / 1000} s" +
+                if (role == Role.JOINING && onFreq > 0) " on $onFreq MHz — trying again on every channel" else " — trying again")
+            if (role == Role.JOINING && owner != null) {
+                failedGroups[owner] = now + FAILED_GROUP_BACKOFF_MS
+                if (onFreq > 0) failedFrequency[owner] = onFreq
+            }
             runCatching { manager?.cancelConnect(channel, null) }
-            if (role == Role.CREATING) runCatching { manager?.removeGroup(channel, null) }
+            // A half-formed group (or group client) would make the next attempt fail as busy.
+            runCatching { manager?.removeGroup(channel, null) }
             clearGroup()
             setRole(Role.SEARCHING)
         }
@@ -324,7 +421,12 @@ class WifiDirectTransportAdapter @Inject constructor(
         val groups = freshGroups(now)
         val phones = freshPhones(now, groups)
         if (role == Role.SEARCHING) {
-            waitingSinceMs = if (phones.any { it < myHex }) (waitingSinceMs ?: now) else null
+            val lower = phones.filter { it < myHex }.minOrNull()
+            if (lower != null && waitingSinceMs == null && groups.isEmpty()) {
+                diagInfo("Waiting up to ${WifiDirectGroupPolicy.CREATE_WAIT_MS / 1000} s for ${lower.takeLast(8)} " +
+                    "(lower node id) to create the group")
+            }
+            waitingSinceMs = if (lower != null) (waitingSinceMs ?: now) else null
         }
         if (role == Role.OWNER) {
             idleSinceMs = if (connectedPeers.isEmpty()) (idleSinceMs ?: now) else null
@@ -335,10 +437,13 @@ class WifiDirectTransportAdapter @Inject constructor(
             Action.Create -> createGroup()
             is Action.LeaveAndJoin -> {
                 Log.i(TAG, "Merging: leaving our empty group for ${a.group.ownerHex}'s")
+                diagInfo("Merging: leaving our empty group for ${a.group.ownerHex.takeLast(8)}'s " +
+                    "(${a.group.members} member(s))")
                 leaveGroup { join(a.group) }
             }
             Action.Disband -> {
                 Log.i(TAG, "Nobody joined our group — giving it up")
+                diagInfo("Disbanding our group: nobody joined and nobody is around")
                 leaveGroup { }
             }
         }
@@ -347,17 +452,52 @@ class WifiDirectTransportAdapter @Inject constructor(
         publishLinkInfo()
     }
 
-    /** DTN groups nearby: from BLE hints (derived credentials) and service discovery (explicit). */
-    private fun freshGroups(now: Long): List<Group> {
-        failedGroups.entries.removeAll { it.value < now }
+    /**
+     * Every DTN group nearby, newest sighting per owner: from BLE hints (derived credentials) and
+     * service discovery (explicit). A sighting without a frequency borrows the other source's.
+     */
+    private fun groupsNearby(now: Long): Map<String, Group> {
         val fromBle = hints.recent(now, SEEN_TTL_MS).filter { it.active && it.owner }.map {
-            Group(it.nodeHex, WifiDirectHints.networkName(it.nodeHex), WifiDirectHints.passphrase(it.nodeHex, it.nonce), it.members, it.seenAtMs)
+            Group(it.nodeHex, WifiDirectHints.networkName(it.nodeHex), WifiDirectHints.passphrase(it.nodeHex, it.nonce), it.members,
+                it.seenAtMs, WifiDirectHints.frequencyOf(it.channel))
         }
         val fromSd = sdGroups.values.filter { now - it.seenAtMs <= SEEN_TTL_MS }
-        return (fromSd + fromBle)
-            .groupBy { it.ownerHex }
-            .map { (_, list) -> list.maxBy { it.seenAtMs } }
+        return (fromSd + fromBle).groupBy { it.ownerHex }.mapValues { (_, list) ->
+            val newest = list.maxBy { it.seenAtMs }
+            if (newest.frequencyMhz > 0) newest
+            else newest.copy(frequencyMhz = list.firstOrNull { it.frequencyMhz > 0 && it.passphrase == newest.passphrase }?.frequencyMhz ?: 0)
+        }
+    }
+
+    /** Groups we could join now (not ours, not one we're in / joining, not one that just failed). */
+    private fun freshGroups(now: Long): List<Group> {
+        failedGroups.entries.removeAll { it.value < now }
+        return groupsNearby(now).values
             .filter { it.ownerHex != myHex && !failedGroups.containsKey(it.ownerHex) && it.ownerHex != groupOwnerHex }
+    }
+
+    /**
+     * While joining: the owner stopped running its group (start over and wait for it), or
+     * re-created it with another password (an app restart there): join again with the new one at
+     * once instead of waiting out the timeout with credentials that can never work.
+     */
+    private fun checkJoin(now: Long) {
+        val owner = groupOwnerHex ?: return
+        if (now - roleSinceMs < 1_000L) return
+        val hint = hints.recent(now, SEEN_TTL_MS).firstOrNull { it.nodeHex == owner }
+        if (hint != null && hint.seenAtMs > roleSinceMs && (!hint.active || (!hint.owner && sdGroups[owner] == null))) {
+            diagInfo("${owner.takeLast(8)} stopped running its group — stopped joining, waiting for it")
+            runCatching { manager?.cancelConnect(channel, null) }
+            clearGroup()
+            setRole(Role.SEARCHING)
+            return
+        }
+        val latest = groupsNearby(now)[owner] ?: return
+        if (latest.passphrase != groupPassphrase) {
+            diagInfo("${owner.takeLast(8)}'s group was re-created with a new password — joining it again")
+            runCatching { manager?.cancelConnect(channel, null) }
+            join(latest)
+        }
     }
 
     /** DTN phones nearby running Wi-Fi Direct that own no group (election candidates). */
@@ -377,16 +517,25 @@ class WifiDirectTransportAdapter @Inject constructor(
         groupName = group.networkName
         groupPassphrase = group.passphrase
         ownNonce = null
-        val config = WifiP2pConfig.Builder()
+        fun base() = WifiP2pConfig.Builder()
             .setNetworkName(group.networkName)
             .setPassphrase(group.passphrase)
             .enablePersistentMode(false)
-            .build()
-        Log.i(TAG, "Joining ${group.ownerHex}'s group ${group.networkName} (${group.members} member(s))")
+        // The owner's channel, when it advertised one (and it didn't just fail): the join scans only
+        // that channel instead of every 2.4 / 5 GHz one, which is most of the time a join takes.
+        val freq = group.frequencyMhz.takeIf { it > 0 && failedFrequency[group.ownerHex] != it } ?: 0
+        val onFreq = if (freq > 0) runCatching { base().setGroupOperatingFrequency(freq).build() }.getOrNull() else null
+        val config = onFreq ?: base().build()
+        joinFrequencyMhz = if (onFreq != null) freq else 0
+        val where = if (joinFrequencyMhz > 0) "on $joinFrequencyMhz MHz (its channel only)" else "(scanning every channel)"
+        Log.i(TAG, "Joining ${group.ownerHex}'s group ${group.networkName} $where (${group.members} member(s))")
+        diagInfo("Joining ${group.ownerHex.takeLast(8)}'s group ${group.networkName} $where: picked as the best visible " +
+            "group (${group.members} member(s); most members, then lowest owner id)")
         m.connect(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { Log.d(TAG, "Join request accepted by the framework") }
             override fun onFailure(reason: Int) {
                 Log.w(TAG, "Joining ${group.ownerHex} failed: reason=$reason")
+                diagWarn("Joining ${group.ownerHex.takeLast(8)}'s group failed: reason $reason")
                 failedGroups[group.ownerHex] = System.currentTimeMillis() + FAILED_GROUP_BACKOFF_MS
                 if (role == Role.JOINING) { clearGroup(); setRole(Role.SEARCHING) }
             }
@@ -397,7 +546,7 @@ class WifiDirectTransportAdapter @Inject constructor(
         val m = manager ?: return
         val ch = channel ?: return
         runCatching { m.stopPeerDiscovery(ch, null) }
-        val nonce = Random.nextInt().let { if (it == 0) 1 else it }
+        val nonce = sessionNonce
         val name = WifiDirectHints.networkName(myHex)
         val pass = WifiDirectHints.passphrase(myHex, nonce)
         setRole(Role.CREATING)
@@ -408,10 +557,12 @@ class WifiDirectTransportAdapter @Inject constructor(
             .enablePersistentMode(false)
             .build()
         Log.i(TAG, "Creating group $name")
+        diagInfo("Creating group $name (no group visible, so the lowest node id creates)")
         m.createGroup(ch, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { Log.d(TAG, "Group creation accepted by the framework") }
             override fun onFailure(reason: Int) {
                 Log.w(TAG, "Creating the group failed: reason=$reason")
+                diagWarn("Creating the group failed: reason $reason")
                 if (role == Role.CREATING) { clearGroup(); setRole(Role.SEARCHING) }
             }
         })
@@ -435,7 +586,11 @@ class WifiDirectTransportAdapter @Inject constructor(
     private fun advertise() {
         val members = if (role == Role.OWNER) connectedPeers.size else 0
         val ownsJoinable = role == Role.OWNER && ownNonce != null
-        hints.setLocal(WifiDirectHints.Local(active = running, ownerNonce = if (ownsJoinable) ownNonce else null, members = members))
+        // "Running" only while P2P is really on: a phone waiting for Wi-Fi can't create a group, and
+        // phones with a higher id used to wait for it at every election (fix 2).
+        hints.setLocal(WifiDirectHints.Local(active = running && p2pEnabled != false,
+            ownerNonce = if (ownsJoinable) ownNonce else null, members = members,
+            channel = if (ownsJoinable) WifiDirectHints.channelOf(ownFrequencyMhz) else 0))
 
         val txt = buildMap {
             put("v", "2")
@@ -444,6 +599,7 @@ class WifiDirectTransportAdapter @Inject constructor(
             val pass = groupPassphrase
             if (role == Role.OWNER && name != null && pass != null) {
                 put("g", name); put("k", pass); put("n", members.toString())
+                if (ownFrequencyMhz > 0) put("f", ownFrequencyMhz.toString())
             }
         }
         if (txt == advertisedTxt) return
@@ -459,6 +615,7 @@ class WifiDirectTransportAdapter @Inject constructor(
                     override fun onSuccess() { Log.d(TAG, "Advertised $txt") }
                     override fun onFailure(reason: Int) {
                         Log.w(TAG, "Advertising failed: reason=$reason")
+                        diagWarn("DNS-SD advertising failed: reason $reason (retried next tick)")
                         advertisedTxt = null // retried next tick
                     }
                 })
@@ -473,7 +630,10 @@ class WifiDirectTransportAdapter @Inject constructor(
             override fun onSuccess() { startServiceDiscovery(m, ch) }
             override fun onFailure(reason: Int) {
                 // BUSY (2) is normal while a group is forming.
-                if (reason == WifiP2pManager.BUSY) Log.d(TAG, "Peer discovery busy") else Log.w(TAG, "Peer discovery failed: reason=$reason")
+                if (reason == WifiP2pManager.BUSY) Log.d(TAG, "Peer discovery busy") else {
+                    Log.w(TAG, "Peer discovery failed: reason=$reason")
+                    diagWarn("Peer discovery failed: reason $reason")
+                }
             }
         })
     }
@@ -504,7 +664,8 @@ class WifiDirectTransportAdapter @Inject constructor(
         val g = txt["g"]
         val k = txt["k"]
         if (g != null && k != null) {
-            sdGroups[hex] = Group(hex, g, k, txt["n"]?.toIntOrNull() ?: 0, now)
+            sdGroups[hex] = Group(hex, g, k, txt["n"]?.toIntOrNull() ?: 0, now,
+                txt["f"]?.toIntOrNull()?.takeIf { it in 2400..7200 } ?: 0)
             sdPhones.remove(hex)
         } else {
             sdPhones[hex] = now
@@ -541,12 +702,14 @@ class WifiDirectTransportAdapter @Inject constructor(
             rosterDirty = true
             emitPeer(peerId, online = false)
             Log.d(TAG, "Peer stale (no activity): ${peerId.takeLast(8)}")
+            diagInfo("Member left: ${peerId.takeLast(8)} (no HELLO for 30 s)")
         }
     }
 
     /** Every phone reached over the (former) group goes offline. */
     private fun dropGroupPeers() {
         val ids = connectedPeers.keys.toList()
+        if (ids.isNotEmpty()) diagInfo("Group link gone: ${ids.size} phone(s) dropped")
         connectedPeers.clear()
         peerLastSeenMs.clear()
         peerRoles.clear()
@@ -666,6 +829,8 @@ class WifiDirectTransportAdapter @Inject constructor(
                 scope.launch { sendHello(remoteIp) }
                 advertise(); publishLinkInfo()
                 Log.i(TAG, "Linked with ${senderId.takeLast(8)} at $remoteIp")
+                diagInfo("Member linked: ${senderId.takeLast(8)} (${groupName ?: "group"})")
+                logTimeToLink(senderId.takeLast(8))
             }
 
             when {
@@ -696,6 +861,8 @@ class WifiDirectTransportAdapter @Inject constructor(
                     emitPeer(id, online = true)
                     publishLinkInfo()
                     Log.i(TAG, "Linked with ${id.takeLast(8)} at $ip (from the roster)")
+                    diagInfo("Member linked: ${id.takeLast(8)} (from the owner's roster)")
+                    logTimeToLink(id.takeLast(8))
                 }
             }
         }
@@ -744,6 +911,7 @@ class WifiDirectTransportAdapter @Inject constructor(
             pktId
         } catch (e: Exception) {
             Log.e(TAG, "Send failed to ${targetPeer.value}", e)
+            diagWarn("Send to ${targetPeer.value.takeLast(8)} failed: ${e.javaClass.simpleName}")
             null
         }
     }
@@ -778,13 +946,19 @@ class WifiDirectTransportAdapter @Inject constructor(
                     p2pEnabled = enabled
                     if (!enabled) {
                         Log.w(TAG, "Wi-Fi P2P is off — waiting for Wi-Fi")
+                        diagWarn("Wi-Fi P2P is off — waiting for Wi-Fi")
                         dropGroupPeers()
                         clearGroup()
                         setRole(Role.SEARCHING)
+                        // Nearby phones must not wait for us to create a group while we can't.
+                        hints.setLocal(WifiDirectHints.Local(active = false))
                     } else if (was == false) {
                         // Wi-Fi came back: the framework forgot our local service — advertise again
                         // and resume looking for a group straight away.
                         Log.i(TAG, "Wi-Fi P2P back on — searching again")
+                        diagInfo("Wi-Fi P2P back on — searching again")
+                        // The group was dropped when Wi-Fi went off: time-to-link counts from now.
+                        searchStartedMs = System.currentTimeMillis()
                         advertisedTxt = null
                         lastDiscoveryMs = 0L
                         advertise()
@@ -809,6 +983,7 @@ class WifiDirectTransportAdapter @Inject constructor(
                     groupOwnerHex = myHex
                     idleSinceMs = System.currentTimeMillis()
                     Log.i(TAG, "Group up — this phone owns it (${groupName ?: "?"})")
+                    diagInfo("Group created: this phone owns ${groupName ?: "?"}")
                 }
                 // A group we didn't create ourselves (e.g. accepted from an older build): learn its
                 // name + password from the framework so others can still join it.
@@ -816,6 +991,12 @@ class WifiDirectTransportAdapter @Inject constructor(
                     if (group != null && ownNonce == null) {
                         groupName = group.networkName
                         groupPassphrase = group.passphrase
+                    }
+                    // The group's channel goes into the BLE hint and the TXT record: joiners scan only it.
+                    val f = if (group != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) group.frequency else 0
+                    if (f > 0 && f != ownFrequencyMhz) {
+                        ownFrequencyMhz = f
+                        diagInfo("Our group runs on $f MHz (channel ${WifiDirectHints.channelOf(f)}): joiners scan only that channel")
                     }
                     advertise(); publishLinkInfo()
                 }
@@ -825,6 +1006,7 @@ class WifiDirectTransportAdapter @Inject constructor(
                 if (role != Role.MEMBER) {
                     setRole(Role.MEMBER)
                     Log.i(TAG, "Joined the group — owner at $groupOwnerAddress")
+                    diagInfo("Joined ${groupName ?: "the group"} as a member (owner ${groupOwnerHex?.takeLast(8) ?: "?"})")
                 }
                 ownNonce = null
                 groupOwnerAddress?.let { ip -> scope.launch { sendHello(ip) } }
@@ -832,6 +1014,7 @@ class WifiDirectTransportAdapter @Inject constructor(
             }
             role == Role.OWNER || role == Role.MEMBER -> {
                 Log.i(TAG, "The group ended")
+                diagInfo("Group ${groupName ?: ""} ended (was ${role.name.lowercase()})")
                 dropGroupPeers()
                 clearGroup()
                 setRole(Role.SEARCHING)

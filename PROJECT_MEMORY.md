@@ -1166,3 +1166,171 @@ Shrivastwa, Upadhyay), Message info must show the algorithm a message was actual
   Presence only: routing unchanged (the hub already floods every DM it can't hand over itself).
 - Known gap: a LoRa flood is sent once per hub; a frame lost to a collision isn't re-flooded when
   the phone re-sends (the hub already holds it), so that DM waits for the next hub session.
+
+---
+
+# PART L — 2026-10-24: UI redesign (Phases 1–6), one identity per phone, hub beacon v4
+
+User asks: describe every page's UI in the architecture docs, a simple status sheet in the chat with
+how a message travelled ("Received via BLE / Wi-Fi Direct / LoRa / Internet relay"), one identity per
+phone that survives a data clear, Available hubs from a hub Bluetooth beacon, then build it all and
+install once at the end. Spec: `docs/ui-redesign/` — `architecture.md` (v4), `visual-design.md`,
+`navigation.mmd`, `plan.md` (the locked decisions + phases). Per-phase reports: `_diag/phase1..6_report.md`
+(scratch, git-ignored). No Room schema change (DB stays v4: new state is DataStore), no new permission.
+
+## L.1 By phase
+- **P1 Shell + logging core.** `ui/theme` (DtnTheme / DtnColors / DtnType), bundled vector icons (39 by
+  P5, no icon library), `ui/components`; Navigation Compose 2.8.5 (pinned): one NavHost, tabs Network ·
+  Chats · Queue · Peers (start Network), status card + Connection links sheet. `service/DiagnosticsLog`
+  (level + source per line, 2,000-line ring, 2 MB rotating file, one writer thread) and the architecture
+  §8 lines (per-peer "held because…" flush summaries, Wi-Fi Direct time to link, GATT / MTU, relay
+  endpoints, presence, crypto failures, timing, Q-table saves).
+- **P2 Network, Chats, Chat, Peers, Contact.** Nearby devices + Add by QR; Chats search, All / Unread /
+  Groups (last-read times in DataStore), pinned Broadcast, New message sheet; chat page with status lines
+  and the simple status sheet; Peers (Contacts | Nearby devices + Discover); Contact page (safety-number
+  grid, routing scores); Delete contact; Block; one identity per phone (L.3).
+- **P3 Queue + message pages.** Pending / Forwarded / Delivered / History / Broadcasts & groups; Queued
+  message page (live routing math); Message page (status, route chain, saved decision, journey, Copy all,
+  Export event details to `cache/events/`).
+- **P4 Groups, identity, settings, links, beacon.** Groups / group page / Create group (optional members
+  → invite DMs → Join card; names ≤ 151 UTF-8 bytes); My Identity; First launch; Settings rewrite
+  (Privacy: Discover + Blocked contacts; Data & storage); Relay Configuration (+ Test connection with a
+  throwaway MQTT client); the 4 link pages (Refresh hooks, last-scan times); hub beacon (L.4) with
+  Available hubs, Join and strongest-hub auto-join.
+- **P5 Developer Tools.** Event Log, Routing Engine, Buffer History, Routing & Tuning (the only
+  algorithm switch, λ / η, Reset), Benchmarks (a messages-handled counter → a real delivery rate),
+  Export Data (datasets, date range, history + zip Share, Export all logs), Console (levels, sources,
+  search, copy, clear view).
+- **P6 Clean-up.** A checklist (`_diag/phase6_report.md`) confirmed every old feature has a reachable
+  new home, then the old UI went: `MainScreen.kt` (old tabs, chat list / detail, Network / Lifecycle / Log
+  tabs, strategy switch, benchmarks and research-export cards, buffer dialogs), `ChatExtras.kt` (Identity,
+  Settings, Groups, Group info, Contact info dialogs), `ConnectionPanel.kt` (old card, link details,
+  reachability banner), `MessageInfoDialog.kt`, `FileExportHelper` / `ResearchExportBundle` /
+  `ResearchExporter.exportAll`, the dead ViewModel API (`exportData` / `exportPath`, `switchStrategy`,
+  `saveSettings`, `createGroup`, `logEntries`, `bufferedMessages`, `discoveredPeers`,
+  `selectedDestination`, `pendingKeyChanges`, `diagnosticsCounts`) and `observeBufferedMessages`. What the
+  new pages still use moved next to them: `ui/CommonUi.kt` (snackbars, Before connecting, Clear buffer
+  text, system-settings shortcuts), `queue/RoutingMath.kt` (now in the new colours), `deriveBufferHistory`
+  → `queue/QueueModel.kt`, Event Log chips + route labels → `devtools/DevToolsModels.kt`, `relativeSince`
+  → `UiText.kt`. The old `Palette` is gone. Steering, README and this file updated.
+
+## L.2 Decisions (plan.md)
+Opens on Network · Queue = DM segments + a separate Broadcasts & groups segment (DM counters unchanged) ·
+the algorithm switch only in Routing & Tuning, read-only on the Network card · "Sent ✓" kept · bundled
+icons · "Clear buffer…" · mesh-breaking switches shown as read-only facts · Available hubs from the hub
+beacon, auto-join to the strongest · chat long-press → simple status sheet, full trace in Developer
+Tools · Create group with optional members, invites as encrypted DMs + Join card · Export with datasets,
+date range, history + Share, Export all logs · Benchmarks with messages handled, no Run / scenario ·
+Delete contact + Block (blocked contacts still get receipts) · one identity per phone.
+
+## L.3 One identity per phone (decision 14)
+- Apps can't read the MAC (Android returns `02:00:00:00:00:00`), so the node id = first 4 bytes of
+  SHA-256("DTN-node-v1|" + ANDROID_ID + "|" + package), re-hashed while 0 / 0xFFFFFFFF. A data clear or
+  reinstall keeps it; a factory reset changes it. Without a usable ANDROID_ID the stored id is kept.
+- The keys are still new after a clear: ANNOUNCE v2 signs the node id and issue time, receivers switch
+  keys only for a newer announce, unverified contacts switch with a "safety number changed" note,
+  QR-verified ones wait for Accept / a re-scan (DMs `HELD`). Announces carrying our own keys are ignored.
+- Every phone moved to its new id once with this build (test phone `!97ef4bf4` → `!0cdc860b`); contacts
+  re-add each other once by QR. Older builds can't read v2 announces / QRs.
+
+## L.4 Hub Bluetooth beacon (firmware v4)
+- One non-connectable legacy advert (~1 s, +9 dBm), manufacturer data 0xFFFF + "DH" v1: hub id, firmware,
+  phones on it, DMs waiting, up to 4 other hubs heard with RSSI / SNR (31 B). NimBLE-Arduino 1.4.3 as a
+  broadcaster only. Static RAM +3,996 B, flash +116,940 B. Layout in `wire-protocol.md` + `firmware/README.md`.
+- **Built (`pio run` OK), not flashed**: no board was attached. Both bench hubs still run v3 — they keep
+  working but don't appear under Available hubs (auto-join falls back to the `DTN-HUB-` prefix). Flash each
+  board (`pio run -t upload --upload-port COMxx`) and check `BLE beacon up` in the boot banner.
+
+## L.5 Tests and builds
+- JVM unit tests 171 → 188 (P1) → 225 (P2) → 249 (P3) → 263 (P4) → 308 (P5, P6); all pass. P6 removed no
+  test (none covered only deleted code) and moved two imports. The instrumented `MigrationTest` is
+  unchanged and wasn't run (it uninstalls the app).
+- P6 R8 builds (no new keep rules needed): `app-release.apk` 4.0 MB and `app-release.aab` 7.7 MB (signed
+  with the upload key), `app-staging.apk` 4.0 MB (debug-signed). Debug APK 18.2 MB.
+
+## L.6 Not verified on devices
+- Phases 3–6 weren't installed yet (Phase 7 installs once and walks every page with screenshots).
+- Two-phone flows: a key change after a data clear (Accept / re-scan), a blocked sender seeing
+  Delivered, delete + re-add by DM, the forced re-announce, invite DM → Join card, delivery rates.
+- Real hub beacons, Android's exact-SSID join prompt, Test connection against the public broker, the
+  share sheets (event file, export zip), `logcat --pid` on ColorOS, the date picker, and narrow screens
+  (route chain, benchmark table, console panel). The R8 builds were built, not run.
+
+## L.7 Phase 8 — 5 s DM fallback + group receipts (report: `_diag/phase8_report.md`)
+- **Fallback** (`service/DmFallback.kt` pure, `DtnOrchestrator.fallbackPass`): a DM (own or carried)
+  queued ≥ 5 s here (`DtnMessage.bufferedAtMs` = the buffer row's received time) keeps trying BLE /
+  Wi-Fi Direct and also goes to our hub (`HUB_LOCAL` for a roster phone, else a flood once per hub
+  session) and the relay (destination present, 30 s window, stays buffered until the receipt). A peer
+  pass sends DATA DMs only over its own tier (`sendMessageVia(msg, peer, only)`): a failed BLE write
+  tries Wi-Fi Direct at once, never the hub / relay. The 5 s pass is scheduled (coalesced) and runs
+  beside a busy flush; it never trains routing / Q-learning and isn't a benchmark forward. Route fields
+  `fallbackVia` / `fallbackAfter` → "Sent via Internet relay (fallback after BLE)".
+- **Group receipts** (`service/GroupReceipts.kt`): a member that decrypts a group message for the
+  first time sends the origin a suite-1 DM `[0xA7][1][ch][n][n × 16 B id]` (n ≤ 12, batched 3 s per
+  origin + channel, TTL ≥ 30 min; local `portNum` 257 = control traffic). Group messages never get a
+  ROUTING_ACK. The origin keeps member, time, link and hop per message in the journal route
+  (`groupReceipts`); known members = invited (DataStore `group_invited:<ch>`) ∪ posters ∪ receipt
+  senders − me − blocked; `deliveryState()` adds `RECEIVED_BY_SOME` / `RECEIVED_BY_ALL`. No Room or
+  firmware change. **Every phone needs this build**: older builds show a group receipt as garbage text.
+- Unit tests 308 → 337, all pass. Not verified on devices yet (Phase 10).
+
+## L.8 Phase 9 — multi-hop routing audit of all 6 algorithms (report: `_diag/phase9_report.md`)
+- **Carrier rules extracted** (no behaviour change): `service/CarrierRules.kt` (pure) holds the per-bundle
+  chain of `sendToSingle` (origin / previous hop, relay / hub / hub-only, broadcast once per session,
+  30 s window, strategy veto, `onWire` = hop + 1) and Q-learning's pass (`qLearningPass`, `progressReward`).
+  `routing/MeshSim` (test) runs them with one real `StrategySelector` + Q engine per phone, encounters and
+  summaries through the orchestrator's entry points, bundles through `DtnWireCodec` (new optional `nowMs`),
+  the 15-min aging worker (`ProphetStrategy.ageTo`). `MultiHopRoutingTest`: A→B→C→D→E with F / G / H.
+- **Bugs found by the simulation, fixed:**
+  - PRoPHET transitivity used the 2003 additive form; with summaries every 8 s every phone ended up with
+    P ≈ 0.7 for every node. → RFC 6693 eq. 3 `max(P_old, P(a,b)·P(b,c)·β)`; own id never learnt (`selfId`).
+  - PRoPHET's live-path tier turned away a far better carrier (P(G,E) 0.51 vs P(B,E) 0.09) because the
+    path search reached C first. → GRTR: a strictly better carrier still gets a copy (not when E is in range).
+  - MaxProp / DiMaxProp (and Q-learning's prior) didn't deliver: a neighbour's f was "seeded" into one's own
+    table, so every node looked one hop away at cost ≈ 1, A gave the DM to F and held it from B. → no
+    seeding; summaries carry the sender's own path cost to nodes further away (distance vectors: DiMaxProp
+    entries `[id][0][C×64]`, MaxProp a second `(id, cost)` list); MaxProp's summary got a 200 B budget.
+  - A duplicate from a second carrier replaced `receivedFrom`, so the real previous hop could get the bundle
+    back (G→B, H→C under Epidemic). → `receivedFrom` keeps every phone that handed us a copy.
+  - TTL expiry was never journaled (and the −0.3 expiry reward never set): `ForwardingWorker` read
+    `getAllBuffered()`, which excludes expired rows. → `getExpiring(now)` + `expireMessages(now)`.
+  - Replayed receipts were journaled again. → `DeliveryReceiptStore.markDelivered` returns "news";
+    `lifecycle.hasEvent` covers restarts.
+  - Firmware **v5**: a DM whose receipt already passed the hub is dropped on a late re-send (ack ring).
+- **Result** (after the fixes): all six deliver A→B→C→D→E (MaxProp A→B→G→C→D→E); DiMaxProp / Q-learning
+  never pick F; PRoPHET gives F a stage-1 copy and MaxProp a cheapest-first-hop copy (design trade-offs,
+  in the report); no ping-pong, TTL only counts down, the hop limit stops relaying, receipts clear every
+  copy. Unit tests 337 → 370. Phase 10 must flash both hubs with v5 and install this build on both phones.
+
+## L.9 Feedback fix 1 — false relay "Connecting", BLE DMs stuck in Queued (report: `_diag/fix1_report.md`)
+- **Relay.** Field log (Redmi, node 5c432f0e): after the broker's DISCONNECT at 17:37:07 HiveMQ's automatic
+  reconnect was pointed at WebSocket 8884 and never answered or failed; the app changed state only in HiveMQ
+  callbacks, so every surface said "Connecting…" for 40+ min. The network-return hook only fired on
+  internet unavailable → available, and the phone had moved mobile data → Wi-Fi (both validated). Every
+  session drop also rotated to the next endpoint (TLS → plain TCP → WSS). → `receiver/RelayLink.kt`:
+  `RelayStatus` (Off · Waiting for internet · Connecting… · Retrying in N s · Connected · <endpoint> ·
+  Couldn't reach the relay · Retry) + the pure `RelayLinkMachine` (back-off 2–60 s, endpoint rotation only
+  on failed attempts, give up after 10, 30 s watchdog, network-aware via `RadioStatusMonitor.internetNetworkId`);
+  `InternetTransportAdapter` carries it out on one control thread, fresh client per attempt (27 s budget),
+  no automatic reconnect; `ui/RelayStatusUi.kt` `relayStatusText()` on every surface.
+- **BLE.** Kunal (c06853fe) at 0.5 m: 28 outbound connects failed with status 133 (17:06:54–17:09:13) while
+  his inbound writes kept arriving; two inbound ACLs from him at once. At 18:20 the phone held 10 live LE
+  links and 9 GATT client registrations for ONE nearby phone: client links were keyed by address, peers'
+  addresses rotate (each re-advertise / inbound connection), and the old link was never closed (callbacks
+  of old objects also clobbered the new one's state). → one link per peer phone (`LinkTable`), reused across
+  address changes, old ones closed, `TRANSPORT_LE`, one quick retry, resend once after a mid-bundle failure,
+  MTU fallback, per-peer mutex, per-phone stats on the Bluetooth page, receiver drops torn partial frames.
+- **Carrier re-offers.** A carried DM was re-offered to the same carrier every 30 s in contact (fwd 1 → 27).
+  → a mule copy handed over an acknowledged link (BLE / Wi-Fi Direct) goes once per carrier session
+  (`HoldReason.CARRIER_HAS_IT`); Q-learning makes no new decision (or progress reward) for it.
+- Unit tests 370 → 396. Installed on the Redmi (debug, data kept); dist `DTN-Mesh-debug-2026-10-24-fix1.apk`.
+
+## L.10 Feedback fix 2 — Wi-Fi Direct link time (report: `_diag/fix2_report.md`)
+- Joins with a fresh password silently never formed (30 s timeout), and a join with the password of a group the
+  owner had just re-created (a new random nonce per group) could never work → 46.6 s to link; joins scanned every
+  channel; an election waited 8 s for a lower-id phone that advertised "running" with P2P unusable.
+- → the owner advertises its group's channel (BLE hint byte 9, TXT `f`), joiners `setGroupOperatingFrequency`;
+  join timeout 12 s + 2 s retry (then every channel); one nonce per app run; a stale join restarts at once;
+  1 s ticks while searching; create wait 5 s; "running" only while P2P is on; a new owner skips discovery 20 s.
+- Time to link 2.6–2.7 s on the Redmi + Kunal's OnePlus (was 11.6–46.6 s). Tests 396 → 398. Installed on both;
+  dist `DTN-Mesh-debug-2026-10-24-fix2.apk` (supersedes fix1). Older builds still join, scanning every channel.

@@ -46,11 +46,12 @@ object DtnWireCodec {
      *
      * @param message The DTN message to encode. Its [DtnMessage.originNodeId] and
      *   [DtnMessage.destinationNodeId] are written into the header as 32-bit values.
+     * @param nowMs The clock the remaining TTL is measured against (tests pass a simulated one).
      * @return Raw bytes: 32-byte header + payload. Total ≤ 255 bytes for a single frame.
      * @throws IllegalArgumentException if payload exceeds single-frame limit and fragmentation
      *   is not indicated.
      */
-    fun encode(message: DtnMessage): ByteArray {
+    fun encode(message: DtnMessage, nowMs: Long = System.currentTimeMillis()): ByteArray {
         val payloadSize = message.payloadBytes.size
 
         // Validate: if not fragmented, payload must fit in a single frame
@@ -82,7 +83,7 @@ object DtnWireCodec {
         // TTL in minutes (2 bytes UShort) — encode the REMAINING ttl so it counts DOWN across
         // hops and bundles actually expire. (Was message.ttlMs, which reset the clock at every
         // hop and made bundles effectively immortal.)
-        val ttlMinutes = (message.remainingTtlMs() / 60_000L).coerceIn(0, 65535).toInt()
+        val ttlMinutes = (message.remainingTtlMs(nowMs) / 60_000L).coerceIn(0, 65535).toInt()
         buffer.putShort(ttlMinutes.toShort())
 
         // Hop count (1 byte)
@@ -118,12 +119,14 @@ object DtnWireCodec {
      * @param wireBytes The raw bytes received from any transport (LoRa hub, BLE, or WiFi Direct).
      * @param rssi RSSI observed on this receive hop (transport metadata, not part of the header).
      * @param snr SNR observed on this receive hop (transport metadata, not part of the header).
+     * @param nowMs When it arrived: the remaining TTL counts from here (tests pass a simulated clock).
      * @return The decoded [DtnMessage], or null if the wire data is malformed.
      */
     fun decode(
         wireBytes: ByteArray,
         rssi: Int = 0,
         snr: Float = 0f,
+        nowMs: Long = System.currentTimeMillis(),
     ): DtnMessage? {
         if (wireBytes.size < HEADER_SIZE) return null // Too short to contain a valid header
 
@@ -174,7 +177,7 @@ object DtnWireCodec {
             destinationNodeId = destinationNodeId,
             payloadBytes = payloadBytes,
             portNum = DtnMessage.PORT_NUM_PRIVATE_APP,
-            createdAtMs = System.currentTimeMillis(), // Approximate; origin time is ttl-relative
+            createdAtMs = nowMs, // Approximate; origin time is ttl-relative
             ttlMs = ttlMs,
             hopCount = hopCount,
             channel = channel,

@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider paths: QR codes shared as images are written to cache/qr/. -->
+<!-- FileProvider paths: QR codes shared as images are written to cache/qr/, a message's exported
+     event details (Message page › Export event details) and the Event Log's Export events to
+     cache/events/, and Developer Tools › Export Data's folders plus the zips Share sends to
+     exports/ in the app's external files directory. -->
 <paths>
     <cache-path name="qr" path="qr/" />
+    <cache-path name="events" path="events/" />
+    <external-files-path name="exports" path="exports/" />
 </paths>

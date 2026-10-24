@@ -45,7 +45,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -92,6 +91,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.dtn.mesh.ui.theme.DtnColors
 import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeView
 import com.journeyapps.barcodescanner.CameraPreview
@@ -109,6 +109,9 @@ import kotlin.math.max
  * is exactly what gets decoded.
  */
 private const val SCAN_MARGIN_FRACTION = 0.14f
+
+/** Light blue of the frame corners and the sweeping line (stands out on the dimmed camera image). */
+private val SCAN_ACCENT = Color(0xFF12A0D8)
 
 /** Scan + upload entry points, plus a busy flag while an uploaded image is being decoded. */
 class QrActions internal constructor(
@@ -287,7 +290,7 @@ fun QrScannerDialog(
                     Button(
                         onClick = onUpload,
                         modifier = Modifier.heightIn(min = 52.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Palette.Primary),
+                        colors = ButtonDefaults.buttonColors(containerColor = DtnColors.Primary),
                     ) { Text("🖼 Upload image", fontSize = 15.sp) }
                 }
             }
@@ -372,7 +375,7 @@ private fun ScanOverlay() {
         animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Reverse),
         label = "sweep",
     )
-    val accent = Palette.PrimaryLight
+    val accent = SCAN_ACCENT
     Canvas(
         modifier = Modifier.fillMaxSize().graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen),
     ) {
@@ -444,17 +447,6 @@ fun QrImage(content: String, modifier: Modifier = Modifier, size: Dp = 220.dp) {
     }
 }
 
-/** Row of "Scan" / "Upload image" buttons used by the identity and group dialogs. */
-@Composable
-fun QrInputButtons(actions: QrActions, scanLabel: String = "📷 Scan QR") {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = actions.scan) { Text(scanLabel) }
-        OutlinedButton(onClick = actions.upload, enabled = !actions.decoding) {
-            Text(if (actions.decoding) "Reading…" else "🖼 Upload")
-        }
-    }
-}
-
 /** Decode a QR code from a picked image (gallery / files). */
 object QrImageDecoder {
     private const val MAX_DIM = 1600
@@ -515,12 +507,26 @@ object QrImageDecoder {
 /** Share a QR code as a PNG (e.g. over WhatsApp) so the other phone can upload it. */
 object QrShare {
     fun share(context: Context, content: String, chooserTitle: String): Boolean = runCatching {
+        startChooser(context, writePng(context, content), chooserTitle)
+    }.isSuccess
+
+    /** [share] with the PNG encoded and written on the IO dispatcher (the new pages use this). */
+    suspend fun shareAsync(context: Context, content: String, chooserTitle: String): Boolean = runCatching {
+        val file = withContext(Dispatchers.IO) { writePng(context, content) }
+        startChooser(context, file, chooserTitle)
+    }.isSuccess
+
+    private fun writePng(context: Context, content: String): File {
         val m = QrCodec.encode(content, marginModules = 4)
         val scale = (1024 / m.width).coerceAtLeast(4)
         val bmp = Bitmap.createBitmap(QrCodec.toPixels(m, scale), m.width * scale, m.height * scale, Bitmap.Config.ARGB_8888)
         val dir = File(context.cacheDir, "qr").apply { mkdirs() }
         val file = File(dir, "dtn-qr.png")
         FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        return file
+    }
+
+    private fun startChooser(context: Context, file: File, chooserTitle: String) {
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "image/png"
@@ -531,7 +537,7 @@ object QrShare {
         val chooser = Intent.createChooser(send, chooserTitle)
         if (context.findActivity() == null) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(chooser)
-    }.isSuccess
+    }
 }
 
 internal fun Context.findActivity(): Activity? {

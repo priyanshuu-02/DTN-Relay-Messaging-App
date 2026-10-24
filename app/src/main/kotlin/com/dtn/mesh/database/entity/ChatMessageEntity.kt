@@ -42,7 +42,7 @@ data class ChatMessageEntity(
     @ColumnInfo(name = "text")
     val text: String,
 
-    /** Display status: SENDING / BUFFERED / DELIVERED / RECEIVED / EXPIRED / DROPPED / FAILED. */
+    /** Display status: SENDING / BUFFERED / DELIVERED / RECEIVED / EXPIRED / DROPPED / FAILED / HELD. */
     @ColumnInfo(name = "status")
     val status: String,
 
@@ -61,5 +61,10 @@ data class ChatMessageEntity(
         const val EXPIRED = "EXPIRED"
         const val DROPPED = "DROPPED"
         const val FAILED = "FAILED"
+        /**
+         * A DM to a QR-verified contact whose keys changed: not sealed or sent yet. It goes out
+         * (sealed to the right keys) once the user accepts the new keys or re-scans their QR.
+         */
+        const val HELD = "HELD"
     }
 }

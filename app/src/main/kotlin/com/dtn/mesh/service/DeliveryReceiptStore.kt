@@ -20,10 +20,11 @@ class DeliveryReceiptStore @Inject constructor() {
     /** Set of message UIDs confirmed delivered to their final destination. */
     private val deliveredUids = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-    /** Record that a message reached its final destination. */
-    fun markDelivered(msgId: String) {
-        deliveredUids.add(msgId)
-    }
+    /**
+     * Record that a message reached its final destination.
+     * @return true the first time (news to this phone), false for a receipt it already had.
+     */
+    fun markDelivered(msgId: String): Boolean = deliveredUids.add(msgId)
 
     /** Check if a message has been confirmed delivered. */
     fun isDelivered(msgId: String): Boolean = deliveredUids.contains(msgId)

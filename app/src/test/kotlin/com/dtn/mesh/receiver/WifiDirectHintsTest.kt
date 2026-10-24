@@ -12,8 +12,37 @@ class WifiDirectHintsTest {
     @Test
     fun encode_startsWithTheNodeIdSoOlderBuildsStillReadIt() {
         val data = WifiDirectHints.encode(0x1ea53158, WifiDirectHints.Local())
-        assertEquals(9, data.size)
+        // 10 bytes since fix 2 (the group channel): 2 + 16 + 10 = 28 B scan response, under the 31 B limit.
+        assertEquals(10, data.size)
         assertEquals(listOf(0x1e, 0xa5, 0x31, 0x58), data.take(4).map { it.toInt() and 0xFF })
+    }
+
+    @Test
+    fun theOwnersChannelTravels_andOlderNineByteAdvertsMeanUnknown() {
+        val local = WifiDirectHints.Local(active = true, ownerNonce = 9, members = 1, channel = WifiDirectHints.channelOf(5745))
+        val d = WifiDirectHints.decode(WifiDirectHints.encode(42, local))!!
+        assertEquals(149, d.channel)
+        assertEquals(5745, WifiDirectHints.frequencyOf(d.channel))
+        // A build before fix 2: 9 bytes, no channel → scan every channel.
+        assertEquals(0, WifiDirectHints.decode(WifiDirectHints.encode(42, local).copyOf(9))!!.channel)
+        // A phone that owns no group never advertises one.
+        assertEquals(0, WifiDirectHints.decode(WifiDirectHints.encode(42, WifiDirectHints.Local(active = true, channel = 6)))!!.channel)
+    }
+
+    @Test
+    fun channelMapping_coversBothBands_andRejectsTheRest() {
+        assertEquals(1, WifiDirectHints.channelOf(2412))
+        assertEquals(6, WifiDirectHints.channelOf(2437))
+        assertEquals(14, WifiDirectHints.channelOf(2484))
+        assertEquals(36, WifiDirectHints.channelOf(5180))
+        assertEquals(165, WifiDirectHints.channelOf(5825))
+        assertEquals(0, WifiDirectHints.channelOf(5955)) // 6 GHz: not encoded
+        assertEquals(0, WifiDirectHints.channelOf(0))
+        for (f in listOf(2412, 2437, 2462, 2484, 5180, 5240, 5745, 5825)) {
+            assertEquals(f, WifiDirectHints.frequencyOf(WifiDirectHints.channelOf(f)))
+        }
+        assertEquals(0, WifiDirectHints.frequencyOf(0))
+        assertEquals(0, WifiDirectHints.frequencyOf(200))
     }
 
     @Test

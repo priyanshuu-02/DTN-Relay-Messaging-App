@@ -1,7 +1,7 @@
 // ============================================================================
-//  DTN LoRa Hub — Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)   firmware v2
-//  Role: WiFi SoftAP for many phones  +  LoRa hub-to-hub backbone.
-//  Framework: Arduino / PlatformIO    Library: RadioLib 6.6.x, U8g2
+//  DTN LoRa Hub — Heltec WiFi LoRa 32 V3 (ESP32-S3 + SX1262)   firmware v5
+//  Role: WiFi SoftAP for many phones  +  LoRa hub-to-hub backbone  +  Bluetooth beacon.
+//  Framework: Arduino / PlatformIO    Library: RadioLib 6.6.x, U8g2, NimBLE-Arduino 1.4.3
 //
 //  Phone <-> hub protocol (framed TCP :9740, matches LoRaHubTransportAdapter.kt):
 //     [1B type][2B length BE][payload]
@@ -34,8 +34,19 @@
 //   * OLED status screen, battery readout, watchdog.
 //  LoRa wire bytes are still EXACTLY the DTN bundle — no link header — so the
 //  255-byte frame budget and dedup are unchanged and phones need no changes.
+//
+//  v4 (Oct 2026): a Bluetooth beacon (NimBLE-Arduino 1.4.3, broadcaster only). One legacy,
+//  non-connectable advert every ~1 s carrying the hub id, firmware version, phones here,
+//  DMs waiting and the other hubs it hears with their LoRa RSSI/SNR, so the app lists
+//  "Available hubs" from its existing Bluetooth scan and joins one hub's Wi-Fi by name.
+//  Updated when those values change. Wi-Fi SoftAP and LoRa are unchanged (coexistence).
+//
+//  v5 (Oct 2026): a DM whose receipt already passed through this hub is dropped when a phone
+//  re-sends it late (it missed the receipt and re-registered), instead of being buffered and
+//  flooded again. Nothing else changed: v3, v4 and v5 hubs interoperate.
 // ============================================================================
 #include <WiFi.h>
+#include <NimBLEDevice.h>
 #include <RadioLib.h>
 #include <Preferences.h>
 #include <U8g2lib.h>
@@ -249,6 +260,7 @@ bool deliverLocal(uint32_t dest, const uint8_t* data, uint16_t len, int skipClie
 void processInboundAck(const uint8_t* data, uint16_t len);
 void routeBundle(const uint8_t* data, uint16_t len, bool fromLoRa, int rssi, int fromClient);
 int  countActivePeers(); int countInactivePeers(); int countConnectedPhones(); int countWaitingMessages();
+int  countRegisteredPhones();
 float readBatteryVolts();
 
 // ============================================================================
@@ -282,6 +294,11 @@ void registerSeen(const uint8_t* id){ if(!seenBefore(id)){} }
 bool ackSeenBefore(const uint8_t* id) {
     for (int i=0;i<DEDUP_N;i++) if (memcmp(ackDedupKey[i],id,16)==0) return true;
     memcpy(ackDedupKey[ackDedupHead],id,16); ackDedupHead=(ackDedupHead+1)%DEDUP_N; return false;
+}
+// A receipt for this message id already passed through here (lookup only, nothing recorded).
+bool ackKnown(const uint8_t* id) {
+    for (int i=0;i<DEDUP_N;i++) if (memcmp(ackDedupKey[i],id,16)==0) return true;
+    return false;
 }
 
 // ============================================================================
@@ -630,6 +647,14 @@ void routeBundle(const uint8_t* data, uint16_t len, bool fromLoRa, int rssi, int
     bool isBroadcast=(dst==BROADCAST_DEST);
     bool forHub=(dst==HUB_ID);
     bool isAck=(mt==MSGTYPE_ROUTING_ACK);
+    // v5: a DM whose receipt already passed through this hub was delivered. A late re-send (its phone
+    // missed the receipt, e.g. it was away when the receipt came, and re-registered) is dropped: it
+    // used to be buffered and flooded again, then waited for a receipt that never comes back.
+    if (mt==MSGTYPE_DATA && !isBroadcast && ackKnown(data+OFF_MSGID)){
+        char idStr[9]; msgIdShort(data+OFF_MSGID,idStr);
+        Serial.printf("[LC] AckedResend     msg=%s dropped (its receipt already passed here)\n", idStr);
+        stats.duplicatesIgnored++; return;
+    }
     // A phone handing us a bundle we already hold (it retries until the receipt):
     // a DM is delivered locally again (its phone may be here now) but never
     // re-flooded; broadcasts/receipts already reached everyone here (on arrival
@@ -787,6 +812,93 @@ void acceptAndPoll(){
 }
 
 // ============================================================================
+//  Bluetooth hub beacon (v4)
+// ============================================================================
+// One legacy, non-connectable advert (ADV_NONCONN_IND, no scan response) every ~1 s whose only
+// AD structure is manufacturer data with company id 0xFFFF (no Bluetooth SIG id) and the magic
+// "DH". Phones advertise the DTN GATT service UUID instead, so a hub is never taken for a phone.
+//   [0xFF 0xFF company][0x44 'D'][0x48 'H'][ver 1][4B HUB_ID BE][fw][phones][DMs waiting][n]
+//   + n x [2B other hub's id & 0xFFFF BE (its SSID suffix)][1B -RSSI dBm, 0 = none][1B SNR x4, int8]
+// n <= 4 (strongest first): 29 B of data -> a 31-byte AD, exactly one legacy advert. Readers
+// ignore other versions; later fields are appended without a version bump.
+static const uint8_t  BEACON_MAGIC_0 = 0x44, BEACON_MAGIC_1 = 0x48, BEACON_VER = 1, BEACON_MAX_HUBS = 4;
+static const int      BEACON_MAX_LEN = 2 + 11 + 4 * 4;    // company id + header + 4 hubs = 29
+static const uint16_t BEACON_INTERVAL_MIN = 1600;          // 1000 ms in 0.625 ms units
+static const uint16_t BEACON_INTERVAL_MAX = 1760;          // 1100 ms
+static const uint32_t BEACON_CHECK_MS = 1000;              // rebuild + compare once a second
+NimBLEAdvertising* bleAdv = nullptr;
+bool     bleOk = false;
+uint8_t  beaconLast[BEACON_MAX_LEN];
+int      beaconLen = 0;
+uint32_t beaconUpdates = 0, nextBeaconMs = 0;
+
+// The manufacturer data (company id first) for the current state; returns its length.
+int buildBeacon(uint8_t* p){
+    int n=0;
+    p[n++]=0xFF; p[n++]=0xFF;                       // company id 0xFFFF, little-endian
+    p[n++]=BEACON_MAGIC_0; p[n++]=BEACON_MAGIC_1; p[n++]=BEACON_VER;
+    wr32(p+n,HUB_ID); n+=4;
+    p[n++]=(uint8_t)DTN_FW_VERSION;
+    int phones=countRegisteredPhones(); p[n++]=(uint8_t)(phones>255?255:phones);
+    int dms=countWaitingMessages();     p[n++]=(uint8_t)(dms>255?255:dms);
+    int nAt=n++; uint8_t k=0;
+    // Other hubs heard directly over LoRa in the last NODE_TIMEOUT_MS, strongest first.
+    bool taken[MAX_KNOWN_PEERS]={false};
+    uint32_t now=millis();
+    while (k<BEACON_MAX_HUBS){
+        int best=-1;
+        for (int i=0;i<MAX_KNOWN_PEERS;i++){ KnownPeer& kp=knownPeers[i];
+            if (!kp.valid || taken[i] || (int32_t)(now-kp.lastSeenMs)>=(int32_t)NODE_TIMEOUT_MS) continue;
+            if (best<0 || kp.lastRssi>knownPeers[best].lastRssi) best=i; }
+        if (best<0) break;
+        taken[best]=true; KnownPeer& kp=knownPeers[best];
+        wr16(p+n,(uint16_t)(kp.nodeId & 0xFFFF)); n+=2;
+        int r=kp.lastRssi; p[n++]=(uint8_t)(r>=0 ? 0 : (r<-255 ? 255 : -r));
+        long s=lroundf(kp.lastSnr*4.0f); if (s<-128) s=-128; if (s>127) s=127; p[n++]=(uint8_t)(int8_t)s;
+        k++;
+    }
+    p[nAt]=k;
+    return n;
+}
+void setBeaconData(const uint8_t* p, int n){
+    NimBLEAdvertisementData d;
+    d.setManufacturerData(std::string((const char*)p,(size_t)n));
+    bleAdv->setAdvertisementData(d);
+}
+// Broadcaster only (no GATT, no scanning, no connections): coexists with the SoftAP and LoRa.
+void initBle(){
+    uint32_t heapBefore=ESP.getFreeHeap();
+    NimBLEDevice::init("");                         // no GAP name: the advert carries the hub id
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);         // +9 dBm, about the reach of the hub Wi-Fi
+    bleAdv=NimBLEDevice::getAdvertising();
+    bleAdv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+    bleAdv->setScanResponse(false);
+    bleAdv->setMinInterval(BEACON_INTERVAL_MIN);
+    bleAdv->setMaxInterval(BEACON_INTERVAL_MAX);
+    beaconLen=buildBeacon(beaconLast);
+    setBeaconData(beaconLast,beaconLen);
+    bleOk=bleAdv->start();
+    nextBeaconMs=millis()+BEACON_CHECK_MS;
+    Serial.printf("BLE beacon %s: v%u, %d B advert every ~1 s, non-connectable (NimBLE-Arduino 1.4.3), heap used %u B, free %u B\n",
+                  bleOk?"up":"FAILED", (unsigned)BEACON_VER, beaconLen+2, (unsigned)(heapBefore-ESP.getFreeHeap()),
+                  (unsigned)ESP.getFreeHeap());
+}
+// Re-advertise when what the beacon says changed (phones, DMs waiting, other hubs or their signal).
+void maybeUpdateBeacon(){
+    if (!bleOk) return;
+    uint32_t now=millis();
+    if ((int32_t)(now-nextBeaconMs)<0) return;
+    nextBeaconMs=now+BEACON_CHECK_MS;
+    uint8_t p[BEACON_MAX_LEN]; int n=buildBeacon(p);
+    if (n==beaconLen && memcmp(p,beaconLast,n)==0) return;
+    bleAdv->stop();
+    setBeaconData(p,n);
+    bleOk=bleAdv->start();
+    memcpy(beaconLast,p,n); beaconLen=n; beaconUpdates++;
+    if (!bleOk) Serial.println("[BLE] beacon restart failed");
+}
+
+// ============================================================================
 //  Battery / OLED
 // ============================================================================
 float readBatteryVolts(){
@@ -819,6 +931,8 @@ void maybeDrawOled(){ uint32_t now=millis(); if((int32_t)(now-nextOledMs)<0) ret
 int countActivePeers(){ int n=0; for(int i=0;i<MAX_KNOWN_PEERS;i++) if(knownPeers[i].valid&&knownPeers[i].active)n++; return n; }
 int countInactivePeers(){ int n=0; for(int i=0;i<MAX_KNOWN_PEERS;i++) if(knownPeers[i].valid&&!knownPeers[i].active)n++; return n; }
 int countConnectedPhones(){ int n=0; for(int i=0;i<MAX_CLIENTS;i++) if(clients[i].used&&clients[i].sock.connected())n++; return n; }
+// Phones that REGISTERed (the ROSTER count): what the Bluetooth beacon reports.
+int countRegisteredPhones(){ int n=0; for(int i=0;i<MAX_CLIENTS;i++) if(clients[i].used&&clients[i].nodeId&&clients[i].sock.connected())n++; return n; }
 // Messages actually waiting for delivery (DMs). Announces, broadcasts, group messages and
 // receipts also sit in the buffer until their TTL — by design — but they wait for nobody.
 int countWaitingMessages(){ int n=0; for(int i=0;i<BUFFER_CAPACITY;i++) if(buffer[i].valid&&buffer[i].msgType==MSGTYPE_DATA&&buffer[i].dest!=BROADCAST_DEST)n++; return n; }
@@ -852,6 +966,10 @@ void printDashboard(){
                   (unsigned long)stats.dutyBlocked,(unsigned long)stats.hopDropped,(unsigned long)stats.ttlExpired);
     Serial.printf("phones: in=%lu out=%lu dropped(queue full)=%lu\n",
                   (unsigned long)stats.fromPhones,(unsigned long)stats.toPhones,(unsigned long)stats.txDropped);
+    // beaconLast: [0-1] company, [2-3] magic, [4] ver, [5-8] hub id, [9] fw, [10] phones, [11] DMs, [12] hubs.
+    Serial.printf("ble beacon: %s phones=%u dms=%u hubs=%u updates=%lu free heap=%u B\n", bleOk?"on":"OFF",
+                  beaconLen>10?(unsigned)beaconLast[10]:0u, beaconLen>11?(unsigned)beaconLast[11]:0u,
+                  beaconLen>12?(unsigned)beaconLast[12]:0u, (unsigned long)beaconUpdates, (unsigned)ESP.getFreeHeap());
     Serial.println("cmd: region in|eu|us  |  stats  |  ping (heartbeat now)  |  txpow <-9..22> (until reboot)");
     Serial.println("================================================\n");
 }
@@ -944,6 +1062,7 @@ void setup(){
     Serial.printf("SoftAP %s up at %s\n",AP_SSID,WiFi.softAPIP().toString().c_str());
 
     initRadio();
+    initBle();
 
     esp_task_wdt_init(WDT_TIMEOUT_S,true); esp_task_wdt_add(NULL);
 
@@ -959,6 +1078,7 @@ void loop(){
     pumpLoRaTx();
     maybeSendHeartbeat();
     bufferSweepExpired();
+    maybeUpdateBeacon();
     maybeDrawOled();
     maybePrintDashboard();
     handleSerialCli();

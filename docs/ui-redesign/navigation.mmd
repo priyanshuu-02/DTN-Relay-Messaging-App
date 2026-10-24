@@ -1,0 +1,40 @@
+flowchart TD
+    FL["First launch: display name"] --> SHELL["Main shell: top bar, status card, bottom nav"]
+    SHELL --> NET["Network tab"]
+    SHELL --> CH["Chats tab"]
+    SHELL --> QU["Queue tab"]
+    SHELL --> PE["Peers tab"]
+    SHELL -.->|status card| CL["Connection links sheet"]
+    SHELL -.->|top bar| GR["Groups"]
+    SHELL -.->|top bar| ST["Settings"]
+    SHELL -.->|avatar| ID["My Identity"]
+    CL --> TP["Transport pages: Bluetooth, Wi-Fi Direct, LoRa hub, Internet relay"]
+    NET -->|arrow or long-press| TP
+    TP -->|Internet relay| RC["Relay Configuration"]
+    NET --> AS["Algorithm sheet"]
+    NET --> QR["QR scanner"]
+    GR --> GP["Group page"]
+    CH --> CP["Chat"]
+    CH --> NM["New message sheet"]
+    CP -->|long-press bubble| MP["Message page: route path, routing decision, journey, details"]
+    QU --> QM["Queued message: live routing math"]
+    QU --> MP
+    QM --> MP
+    PE --> CT["Contact: safety number, routing scores"]
+    PE --> QR
+    CT --> CP
+    ST --> SS["Profile, Privacy, Data and storage, About"]
+    ST -->|Relay server| RC
+    ST --> DT["Developer Tools"]
+    DT --> D1["Event Log"]
+    DT --> D2["Routing Engine"]
+    DT --> D3["Buffer History"]
+    DT --> D4["Routing and Tuning"]
+    DT --> D5["Benchmarks"]
+    DT --> D6["Export Data"]
+    DT --> D7["Console"]
+    DT --> RC
+    AS --> D4
+    D4 --> D5
+    D1 --> MP
+    D3 --> MP

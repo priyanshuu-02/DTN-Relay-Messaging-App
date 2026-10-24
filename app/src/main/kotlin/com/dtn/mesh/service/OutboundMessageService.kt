@@ -36,6 +36,7 @@ class OutboundMessageService @Inject constructor(
     private val strategySelector: StrategySelector,
     private val settings: SettingsRepository,
     private val contactDao: ContactDao,
+    private val benchmark: com.dtn.mesh.learning.BenchmarkTracker,
 ) {
     private companion object {
         /** Lifetime of an announce broadcast to everyone (Discover on). */
@@ -48,6 +49,11 @@ class OutboundMessageService @Inject constructor(
     private val lastDirectAnnounceMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
     sealed interface Result {
         data class Sent(val message: DtnMessage) : Result
+        /**
+         * Kept in the chat but not sealed or sent: the QR-verified contact's keys changed. It goes
+         * out once the user accepts the new keys or re-scans their QR ([resendHeld]).
+         */
+        data class Held(val chatId: String) : Result
         /** No encryption key for this peer/group yet (they haven't announced / you haven't joined). */
         object NoKey : Result
         data class TooLong(val maxBytes: Int) : Result
@@ -60,6 +66,45 @@ class OutboundMessageService @Inject constructor(
      * @param channel 0 for DM/broadcast, >0 for a group channel.
      */
     suspend fun sendText(text: String, dest: NodeId, channel: Int, ttlMs: Long): Result {
+        val now = System.currentTimeMillis()
+        val peer = if (channel > 0 || dest == NodeId.BROADCAST) null else dest.value
+        if (peer != null && runCatching { settings.hasPendingKeys(peer) }.getOrDefault(false)) return hold(text, dest, now)
+        return sealAndQueue(text, dest, channel, ttlMs, existingId = null, chatCreatedAtMs = now)
+    }
+
+    /**
+     * Seal and queue the DMs to [peer] that waited for its key change to be resolved (the user
+     * accepted the new keys or re-scanned the QR), each under its own chat id. @return how many went out.
+     */
+    suspend fun resendHeld(peer: NodeId, ttlMs: Long): Int {
+        var sent = 0
+        for (row in runCatching { chatDao.getHeld(peer.value) }.getOrDefault(emptyList())) {
+            val r = sealAndQueue(row.text, peer, 0, ttlMs, existingId = row.id, chatCreatedAtMs = row.createdAtMs)
+            if (r is Result.Sent) sent++
+        }
+        return sent
+    }
+
+    /** Store a DM as HELD: in the chat (Queued), not sealed, not in the buffer. */
+    private suspend fun hold(text: String, dest: NodeId, now: Long): Result {
+        val plain = AlgorithmCode.prefix(strategySelector.activeType, text.toByteArray(Charsets.UTF_8))
+        val budget = envelope.maxPlaintextBytes(dest, 0)
+        val fragments = (plain.size + budget - 1) / budget
+        if (fragments > Fragmenter.MAX_FRAGMENTS) return Result.TooLong(budget * Fragmenter.MAX_FRAGMENTS)
+        // The id it will travel under: a plain id, or the canonical parent id of its fragments.
+        val id = if (fragments <= 1) UUID.randomUUID().toString() else Fragmenter.canonicalParent(UUID.randomUUID().toString())
+        chatDao.upsert(ChatMessageEntity(id, dest.value, dest.value, 0, ChatMessageEntity.Direction.OUT, text,
+            ChatMessageEntity.Status.HELD, now))
+        return Result.Held(id)
+    }
+
+    /**
+     * Seal + enqueue [text]. [existingId] re-uses a held message's chat id (it was never on the
+     * wire); [chatCreatedAtMs] keeps its place in the chat. The bundle's lifetime starts now.
+     */
+    private suspend fun sealAndQueue(
+        text: String, dest: NodeId, channel: Int, ttlMs: Long, existingId: String?, chatCreatedAtMs: Long,
+    ): Result {
         val now = System.currentTimeMillis()
         val isBroadcast = dest == NodeId.BROADCAST
         val convKey = when {
@@ -76,7 +121,7 @@ class OutboundMessageService @Inject constructor(
 
         // ── Single frame (the common case) ──
         if (plain.size <= budget) {
-            val id = UUID.randomUUID().toString()
+            val id = existingId ?: UUID.randomUUID().toString()
             val (payload, flags) = when (val s = envelope.sealBytes(plain, id, identity.nodeId, dest, channel, 0, 1)) {
                 is EnvelopeService.Sealed.Ok -> s.payload to s.flags
                 EnvelopeService.Sealed.NoKey -> return Result.NoKey
@@ -89,11 +134,13 @@ class OutboundMessageService @Inject constructor(
             // DMs await an end-to-end receipt (SENDING → DELIVERED); broadcast/group have no single
             // receipt, so they are shown as SENT once queued/flooded.
             val status = if (channel > 0 || isBroadcast) ChatMessageEntity.Status.SENT else ChatMessageEntity.Status.SENDING
-            chatDao.upsert(ChatMessageEntity(id, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, status, now))
+            chatDao.upsert(ChatMessageEntity(id, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, status, chatCreatedAtMs))
             val stored = queueManager.ingest(msg)
             if (stored) {
                 journalCreated(msg, fragments = 1)
                 bridgeToRelay(msg)
+                // Benchmarks: a DM this phone created is one it handles.
+                if (peer != null) benchmark.recordHandled(strategySelector.name, msg.id, msg.createdAtMs)
             }
             return if (stored) Result.Sent(msg) else Result.Error
         }
@@ -101,7 +148,7 @@ class OutboundMessageService @Inject constructor(
         // ── Fragment: split into independently-sealed bundles that share a canonical parent id ──
         val chunks = plain.toList().chunked(budget).map { it.toByteArray() }
         if (chunks.size > Fragmenter.MAX_FRAGMENTS) return Result.TooLong(budget * Fragmenter.MAX_FRAGMENTS)
-        val canonical = Fragmenter.canonicalParent(UUID.randomUUID().toString())
+        val canonical = existingId ?: Fragmenter.canonicalParent(UUID.randomUUID().toString())
         val total = chunks.size
         var first: DtnMessage? = null
         for ((i, chunk) in chunks.withIndex()) {
@@ -120,12 +167,15 @@ class OutboundMessageService @Inject constructor(
                 // Fragments share the first 8 id characters, so the journal tracks them as one.
                 if (first == null) journalCreated(msg, fragments = total)
                 bridgeToRelay(msg)
+                // Benchmarks count bundles: each fragment is delivered (and acknowledged) on its own.
+                if (peer != null) benchmark.recordHandled(strategySelector.name, msg.id, msg.createdAtMs)
             }
             if (first == null) first = msg
         }
         // One chat row for the whole message, keyed by the canonical parent id (status SENT: a
         // multi-fragment message is acknowledged per fragment, not tracked as one delivery).
-        chatDao.upsert(ChatMessageEntity(canonical, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text, ChatMessageEntity.Status.SENT, now))
+        chatDao.upsert(ChatMessageEntity(canonical, convKey, peer, channel, ChatMessageEntity.Direction.OUT, text,
+            ChatMessageEntity.Status.SENT, chatCreatedAtMs))
         return first?.let { Result.Sent(it) } ?: Result.Error
     }
 
@@ -145,26 +195,48 @@ class OutboundMessageService @Inject constructor(
             return
         }
         val now = System.currentTimeMillis()
-        val me = identity.nodeId.value
-        for (c in runCatching { contactDao.getAddedContacts() }.getOrDefault(emptyList())) {
-            if (c.nodeId == me || !c.nodeId.startsWith("!")) continue
-            if (!force && now - (lastDirectAnnounceMs[c.nodeId] ?: 0L) < DIRECT_ANNOUNCE_TTL_MS) continue
-            sendAnnounceTo(NodeId(c.nodeId), displayName)
+        for (node in directAnnounceTargets()) {
+            if (!force && now - (lastDirectAnnounceMs[node] ?: 0L) < DIRECT_ANNOUNCE_TTL_MS) continue
+            sendAnnounceTo(NodeId(node), displayName)
         }
     }
 
     /**
+     * Right after this phone switched to its derived node id (decision 14): a direct announce to
+     * every added contact now, plus the broadcast one when Discover is on. @return contacts announced to.
+     */
+    suspend fun announceIdentityChange(displayName: String): Int {
+        val targets = directAnnounceTargets()
+        targets.forEach { sendAnnounceTo(NodeId(it), displayName) }
+        if (runCatching { settings.discoverableOnce() }.getOrDefault(false)) {
+            val msg = buildAnnounce(displayName, NodeId.BROADCAST, BROADCAST_ANNOUNCE_TTL_MS)
+            queueManager.ingest(msg)
+            bridgeToRelay(msg)
+        }
+        return targets.size
+    }
+
+    /** Added contacts that get our direct announce (never blocked ones). */
+    private suspend fun directAnnounceTargets(): List<String> = ContactRules.directAnnounceTargets(
+        added = runCatching { contactDao.getAddedContacts() }.getOrDefault(emptyList()).map { it.nodeId },
+        blocked = runCatching { settings.blockedNodesOnce() }.getOrDefault(emptySet()),
+        me = identity.nodeId.value,
+    )
+
+    /**
      * Queue our signed identity for one contact only (just added them, or Discover is off). It
-     * travels like a DM: carriers pass it on but only [peer] pins the keys.
+     * travels like a DM: carriers pass it on but only [peer] pins the keys. Never to a blocked contact.
      */
     suspend fun sendAnnounceTo(peer: NodeId, displayName: String) {
         if (peer == identity.nodeId) return
+        if (peer.value in runCatching { settings.blockedNodesOnce() }.getOrDefault(emptySet())) return
         lastDirectAnnounceMs[peer.value] = System.currentTimeMillis()
         queueManager.ingest(buildAnnounce(displayName, peer, DIRECT_ANNOUNCE_TTL_MS))
     }
 
     private fun buildAnnounce(displayName: String, dest: NodeId, ttlMs: Long): DtnMessage {
         val payload = Announce.build(
+            nodeNum = identity.nodeNum32,
             xPub = identity.xPub, edPub = identity.edPub, edSeed = identity.edSeed,
             name = displayName, issuedAtSec = (System.currentTimeMillis() / 1000L).toInt(),
         )

@@ -10,6 +10,9 @@ lifecycle = "2.8.7"
 composeBom = "2024.12.01"
 activityCompose = "1.9.3"
 hiltNavigationCompose = "1.2.0"
+# Pinned: 2.8.5 is built against Compose 1.7 (BOM 2024.12.01) and lifecycle 2.6+, so it adds no
+# Compose / lifecycle upgrade. hilt-navigation-compose 1.2.0 only asks for navigation 2.5.1+.
+navigationCompose = "2.8.5"
 kotlinxSerializationJson = "1.7.3"
 junit = "4.13.2"
 androidxTestExt = "1.2.1"
@@ -41,6 +44,7 @@ compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
 activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 hilt-navigation-compose = { group = "androidx.hilt", name = "hilt-navigation-compose", version.ref = "hiltNavigationCompose" }
+navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
 bouncycastle = { group = "org.bouncycastle", name = "bcprov-jdk18on", version.ref = "bouncycastle" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }

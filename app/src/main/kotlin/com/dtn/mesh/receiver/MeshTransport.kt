@@ -134,6 +134,24 @@ interface MeshTransport {
 
     /** Like [sendMessage], but also reports which link carried the bundle (null = not sent). */
     suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId): SendOutcome?
+
+    /**
+     * Like [sendMessageVia], but only over the links in [only], tried in the usual order (BLE, Wi-Fi
+     * Direct, the hub as the target, the same hub, the relay, the hub flood). Lets the caller force
+     * a path, e.g. the relay while BLE also reaches the peer, or BLE / Wi-Fi Direct without falling
+     * through to the hub or the relay.
+     */
+    suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId, only: Set<SendPath>): SendOutcome?
+
+    /** The links that end at [peer] right now, in send order: [SendPath.BLE], [SendPath.WIFI_DIRECT], [SendPath.HUB]. */
+    fun directLinks(peer: NodeId): List<SendPath>
+
+    /**
+     * A direct link with a phone just came up (BLE, either role; Oct 2026 fix 3). Sends never wait
+     * for a link, so bundles held back while it was coming up can go now: the orchestrator clears
+     * that phone's send back-off and flushes.
+     */
+    val linkReady: Flow<NodeId>
 }
 
 // ──────────────────────────────────────────────────────────────────────────

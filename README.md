@@ -157,7 +157,7 @@ An instrumentation table recording RL training steps.
 
 ## Research Data Export
 
-For offline analysis and benchmarking, the full research archive can be exported from the **Log tab** ("Export telemetry" button). `ResearchExporter` gathers the data and `FileExportHelper` writes it to app storage:
+For offline analysis and benchmarking, the research archive is exported from **Settings › Developer Tools › Export Data** (dataset switches, a date range, export history and Share). `ResearchExporter` builds the CSV / JSON and `DataExportManager` writes each export into its own folder under `Android/data/com.dtn.mesh/files/exports/`. **Export all logs** writes the diagnostics log, the engine console, the message journal and the app's own logcat instead. No export contains message text:
 
 * `encounters.csv` — every contact window (peer, start/end, best RSSI/SNR).
 * `contacts.csv` — per-node delivery-probability profiles and success/attempt counters.
@@ -165,6 +165,7 @@ For offline analysis and benchmarking, the full research archive can be exported
 * `messages.csv` — the store-carry-forward message store with hop/forward/duplicate counts and terminal status.
 * `q_tables.json` — serialized `Q^A` / `Q^B` tables.
 * `metadata.json` — run metadata (local identity, timestamps, record counts).
+* `message_events.csv` — the message journal's events (ids, links, hops, TTL; no text).
 
 ---
 

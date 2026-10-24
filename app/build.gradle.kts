@@ -124,6 +124,7 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.activity.compose)
     implementation(libs.hilt.navigation.compose)
+    implementation(libs.navigation.compose)
 
     // Serialization (for research export)
     implementation(libs.kotlinx.serialization.json)

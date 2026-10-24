@@ -37,7 +37,24 @@ data class LinkPeer(
     val role: String = "",
     /** e.g. "192.168.49.12", "RSSI −61 dBm". */
     val detail: String = "",
+    /** What sending to it did lately, e.g. "GATT: 12 sent · last OK 14:05:03" (Bluetooth page). */
+    val stats: String = "",
 )
+
+/** When each link last looked around (epoch ms, 0 = not yet), for the link pages' last-scan lines. */
+data class LinkScanTimes(
+    /** BLE: the last scan result of any kind (a DTN phone or a hub beacon). */
+    val bleLastResultMs: Long = 0L,
+    /** Wi-Fi Direct: the last peer + service discovery start. */
+    val wifiDirectLastDiscoveryMs: Long = 0L,
+    val wifiDirectIntervalMs: Long = 0L,
+    /** LoRa hub: the last hub beacon heard over Bluetooth, and the last hub Wi-Fi request. */
+    val hubLastBeaconMs: Long = 0L,
+    val hubLastJoinRequestMs: Long = 0L,
+)
+
+/** Relay Configuration › Test connection. [endpoint] is the one that answered (or was tried last). */
+data class RelayTestResult(val ok: Boolean, val endpoint: String, val tookMs: Long, val detail: String)
 
 /** What one link is doing right now, for the link details sheet (tap a transport chip). */
 data class LinkInfo(

@@ -394,7 +394,8 @@ own simpler flood-with-dedup in firmware).
   `DtnMeshApplication` implements `Configuration.Provider` and supplies a `HiltWorkerFactory`, and the
   manifest removes WorkManager's default `WorkManagerInitializer`. Without this the default factory throws
   `NoSuchMethodException` on the assisted constructor when the cycle fires in the background.
-- **Research export.** `export/ResearchExporter` + `export/FileExportHelper` write a benchmark archive
-  (`encounters.csv`, `contacts.csv`, `decisions.csv`, `messages.csv`, `q_tables.json`, `metadata.json`),
-  triggered from the app's **Log tab** ("Export telemetry"). Useful for offline analysis of the routing /
-  RL behaviour described above.
+- **Research export.** `export/ResearchExporter` + `export/DataExportManager` write a benchmark archive
+  (`encounters.csv`, `contacts.csv`, `decisions.csv`, `messages.csv`, `q_tables.json`, `metadata.json`,
+  `message_events.csv`), from the app's **Settings › Developer Tools › Export Data** (with a date range
+  and Share; Export all logs adds the diagnostics log, engine console, journal and logcat). Useful for
+  offline analysis of the routing / RL behaviour described above.

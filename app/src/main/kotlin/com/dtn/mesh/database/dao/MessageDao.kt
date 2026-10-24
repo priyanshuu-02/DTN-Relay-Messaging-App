@@ -7,6 +7,7 @@ import androidx.room.Query
 import androidx.room.Update
 import com.dtn.mesh.database.entity.MessageEntity
 import com.dtn.mesh.database.entity.MessageStatus
+import com.dtn.mesh.model.DtnMessage
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -55,29 +56,32 @@ interface MessageDao {
      * Counts only DMs waiting for delivery. Control bundles (ANNOUNCE key-gossip, routing acks)
      * and everything addressed to "^all" (broadcasts, group messages, announces) also live in the
      * buffer — they keep spreading epidemically until their TTL by design — but they are never
-     * "waiting" for anyone, so they must not inflate the badge.
+     * "waiting" for anyone, so they must not inflate the badge. Our own group-receipt DMs
+     * ([DtnMessage.PORT_GROUP_RECEIPT]) are control traffic too.
      */
     @Query("""
         SELECT COUNT(*) FROM messages
         WHERE status = '${MessageStatus.BUFFERED}'
           AND message_type = 'DATA'
           AND destination_node_id != '^all'
+          AND port_num != ${DtnMessage.PORT_GROUP_RECEIPT}
     """)
     fun observeBufferedCount(): Flow<Int>
 
     /**
-     * Reactive flow of currently-buffered message entities (for the Network tab list).
-     * DMs only — see [observeBufferedCount]; announces and broadcasts would otherwise show up as
-     * a stream of "buffered" rows that never leave until they expire.
+     * Every user-DATA bundle in the buffer (BUFFERED / FORWARDING), newest first: DMs plus the
+     * broadcast and group messages still spreading. For the Queue tab, which shows them in separate
+     * segments. Control traffic (announces, our own group receipts) is left out here and again in
+     * the Queue's own model.
      */
     @Query("""
-        SELECT * FROM messages 
+        SELECT * FROM messages
         WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
           AND message_type = 'DATA'
-          AND destination_node_id != '^all'
+          AND port_num != ${DtnMessage.PORT_GROUP_RECEIPT}
         ORDER BY received_at_ms DESC
     """)
-    fun observeBufferedMessages(): Flow<List<MessageEntity>>
+    fun observeBufferedData(): Flow<List<MessageEntity>>
 
     /** Total payload bytes currently buffered — for buffer occupancy calculation. */
     @Query("""
@@ -157,6 +161,16 @@ interface MessageDao {
     // Per destination: with Discover off, a phone sends one direct announce to each contact, and a
     // fresh one to Alice must not delete the one still waiting to reach Bob.
     suspend fun supersedeAnnounces(origin: String, dest: String, keepId: String)
+
+    /** Drop our queued direct announces to [dest] (the contact was deleted or blocked). */
+    @Query("""
+        DELETE FROM messages
+        WHERE message_type = 'ANNOUNCE'
+          AND origin_node_id = :origin
+          AND destination_node_id = :dest
+          AND status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+    """)
+    suspend fun dropAnnouncesTo(origin: String, dest: String): Int
 
     // ──────────────────────────────────────────────────────────────────────
     // Status transitions
@@ -256,6 +270,17 @@ interface MessageDao {
         AND expires_at_ms <= :nowMs
     """)
     suspend fun getExpiringMessageIds(nowMs: Long = System.currentTimeMillis()): List<String>
+
+    /**
+     * The rows [markExpiredMessages] will expire at [nowMs], for the journal. ([getBufferedMessages]
+     * leaves expired rows out, so it can never list them.)
+     */
+    @Query("""
+        SELECT * FROM messages
+        WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+        AND expires_at_ms <= :nowMs
+    """)
+    suspend fun getExpiringMessages(nowMs: Long = System.currentTimeMillis()): List<MessageEntity>
 
     /** Permanently delete messages that have been expired/dropped for longer than retention period. */
     @Query("""

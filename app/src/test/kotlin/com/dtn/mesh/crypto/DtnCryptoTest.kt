@@ -101,14 +101,47 @@ class DtnCryptoTest {
     fun announce_signVerify_roundTrips_andDetectsTamper() {
         val (_, xPub) = DtnCrypto.generateX25519()
         val (edSeed, edPub) = DtnCrypto.generateEd25519()
-        val payload = Announce.build(xPub, edPub, edSeed, "Alice", 1_700_000_000)
+        val node = 0x1a2b3c4d
+        val payload = Announce.build(node, xPub, edPub, edSeed, "Alice", 1_700_000_000)
         val parsed = Announce.parseAndVerify(payload)
         assertNotNull(parsed)
         assertEquals("Alice", parsed!!.name)
         assertArrayEquals(xPub, parsed.xPub)
-        assertEquals(DtnCrypto.deriveNodeNum(xPub, edPub), parsed.nodeNum)
+        assertEquals(node, parsed.nodeNum)
+        assertEquals(Announce.VERSION, parsed.version)
+        assertEquals(1_700_000_000, parsed.issuedAtSec)
 
         val tampered = payload.copyOf().also { it[10] = (it[10] + 1).toByte() }
         assertNull(Announce.parseAndVerify(tampered))
+    }
+
+    @Test
+    fun announce_nodeIdIsSigned_soItCantBeRewrappedUnderAnotherId() {
+        val (_, xPub) = DtnCrypto.generateX25519()
+        val (edSeed, edPub) = DtnCrypto.generateEd25519()
+        val payload = Announce.build(0x01020304, xPub, edPub, edSeed, "Bob", 1_700_000_000)
+        // Bytes 2..5 carry the node id: any change breaks the signature.
+        val otherId = payload.copyOf().also { it[5] = (it[5] + 1).toByte() }
+        assertNull(Announce.parseAndVerify(otherId))
+    }
+
+    @Test
+    fun announce_v1FromOlderBuilds_stillParses_withTheKeyDerivedId() {
+        val (_, xPub) = DtnCrypto.generateX25519()
+        val (edSeed, edPub) = DtnCrypto.generateEd25519()
+        val parsed = Announce.parseAndVerify(Announce.buildV1(xPub, edPub, edSeed, "Old", 1_600_000_000))
+        assertNotNull(parsed)
+        assertEquals(1, parsed!!.version)
+        assertEquals(DtnCrypto.deriveNodeNum(xPub, edPub), parsed.nodeNum)
+        assertEquals("Old", parsed.name)
+    }
+
+    @Test
+    fun announce_longestName_fitsOneLoRaFrame() {
+        val (_, xPub) = DtnCrypto.generateX25519()
+        val (edSeed, edPub) = DtnCrypto.generateEd25519()
+        val payload = Announce.build(7, xPub, edPub, edSeed, "x".repeat(200), 1_700_000_000)
+        assertEquals(187, payload.size)
+        assertTrue(payload.size <= 223)
     }
 }

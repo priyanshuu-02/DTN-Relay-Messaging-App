@@ -2,6 +2,7 @@ package com.dtn.mesh.ui
 
 import com.dtn.mesh.receiver.MeshConnectionState
 import com.dtn.mesh.receiver.RadioStatusMonitor
+import com.dtn.mesh.receiver.RelayStatus
 import com.dtn.mesh.receiver.TransportKind
 import com.dtn.mesh.receiver.TransportStatus
 
@@ -27,6 +28,9 @@ data class ConnectionHeadline(val health: LinkHealth, val title: String, val det
  * @param linkPeers devices on each link right now: DTN phones in Bluetooth range, phones linked
  *   in our Wi-Fi Direct group, other phones on our hub (from each link's details).
  * @param wifiDirectSupported false below Android 10, where invitation-free groups can't run.
+ * @param relay what the internet relay is doing ([relayStatusText] then names it, the same text
+ *   every relay surface shows); null = derive it from [status] alone.
+ * @param nowMs the clock for the relay's "Retrying in N s".
  */
 fun transportChip(
     kind: TransportKind,
@@ -35,6 +39,8 @@ fun transportChip(
     relayPeers: Int,
     linkPeers: Map<TransportKind, Int> = emptyMap(),
     wifiDirectSupported: Boolean = true,
+    relay: RelayStatus? = null,
+    nowMs: Long = 0L,
 ): TransportChipModel {
     val state = status.stateOf(kind)
     val label = when (kind) {
@@ -68,14 +74,39 @@ fun transportChip(
             state == MeshConnectionState.CONNECTING -> chip(LinkHealth.BUSY, "Joining…")
             else -> chip(LinkHealth.PROBLEM, "Not joined · tap to retry")
         }
-        TransportKind.INTERNET -> when {
+        TransportKind.INTERNET -> if (relay != null && relay != RelayStatus.Off) {
+            relayStatusText(relay, relayPeers, nowMs).let { chip(it.health, it.chip) }
+        } else when {
             state == MeshConnectionState.CONNECTED ->
                 chip(LinkHealth.ON, if (relayPeers > 0) "$relayPeers contact${if (relayPeers == 1) "" else "s"} online" else "Connected")
-            !radios.internetAvailable -> chip(LinkHealth.PROBLEM, "No internet")
+            !radios.internetAvailable -> chip(LinkHealth.PROBLEM, "Waiting for internet")
             state == MeshConnectionState.CONNECTING -> chip(LinkHealth.BUSY, "Connecting…")
             else -> chip(LinkHealth.PROBLEM, "Failed · tap to retry")
         }
     }
+}
+
+/** What tapping a link (chip, Network tile, Connection links row) does. */
+enum class LinkTapAction { SHOW_DETAILS, ENABLE_BLUETOOTH, OPEN_WIFI_SETTINGS, TOGGLE }
+
+/**
+ * The link tap rule, shared by every surface that shows links: a link that's running or coming
+ * up shows its details (it can be turned off there); Bluetooth / Wi-Fi off asks for the radio
+ * first; anything else (off, or wanted but failed) starts / retries it.
+ */
+fun linkTapAction(
+    kind: TransportKind,
+    health: LinkHealth,
+    radios: RadioStatusMonitor.Radios,
+    wifiDirectSupported: Boolean,
+): LinkTapAction = when {
+    kind == TransportKind.WIFI_DIRECT && !wifiDirectSupported -> LinkTapAction.SHOW_DETAILS
+    kind == TransportKind.BLE && !radios.bluetoothOn -> LinkTapAction.ENABLE_BLUETOOTH
+    (kind == TransportKind.HUB || kind == TransportKind.WIFI_DIRECT) && !radios.wifiOn -> LinkTapAction.OPEN_WIFI_SETTINGS
+    // A relay waiting for internet can't be retried from here: its page says why and what it does.
+    kind == TransportKind.INTERNET && health == LinkHealth.PROBLEM && !radios.internetAvailable -> LinkTapAction.SHOW_DETAILS
+    health == LinkHealth.ON || health == LinkHealth.BUSY -> LinkTapAction.SHOW_DETAILS
+    else -> LinkTapAction.TOGGLE
 }
 
 /** Headline derived from the chips: online over what, coming up, needs attention, or offline. */

@@ -64,6 +64,11 @@ data class DtnMessage(
      * bit3 = receipt-lock present, bit4 = OK_TO_INTERNET, bit5 = VIA_INTERNET, bits6-7 = version.
      */
     val flags: Int = 0,
+    /**
+     * When THIS phone stored the bundle in its buffer (epoch ms; the buffer row's received time).
+     * Local only, never on the wire; 0 = not from the buffer. The 5 s DM fallback counts from it.
+     */
+    val bufferedAtMs: Long = 0L,
 ) {
     companion object {
         /**
@@ -71,6 +76,13 @@ data class DtnMessage(
          * field. No longer tied to any Meshtastic PortNum now that the LoRa path is independent.
          */
         const val PORT_NUM_PRIVATE_APP = 256
+
+        /**
+         * [portNum] of one of OUR group-receipt DMs (local only, like [portNum] itself: the wire
+         * never carries it). On the wire it's an ordinary DATA DM; here it is control traffic, kept
+         * out of the Queue, the "N queued" counters, the message journal and the benchmarks.
+         */
+        const val PORT_GROUP_RECEIPT = 257
 
         /**
          * Maximum raw payload in a single LoRa frame (SX126x). This is the hard ceiling for a

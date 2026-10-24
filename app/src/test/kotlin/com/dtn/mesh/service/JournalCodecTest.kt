@@ -64,6 +64,44 @@ class JournalCodecTest {
     }
 
     @Test
+    fun route_keepsGroupReceiptsAndTheFallback() {
+        val group = MessageLifecycleLog.RouteRecord(
+            msgId = "1a2b3c4d", source = "58fe1be9", destination = "BROADCAST", me = "58fe1be9", channel = 7,
+            timestampMs = 5L, createdAtMs = 1L,
+            groupReceipts = listOf(
+                MessageLifecycleLog.GroupReceipt("aaaa0001", 1_700_000_000_000L, "LoRa hub", "da65bdb8"),
+                MessageLifecycleLog.GroupReceipt("bbbb0002", 1_700_000_001_000L, "BLE"),
+            ),
+        )
+        assertEquals(group, JournalCodec.decode(JournalCodec.encodeRoute(group), fmt)?.route)
+
+        val fallback = MessageLifecycleLog.RouteRecord(
+            msgId = "2b3c4d5e", source = "58fe1be9", destination = "ffbd889b", me = "58fe1be9", nextHop = "da64a9b0",
+            lastPath = "LoRa hub", timestampMs = 5L, createdAtMs = 1L,
+            fallbackVia = "Internet relay,LoRa hub", fallbackAfter = "BLE",
+        )
+        val decoded = JournalCodec.decode(JournalCodec.encodeRoute(fallback), fmt)?.route
+        assertEquals(fallback, decoded)
+        assertEquals(listOf("Internet relay", "LoRa hub"), decoded?.fallbackLinks)
+    }
+
+    @Test
+    fun routeLinesFromBeforeGroupReceipts_stillLoad() {
+        val r = MessageLifecycleLog.RouteRecord(
+            msgId = "1a2b3c4d", source = "58fe1be9", destination = "BROADCAST", me = "58fe1be9", channel = 7,
+            timestampMs = 5L, createdAtMs = 1L, senderStrategy = "",
+        )
+        // A line as the previous build wrote it: 19 fields, no receipts / fallback.
+        val old = JournalCodec.encodeRoute(r).split('\t').take(19).joinToString("\t")
+        val route = JournalCodec.decode(old, fmt)?.route
+        assertEquals(r, route)
+        assertEquals(emptyList<MessageLifecycleLog.GroupReceipt>(), route?.groupReceipts)
+        assertEquals("", route?.fallbackVia)
+        // Damaged receipt entries are skipped, the rest kept.
+        assertEquals(listOf("aaaa0001"), JournalCodec.decodeReceipts("aaaa0001,5,BLE,;bad;,7,BLE").map { it.member })
+    }
+
+    @Test
     fun routeLinesFromBeforeDecisionsWereSaved_stillLoad() {
         val old = listOf("R", "1a2b3c4d", "full", "src", "dst", "0", "", "me", "nxt", "0", "5", "PROPHET",
             "1", "BLE", "", "0").joinToString("\t")

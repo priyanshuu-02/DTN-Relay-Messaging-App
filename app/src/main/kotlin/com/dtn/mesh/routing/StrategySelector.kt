@@ -45,6 +45,14 @@ class StrategySelector(
      */
     val diMaxProp: DiMaxPropStrategy get() = diMaxPropStrategy
 
+    /** This phone's node id: no strategy learns a route to (or through) itself from a neighbour's summary. */
+    fun setSelfId(id: String) {
+        prophet.selfId = id
+        stableProphet.selfId = id
+        maxProp.selfId = id
+        diMaxPropStrategy.selfId = id
+    }
+
     override val name: String get() = active.name
 
     /**

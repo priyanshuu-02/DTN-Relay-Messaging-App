@@ -7,12 +7,27 @@ package com.dtn.mesh.service
  *  - `E` event: `E \t epochMs \t EVENT \t msgId8 \t origin8 \t dest8 \t hop \t fwd \t ttlMin \t extra`
  *  - `R` route: `R \t msgId8 \t fullId \t source \t dest \t channel \t prev \t me \t next \t delivered
  *               \t updatedMs \t strategy \t createdMs \t lastPath \t outcome \t deliveredMs
- *               \t decision \t decisionMs \t senderStrategy` (the last three are optional: older
- *               lines without them still load)
+ *               \t decision \t decisionMs \t senderStrategy \t groupReceipts \t fallbackVia
+ *               \t fallbackAfter` (fields 16 on are optional: older lines without them still load,
+ *               and older builds ignore the newer ones). groupReceipts = `member,atMs,path,hop`
+ *               entries joined by `;`.
  *
  * Unknown / malformed lines are skipped, so the file can evolve without breaking old installs.
  */
 object JournalCodec {
+
+    /** Group receipts as `member,atMs,path,hop;…` (the values never contain `,` or `;`). */
+    fun encodeReceipts(list: List<MessageLifecycleLog.GroupReceipt>): String = list.joinToString(";") { g ->
+        listOf(g.member, g.atMs.toString(), g.path, g.hop).joinToString(",") { it.replace(",", " ").replace(";", " ") }
+    }
+
+    fun decodeReceipts(s: String): List<MessageLifecycleLog.GroupReceipt> =
+        if (s.isBlank()) emptyList() else s.split(';').mapNotNull { e ->
+            val p = e.split(',')
+            val at = p.getOrNull(1)?.toLongOrNull() ?: return@mapNotNull null
+            val member = p[0].takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            MessageLifecycleLog.GroupReceipt(member, at, p.getOrNull(2).orEmpty(), p.getOrNull(3).orEmpty())
+        }
 
     private fun esc(s: String): String =
         s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
@@ -49,6 +64,7 @@ object JournalCodec {
         r.nextHop.orEmpty(), if (r.delivered) "1" else "0", r.timestampMs.toString(), r.strategy,
         r.createdAtMs.toString(), r.lastPath, r.outcome, r.deliveredAtMs.toString(),
         r.decision, r.decisionAtMs.toString(), r.senderStrategy,
+        encodeReceipts(r.groupReceipts), r.fallbackVia, r.fallbackAfter,
     ).joinToString("\t") { esc(it) }
 
     /** Decoded line: exactly one of [event] / [route] is set. */
@@ -79,6 +95,9 @@ object JournalCodec {
                     decision = f.getOrNull(16).orEmpty(),
                     decisionAtMs = f.getOrNull(17)?.toLongOrNull() ?: 0L,
                     senderStrategy = f.getOrNull(18).orEmpty(),
+                    groupReceipts = decodeReceipts(f.getOrNull(19).orEmpty()),
+                    fallbackVia = f.getOrNull(20).orEmpty(),
+                    fallbackAfter = f.getOrNull(21).orEmpty(),
                 ))
             }
             else -> null

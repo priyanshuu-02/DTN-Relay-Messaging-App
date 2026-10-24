@@ -12,7 +12,7 @@ end-to-end encrypted so only the sender and recipient can read it doesn't need t
 |---|---|---|---|---|---|
 | Personal info → Name | Yes | No | Optional | App functionality | The display name (if set) is sent in the signed announce |
 | Messages → Other in-app messages | Yes | No | Optional | App functionality | Public broadcasts aren't encrypted. DMs and group messages are E2E encrypted and excluded |
-| Device or other IDs | Yes | No | Required | App functionality | The app-generated node id + public keys identify you to other phones and the relay |
+| Device or other IDs | Yes | No | Required | App functionality | The node id is a hash of Android's app-scoped device id (`ANDROID_ID`) and the package name: it persists until a factory reset (also across data clears and reinstalls). With the public keys it is this phone's address, sent to nearby phones, LoRa hubs and the relay in every message header and announce |
 
 - **Processed ephemerally?** No.
 - **Shared:** no. Transfers to other users and to the relay broker happen because the user sends a

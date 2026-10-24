@@ -38,7 +38,13 @@ class RadioStatusMonitor @Inject constructor(
         val bluetoothOn: Boolean,
         val wifiOn: Boolean,
         val locationOn: Boolean,
+        /** The default network has validated internet (the hub's SoftAP is never the default network). */
         val internetAvailable: Boolean,
+        /**
+         * That network's handle while [internetAvailable] (0 otherwise): a new value means the phone
+         * moved to another network (e.g. mobile data → Wi-Fi), which the relay reconnects over.
+         */
+        val internetNetworkId: Long = 0L,
     )
 
     private val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -88,13 +94,16 @@ class RadioStatusMonitor @Inject constructor(
             (context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager)
                 ?.let { LocationManagerCompat.isLocationEnabled(it) } == true
         }.getOrDefault(false)
+        val active = runCatching { connectivity.activeNetwork }.getOrNull()
         val internet = runCatching {
-            connectivity.getNetworkCapabilities(connectivity.activeNetwork)?.let {
+            connectivity.getNetworkCapabilities(active)?.let {
                 it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                     it.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             } == true
         }.getOrDefault(false)
-        return Radios(bluetoothOn = bt, wifiOn = wifi, locationOn = location, internetAvailable = internet)
+        val networkId = if (internet) runCatching { active?.networkHandle }.getOrNull() ?: 0L else 0L
+        return Radios(bluetoothOn = bt, wifiOn = wifi, locationOn = location, internetAvailable = internet,
+            internetNetworkId = networkId)
     }
 
     private companion object {

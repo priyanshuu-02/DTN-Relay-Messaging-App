@@ -16,8 +16,12 @@ package com.dtn.mesh.receiver
  */
 object WifiDirectGroupPolicy {
 
-    /** How long a higher-id phone waits for the lowest-id phone to create the group. */
-    const val CREATE_WAIT_MS = 8_000L
+    /**
+     * How long a higher-id phone waits for the lowest-id phone to create the group. That phone creates
+     * within ~1 s of hearing us (1 s ticks while searching) and its BLE hint follows in ~1 s, so 5 s is
+     * ample; it was 8 s (fix 2).
+     */
+    const val CREATE_WAIT_MS = 5_000L
     /** An owner with no members and no DTN phone in sight gives the group up after this. */
     const val OWNER_IDLE_MS = 120_000L
 
@@ -30,6 +34,8 @@ object WifiDirectGroupPolicy {
         val passphrase: String,
         val members: Int,
         val seenAtMs: Long,
+        /** The group's operating frequency as its owner advertised it (0 = unknown: scan every channel). */
+        val frequencyMhz: Int = 0,
     )
 
     sealed interface Action {

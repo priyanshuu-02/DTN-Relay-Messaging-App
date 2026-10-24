@@ -43,4 +43,8 @@ interface ChatDao {
 
     @Query("DELETE FROM chat_messages WHERE conv_key = :convKey")
     suspend fun deleteConversation(convKey: String)
+
+    /** Our messages in [convKey] that wait for a key change to be resolved (status HELD), oldest first. */
+    @Query("SELECT * FROM chat_messages WHERE conv_key = :convKey AND direction = 'OUT' AND status = 'HELD' ORDER BY created_at_ms ASC")
+    suspend fun getHeld(convKey: String): List<ChatMessageEntity>
 }

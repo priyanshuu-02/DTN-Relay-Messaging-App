@@ -29,21 +29,6 @@ class ResearchExporter @Inject constructor(
     private val qEngine: DoubleQLearningEngine,
 ) {
 
-    /**
-     * Export all data for a time range. Returns a [ResearchExportBundle]
-     * containing all datasets as string content (CSV/JSON).
-     */
-    suspend fun exportAll(fromMs: Long = 0, toMs: Long = System.currentTimeMillis()): ResearchExportBundle {
-        return ResearchExportBundle(
-            encountersCsv = exportEncountersCsv(fromMs, toMs),
-            contactsCsv = exportContactsCsv(),
-            decisionsCsv = exportDecisionsCsv(fromMs, toMs),
-            messagesCsv = exportMessagesCsv(fromMs, toMs),
-            qTableJson = exportQTableJson(),
-            metadata = exportMetadata(fromMs, toMs),
-        )
-    }
-
     // ── Encounters CSV ───────────────────────────────────────────────────
 
     suspend fun exportEncountersCsv(fromMs: Long, toMs: Long): String {
@@ -130,7 +115,7 @@ class ResearchExporter @Inject constructor(
 
     // ── Metadata ─────────────────────────────────────────────────────────
 
-    private suspend fun exportMetadata(fromMs: Long, toMs: Long): String {
+    suspend fun exportMetadata(fromMs: Long, toMs: Long): String {
         val uniquePeers = encounterDao.getUniquePeersEncountered()
         val statusCounts = messageDao.getStatusCounts()
         val actionDist = decisionDao.getActionDistribution()

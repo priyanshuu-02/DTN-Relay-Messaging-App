@@ -35,9 +35,9 @@ import javax.inject.Singleton
  * reactively from every transport's own state flow, so a hub that joins (or a BLE stack that
  * dies) a minute after Connect is reflected immediately.
  *
- * Send priority for a peer: BLE → Wi-Fi Direct → LoRa hub (peer is the hub) → same hub (peer is
- * another phone on our hub, bundle addressed to it) → internet relay (peer is present there) →
- * LoRa hub flood (last resort).
+ * Send priority for a peer: BLE (a link that is up now; fix 3) → Wi-Fi Direct → LoRa hub (peer is
+ * the hub) → same hub (peer is another phone on our hub, bundle addressed to it) → internet relay
+ * (peer is present there) → LoRa hub flood (last resort). No step waits for a BLE connect.
  */
 @Singleton
 class MultiTransportManager @Inject constructor(
@@ -46,10 +46,12 @@ class MultiTransportManager @Inject constructor(
     private val loRaHubTransport: LoRaHubTransportAdapter,
     private val internetTransport: InternetTransportAdapter,
     private val radios: RadioStatusMonitor,
+    private val hubBeaconRegistry: HubBeaconRegistry,
 ) : MeshTransport {
 
     companion object {
         private const val TAG = "MultiTransport"
+        private val ALL_PATHS: Set<SendPath> = SendPath.entries.toSet()
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -100,29 +102,28 @@ class MultiTransportManager @Inject constructor(
 
     override val meshPeers: StateFlow<Map<String, String>> = loRaHubTransport.meshPeers
 
+    override val linkReady: Flow<NodeId> = bleTransport.linkReady
+
     /** Wi-Fi Direct groups (no invitations) need Android 10+; older phones show it unavailable. */
     val wifiDirectSupported: Boolean get() = WifiDirectTransportAdapter.SUPPORTED
 
     private val internetLinkInfo = combine(
-        internetTransport.connectionState, internetTransport.onlinePeers, internetTransport.diagnostics,
+        internetTransport.status, internetTransport.onlinePeers, internetTransport.diagnostics,
     ) { st, peers, diag ->
         val facts = buildList {
             if (diag.isNotBlank()) add(diag)
             add("Messages stay end-to-end encrypted: the relay only ever sees ciphertext.")
         }
-        when (st) {
-            MeshConnectionState.CONNECTED -> LinkInfo(
-                summary = "Connected to the relay · " + when (peers.size) {
-                    0 -> "no contacts online"
-                    1 -> "1 contact online"
-                    else -> "${peers.size} contacts online"
-                },
-                facts = facts,
-                peers = peers.sorted().map { LinkPeer(it, role = "On the relay") },
-            )
-            MeshConnectionState.CONNECTING -> LinkInfo(summary = "Connecting to the relay…", facts = facts)
-            else -> LinkInfo(summary = "Off", facts = facts)
-        }
+        // The headline itself comes from [RelayStatus] on every surface; this is the extra line.
+        if (st is RelayStatus.Connected) LinkInfo(
+            summary = when (peers.size) {
+                0 -> "No contacts online"
+                1 -> "1 contact online"
+                else -> "${peers.size} contacts online"
+            },
+            facts = facts,
+            peers = peers.sorted().map { LinkPeer(it, role = "On the relay") },
+        ) else LinkInfo(summary = "", facts = facts)
     }
 
     /** What every link is doing and who is on it, for the link details sheet (tap a chip). */
@@ -171,17 +172,15 @@ class MultiTransportManager @Inject constructor(
                 }
             }
         }
-        // Follow internet availability: when it returns, retry the relay now rather than waiting
-        // out its reconnect back-off.
-        scope.launch {
-            radios.radios.map { it.internetAvailable }.distinctUntilChanged().drop(1).collect { available ->
-                if (available && TransportKind.INTERNET in wanted.value) internetTransport.restartIfStalled()
-            }
-        }
+        // Internet availability is followed by the relay itself (InternetTransportAdapter watches the
+        // default network: "Waiting for internet" without one, a fresh run when it returns or changes).
     }
 
     /** Relay status for diagnostics (endpoint, attempts, last error). */
     val relayDiagnostics: StateFlow<String> = internetTransport.diagnostics
+
+    /** What the internet relay is doing right now: the one model every relay surface shows. */
+    val relayStatus: StateFlow<RelayStatus> = internetTransport.status
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -230,15 +229,63 @@ class MultiTransportManager @Inject constructor(
         bleTransport.forceStalenessCheck()
     }
 
+    // ── Link pages: hubs heard over Bluetooth, joining one, rescans ─────
+
+    /** LoRa hubs whose Bluetooth beacon the BLE scan hears, strongest first (Available hubs). */
+    val hubBeacons: StateFlow<List<HubBeacon>> = hubBeaconRegistry.beacons
+
+    /** The hub we're connected to (from its HELLO), null while not connected. */
+    val connectedHubId: StateFlow<String?> = loRaHubTransport.hubId
+
+    /** The exact hub Wi-Fi the hub link is asking for, null = any `DTN-HUB-*`. */
+    val requestedHubSsid: StateFlow<String?> = loRaHubTransport.requestedSsid
+
+    /** Available hubs › Join: the hub link is wanted and asks for exactly that hub's Wi-Fi. */
+    suspend fun joinHub(hubId: String): Boolean {
+        wanted.update { it + TransportKind.HUB }
+        val ok = runCatching { loRaHubTransport.joinHub(hubId) }
+            .onFailure { Log.e(TAG, "join hub threw", it) }
+            .getOrDefault(false)
+        Log.i(TAG, "Join hub ${hubLabel(hubId)}: ${if (ok) "requested" else "could not start"}")
+        return ok
+    }
+
+    /** LoRa hub page › Retry scan: forget hubs gone quiet and, when not on a hub, ask for one again. */
+    fun retryHubScan() {
+        hubBeaconRegistry.prune(System.currentTimeMillis())
+        if (TransportKind.HUB in wanted.value && !loRaHubTransport.isConnected) loRaHubTransport.rerequestNetwork()
+    }
+
+    /** Wi-Fi Direct page › Refresh scan: discovery now (only while not linked). @return whether it started. */
+    fun rescanWifiDirect(): Boolean = wifiDirectTransport.rescan()
+
+    /** Internet relay page › Retry now: a fresh run (DNS, first endpoint) instead of waiting out the back-off. */
+    fun retryRelay() = internetTransport.retryNow()
+
+    /** Last-scan times for the link pages (read on a timer; the scan paths don't publish them). */
+    fun scanTimes(): LinkScanTimes = LinkScanTimes(
+        bleLastResultMs = bleTransport.lastScanResultMs,
+        wifiDirectLastDiscoveryMs = wifiDirectTransport.lastDiscoveryAtMs,
+        wifiDirectIntervalMs = wifiDirectTransport.discoveryIntervalMs,
+        hubLastBeaconMs = hubBeaconRegistry.lastHeardMs,
+        hubLastJoinRequestMs = loRaHubTransport.lastJoinRequestMs,
+    )
+
+    /** Relay Configuration › Test connection: a throwaway client against [url] (off the main thread). */
+    suspend fun testRelay(url: String): RelayTestResult = internetTransport.testConnection(url)
+
     /** Fan a broadcast / group / announce bundle out over the relay (no-op when it's down). */
     fun publishBroadcastToInternet(message: DtnMessage) = internetTransport.publishBroadcast(message)
 
     // ── Send ─────────────────────────────────────────────────────────────
 
-    override fun reachesDirectly(peer: NodeId): Boolean =
-        (bleTransport.isConnected && bleTransport.isPeerReachable(peer)) ||
-            (wifiDirectTransport.isConnected && wifiDirectTransport.isPeerReachable(peer)) ||
-            isHub(peer)
+    override fun reachesDirectly(peer: NodeId): Boolean = directLinks(peer).isNotEmpty()
+
+    override fun directLinks(peer: NodeId): List<SendPath> = buildList {
+        if (bleTransport.isConnected && bleTransport.isPeerReachable(peer)) add(SendPath.BLE)
+        if (wifiDirectTransport.isConnected && wifiDirectTransport.isPeerReachable(peer)) add(SendPath.WIFI_DIRECT)
+        if (isHub(peer)) add(SendPath.HUB)
+    }
 
     override fun isHub(peer: NodeId): Boolean = loRaHubTransport.isConnected && loRaHubTransport.isHub(peer)
 
@@ -249,23 +296,37 @@ class MultiTransportManager @Inject constructor(
     override suspend fun sendMessage(message: DtnMessage, targetPeer: NodeId): Int? =
         sendMessageVia(message, targetPeer)?.packetId
 
-    override suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId): SendOutcome? {
-        // 1. BLE — primary P2P, no airtime cost, coexists with hub WiFi.
-        if (bleTransport.isConnected && bleTransport.isPeerReachable(targetPeer)) {
-            bleTransport.sendMessage(message, targetPeer)?.let {
-                Log.d(TAG, "Sent via BLE to ${targetPeer.value}"); return SendOutcome(it, SendPath.BLE)
-            }
-        }
+    override suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId): SendOutcome? =
+        sendMessageVia(message, targetPeer, ALL_PATHS)
 
-        // 2. WiFi Direct — higher throughput when the peer is a P2P neighbor.
-        if (wifiDirectTransport.isConnected && wifiDirectTransport.isPeerReachable(targetPeer)) {
-            wifiDirectTransport.sendMessage(message, targetPeer)?.let {
-                Log.d(TAG, "Sent via WiFi Direct to ${targetPeer.value}"); return SendOutcome(it, SendPath.WIFI_DIRECT)
+    override suspend fun sendMessageVia(message: DtnMessage, targetPeer: NodeId, only: Set<SendPath>): SendOutcome? {
+        // 1–2. BLE — primary P2P, no airtime cost, coexists with hub WiFi — then Wi-Fi Direct. Only a
+        //      BLE link that is up NOW counts ([DirectLinkChoice], fix 3): without one, Wi-Fi Direct
+        //      (when the peer is in our group) gets the bundle at once while the BLE link comes up in
+        //      the background, and its readiness triggers a flush. Nothing here waits for a connect.
+        //      Wi-Fi Direct is also the next try, at once, when a BLE write fails.
+        val bleInRange = bleTransport.isConnected && bleTransport.isPeerReachable(targetPeer)
+        val direct = DirectLinkChoice.plan(
+            only = only,
+            bleInRange = bleInRange,
+            bleReady = bleInRange && bleTransport.hasReadyLink(targetPeer),
+            wifiDirectLinked = wifiDirectTransport.isConnected && wifiDirectTransport.isPeerReachable(targetPeer),
+        )
+        if (direct.connectBle) bleTransport.requestLink(targetPeer)
+        for (path in direct.order) {
+            val packetId = when (path) {
+                SendPath.BLE -> bleTransport.sendMessage(message, targetPeer)
+                SendPath.WIFI_DIRECT -> wifiDirectTransport.sendMessage(message, targetPeer)
+                else -> null
+            }
+            if (packetId != null) {
+                Log.d(TAG, "Sent via ${path.label} to ${targetPeer.value}")
+                return SendOutcome(packetId, path)
             }
         }
 
         // 3. LoRa hub — the target is the hub itself.
-        if (loRaHubTransport.isConnected && loRaHubTransport.isHub(targetPeer)) {
+        if (SendPath.HUB in only && loRaHubTransport.isConnected && loRaHubTransport.isHub(targetPeer)) {
             loRaHubTransport.sendMessage(message, targetPeer)?.let {
                 Log.d(TAG, "Handed to LoRa hub for ${targetPeer.value}"); return SendOutcome(it, SendPath.HUB)
             }
@@ -275,7 +336,7 @@ class MultiTransportManager @Inject constructor(
         //    bundle's destination, so this only applies to bundles addressed to that phone: the
         //    hub passes them straight on (no LoRa airtime), but it's two hops, so delivery still
         //    waits for the end-to-end receipt.
-        if (message.destinationNodeId == targetPeer && loRaHubTransport.isHubPeer(targetPeer)) {
+        if (SendPath.HUB_LOCAL in only && message.destinationNodeId == targetPeer && loRaHubTransport.isHubPeer(targetPeer)) {
             loRaHubTransport.sendMessage(message, targetPeer)?.let {
                 Log.d(TAG, "Handed to LoRa hub for ${targetPeer.value} (same hub)"); return SendOutcome(it, SendPath.HUB_LOCAL)
             }
@@ -283,7 +344,7 @@ class MultiTransportManager @Inject constructor(
 
         // 5. Internet relay — the target is present on the relay and no local radio reaches it.
         //    Direct, reliable and free of LoRa airtime, so it beats flooding the backbone.
-        if (internetTransport.isConnected && internetTransport.isPeerOnline(targetPeer)) {
+        if (SendPath.INTERNET in only && internetTransport.isConnected && internetTransport.isPeerOnline(targetPeer)) {
             internetTransport.sendMessage(message, targetPeer)?.let {
                 Log.d(TAG, "Sent via internet relay to ${targetPeer.value}"); return SendOutcome(it, SendPath.INTERNET)
             }
@@ -291,13 +352,13 @@ class MultiTransportManager @Inject constructor(
 
         // 6. LoRa hub flood — last resort. The hub floods the backbone and delivers to whichever
         //    phone registered with that node id (critical for receipts to remote phones).
-        if (loRaHubTransport.isConnected) {
+        if (SendPath.HUB_FLOOD in only && loRaHubTransport.isConnected) {
             loRaHubTransport.sendMessage(message, targetPeer)?.let {
                 Log.d(TAG, "Relayed via LoRa hub to ${targetPeer.value}"); return SendOutcome(it, SendPath.HUB_FLOOD)
             }
         }
 
-        Log.w(TAG, "No transport available for ${targetPeer.value}")
+        Log.w(TAG, "No transport available for ${targetPeer.value}" + if (only.size < ALL_PATHS.size) " over $only" else "")
         return null
     }
 }

@@ -56,16 +56,24 @@ import javax.inject.Singleton
  *   ([meshPeers]); not online peers — a DM to one still goes to our hub, which floods it.
  *
  * ## Auto-join
- * On API 29+ we request the hub network via [WifiNetworkSpecifier] (SSID prefix "DTN-HUB-") and
- * bind our socket to it, so the phone can attach without leaving the app and without losing its
- * cellular data default. On older APIs we assume the user has joined the hub WiFi manually and
- * connect on the active network.
+ * On API 29+ we request the hub network via [WifiNetworkSpecifier] and bind our socket to it, so
+ * the phone can attach without leaving the app and without losing its cellular data default. The
+ * request names the strongest hub whose Bluetooth beacon we hear ([HubBeaconRegistry], exact SSID
+ * "DTN-HUB-XXXX" = the last 4 hex digits of its id), or the hub picked with [joinHub]; with no
+ * beacon heard it asks for any "DTN-HUB-" network (SSID prefix), as before. On older APIs we
+ * assume the user has joined the hub WiFi manually and connect on the active network.
  */
 @Singleton
 class LoRaHubTransportAdapter @Inject constructor(
     @ApplicationContext private val context: Context,
     private val identity: LocalNodeIdentity,
+    private val diagnostics: com.dtn.mesh.service.DiagnosticsLog,
+    private val hubBeacons: HubBeaconRegistry,
 ) : DtnTransport {
+
+    private fun diagInfo(text: String) = diagnostics.i(com.dtn.mesh.service.DiagSource.HUB, text)
+    private fun diagWarn(text: String) = diagnostics.w(com.dtn.mesh.service.DiagSource.HUB, text)
+    private fun diagError(text: String) = diagnostics.e(com.dtn.mesh.service.DiagSource.HUB, text)
 
     companion object {
         private const val TAG = "LoRaHubTransport"
@@ -88,6 +96,10 @@ class LoRaHubTransportAdapter @Inject constructor(
         private const val CONNECT_TIMEOUT_MS = 8_000
         /** A hub reboot takes ~6 s before its Wi-Fi is back; asking sooner ends in "No devices found". */
         private const val REREQUEST_DELAY_MS = 8_000L
+        /** Auto-join skips a hub whose Wi-Fi request just failed for this long (then it's tried again). */
+        private const val FAILED_HUB_BACKOFF_MS = 60_000L
+        /** Right after the BLE scan starts, auto-join waits up to this long for a hub beacon. */
+        private const val BEACON_WAIT_MS = 3_000L
         /** Well inside the hub's 120 s idle timeout. */
         private const val PING_INTERVAL_MS = 30_000L
 
@@ -142,6 +154,24 @@ class LoRaHubTransportAdapter @Inject constructor(
     @Volatile private var hubNodeId: NodeId? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
+    /** The hub picked with Join (Available hubs), kept until auto-join runs again or the link is switched off. */
+    @Volatile private var pinnedHubId: String? = null
+    /** Hub id → until when auto-join skips it (its Wi-Fi request failed). */
+    private val failedHubs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** The hub the current Wi-Fi request asks for (null = any DTN-HUB-* network). */
+    @Volatile private var requestedHubId: String? = null
+
+    private val _requestedSsid = MutableStateFlow<String?>(null)
+    /** The exact hub Wi-Fi being asked for ("DTN-HUB-A9B0"), null = any `DTN-HUB-*` (no beacon heard). */
+    val requestedSsid: StateFlow<String?> = _requestedSsid.asStateFlow()
+
+    /** When the hub Wi-Fi was last asked for (0 = not yet), for the LoRa hub page. */
+    @Volatile var lastJoinRequestMs: Long = 0L
+        private set
+
+    /** Auto-join waiting briefly for the first hub beacons right after Bluetooth started scanning. */
+    @Volatile private var beaconWaitJob: kotlinx.coroutines.Job? = null
+
     private val _hubId = MutableStateFlow<String?>(null)
     /** The connected hub's node id (null while not connected). */
     val hubId: StateFlow<String?> = _hubId.asStateFlow()
@@ -178,7 +208,7 @@ class LoRaHubTransportAdapter @Inject constructor(
     override val connectionState: StateFlow<MeshConnectionState> = _connectionState.asStateFlow()
 
     /** Hub + the phones on it (and on the hubs it hears over LoRa), for the link details sheet. */
-    val linkInfo: StateFlow<LinkInfo> = combine(_connectionState, _hubId, _hubPeers, _meshPeers) { st, hub, peers, mesh ->
+    val linkInfo: StateFlow<LinkInfo> = combine(_connectionState, _hubId, _hubPeers, _meshPeers, _requestedSsid) { st, hub, peers, mesh, asked ->
         when {
             st == MeshConnectionState.CONNECTED && hub != null -> LinkInfo(
                 summary = "Connected to hub $hub · " + when (peers.size) {
@@ -196,7 +226,7 @@ class LoRaHubTransportAdapter @Inject constructor(
                     },
             )
             st == MeshConnectionState.CONNECTED -> LinkInfo(summary = "Connected — waiting for the hub to answer")
-            st == MeshConnectionState.CONNECTING -> LinkInfo(summary = "Joining the hub's Wi-Fi (DTN-HUB-…)")
+            st == MeshConnectionState.CONNECTING -> LinkInfo(summary = "Joining the hub's Wi-Fi (${asked ?: "DTN-HUB-…"})")
             else -> LinkInfo(summary = "Not connected")
         }
     }.stateIn(scope, SharingStarted.Eagerly, LinkInfo())
@@ -211,8 +241,32 @@ class LoRaHubTransportAdapter @Inject constructor(
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
+    /** Auto-join (switch on, Connect, retry): the strongest hub heard, else any `DTN-HUB-*`. */
     override suspend fun connect(): Boolean {
         if (isConnected) return true
+        pinnedHubId = null
+        return start()
+    }
+
+    /**
+     * Join one hub (Available hubs › Join): ask Android for exactly its Wi-Fi ("DTN-HUB-A9B0"),
+     * leaving the hub we're on. It stays the choice until auto-join runs again ([connect]) or the
+     * link is switched off. Before Android 10 the user joins hub Wi-Fi by hand, so this is [connect].
+     */
+    suspend fun joinHub(hubId: String): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return connect()
+        pinnedHubId = hubId
+        if (isConnected && hubNodeId?.value == hubId) return true
+        if (socket != null || boundNetwork != null) {
+            diagInfo("Leaving ${hubNodeId?.let { hubLabel(it.value) } ?: "the current hub"} to join ${hubLabel(hubId)}")
+            runCatching { socket?.close() }
+            socket = null; output = null
+            linkDown()
+        }
+        return start()
+    }
+
+    private fun start(): Boolean {
         wantConnection = true
         _connectionState.value = MeshConnectionState.CONNECTING
 
@@ -221,10 +275,31 @@ class LoRaHubTransportAdapter @Inject constructor(
                 // A previous request may have been declined in the system dialog or timed out with
                 // no hub in range. Drop it before asking again, otherwise every "tap to retry"
                 // would stack another pending request and callback.
+                runCatching { beaconWaitJob?.cancel() }
                 networkCallback?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
                 networkCallback = null
                 boundNetwork = null
-                requestHubNetwork() // learns the hub's WiFi Network via the callback
+                val now = System.currentTimeMillis()
+                val scanning = hubBeacons.scanStartedMs
+                val waitMs = if (scanning > 0) scanning + BEACON_WAIT_MS - now else 0L
+                if (pinnedHubId == null && waitMs > 0 && hubBeacons.strongest(now) == null) {
+                    // Bluetooth only just started scanning (Connect starts both): give the hubs'
+                    // ~1 s beacons a moment, so auto-join can ask for the strongest hub.
+                    beaconWaitJob = scope.launch {
+                        val until = System.currentTimeMillis() + waitMs
+                        while (System.currentTimeMillis() < until && hubBeacons.strongest(System.currentTimeMillis()) == null) {
+                            kotlinx.coroutines.delay(250L)
+                        }
+                        if (wantConnection && networkCallback == null && !isConnected) {
+                            runCatching { requestHubNetwork() }.onFailure {
+                                Log.w(TAG, "hub Wi-Fi request failed", it)
+                                diagWarn("Hub Wi-Fi request failed: ${it.javaClass.simpleName}")
+                            }
+                        }
+                    }
+                } else {
+                    requestHubNetwork() // learns the hub's WiFi Network via the callback
+                }
             }
             // One supervised reconnect loop serves both the API-29 specifier path and the legacy
             // manual-join path, retrying with exponential backoff whenever the socket drops.
@@ -234,11 +309,13 @@ class LoRaHubTransportAdapter @Inject constructor(
             return true
         } catch (e: SecurityException) {
             Log.e(TAG, "LoRa Hub permission missing: ${e.message}")
+            diagError("Start failed: Wi-Fi permission missing")
             _connectionState.value = MeshConnectionState.DISCONNECTED
             disconnect()
             return false
         } catch (e: Exception) {
             Log.e(TAG, "LoRa Hub startup failed: ${e.message}", e)
+            diagError("Start failed: ${e.javaClass.simpleName} ${e.message.orEmpty()}")
             _connectionState.value = MeshConnectionState.DISCONNECTED
             disconnect()
             return false
@@ -247,6 +324,10 @@ class LoRaHubTransportAdapter @Inject constructor(
 
     override fun disconnect() {
         wantConnection = false
+        pinnedHubId = null
+        _requestedSsid.value = null
+        runCatching { beaconWaitJob?.cancel() }
+        beaconWaitJob = null
         runCatching { connectionJob?.cancel() }
         connectionJob = null
         _connectionState.value = MeshConnectionState.DISCONNECTED
@@ -286,6 +367,8 @@ class LoRaHubTransportAdapter @Inject constructor(
                 isOnline = false, transport = TransportKind.HUB))
         }
         Log.i(TAG, "Hub roster: ${now.size} other phone(s) ${now.joinToString { it.takeLast(8) }}")
+        diagInfo("Roster changed: ${now.size} other phone(s) on this hub" +
+            if (now.isEmpty()) "" else " (${now.joinToString { it.takeLast(8) }})")
     }
 
     /** Apply a MESH_ROSTER: the phones on the other hubs ours hears (presence only, no encounters). */
@@ -299,6 +382,8 @@ class LoRaHubTransportAdapter @Inject constructor(
         _meshPeers.value = now
         Log.i(TAG, "Other hubs: ${now.size} phone(s) " +
             now.entries.joinToString { "${it.key.takeLast(8)}@${it.value.takeLast(8)}" })
+        diagInfo("Other hubs changed: ${now.size} phone(s) over LoRa on ${now.values.toSet().size} hub(s)" +
+            if (now.isEmpty()) "" else " (" + now.entries.joinToString { "${it.key.takeLast(8)}@${hubLabel(it.value)}" } + ")")
     }
 
     /**
@@ -322,17 +407,24 @@ class LoRaHubTransportAdapter @Inject constructor(
                 _connectionState.value = MeshConnectionState.CONNECTED
                 backoff = 1_000L
                 Log.i(TAG, "Connected to hub at $HUB_IP:$HUB_PORT as ${identity.nodeId}")
+                diagInfo("Connected to the hub at $HUB_IP:$HUB_PORT, registered as ${identity.nodeId.value.takeLast(8)}")
                 // The hub drops phones that stay silent for 2 minutes; keep the link alive.
                 runCatching { pingJob?.cancel() }
                 pingJob = scope.launch {
                     while (true) {
                         kotlinx.coroutines.delay(PING_INTERVAL_MS)
-                        runCatching { writeFrame(FRAME_PING, byteArrayOf(0)) }.onFailure { return@launch }
+                        runCatching { writeFrame(FRAME_PING, byteArrayOf(0)) }.onFailure {
+                            diagWarn("Ping to the hub failed: ${it.javaClass.simpleName}")
+                            return@launch
+                        }
                     }
                 }
                 readLoop(DataInputStream(sock.getInputStream())) // blocks until the socket drops
+                if (wantConnection) diagWarn("Hub link closed — reconnecting")
             } catch (e: Exception) {
                 Log.w(TAG, "Hub connect/read failed: ${e.message}")
+                if (wantConnection) diagWarn("Hub connect/read failed: ${e.javaClass.simpleName} ${e.message.orEmpty()} " +
+                    "— retrying in ${backoff / 1000} s")
             }
             // Still trying (the loop retries below) — report CONNECTING, not "not joined". Only a
             // definitive "no hub / declined" from the system (onUnavailable) means DISCONNECTED,
@@ -363,15 +455,41 @@ class LoRaHubTransportAdapter @Inject constructor(
             _connectionState.value = MeshConnectionState.CONNECTING
             requestHubNetwork()
             Log.i(TAG, "Re-requested hub Wi-Fi")
-        }.onFailure { Log.w(TAG, "hub Wi-Fi re-request failed", it) }
+            diagInfo("Asked Android for the hub Wi-Fi again")
+        }.onFailure {
+            Log.w(TAG, "hub Wi-Fi re-request failed", it)
+            diagWarn("Hub Wi-Fi re-request failed: ${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * The hub to ask for: the one picked with Join, else the strongest hub beacon heard (minus hubs
+     * whose Wi-Fi just failed), else null = any `DTN-HUB-*` (no beacon heard: today's behaviour).
+     */
+    private fun chooseHub(): Pair<String, String>? {
+        pinnedHubId?.let { return it to "picked with Join" }
+        val now = System.currentTimeMillis()
+        failedHubs.entries.removeAll { it.value < now }
+        val best = hubBeacons.strongest(now, exclude = failedHubs.keys) ?: return null
+        return best.hubId to "strongest hub heard, ${best.rssi} dBm"
     }
 
     @SuppressLint("MissingPermission")
     private fun requestHubNetwork() {
-        val specifier = WifiNetworkSpecifier.Builder()
-            .setSsidPattern(PatternMatcher(HUB_SSID_PREFIX, PatternMatcher.PATTERN_PREFIX))
-            .setWpa2Passphrase(HUB_PASSPHRASE)
-            .build()
+        val choice = chooseHub()
+        val hubId = choice?.first
+        val builder = WifiNetworkSpecifier.Builder()
+        if (hubId != null) {
+            builder.setSsid(HubBeacons.ssidFor(hubId))
+        } else {
+            builder.setSsidPattern(PatternMatcher(HUB_SSID_PREFIX, PatternMatcher.PATTERN_PREFIX))
+        }
+        val specifier = builder.setWpa2Passphrase(HUB_PASSPHRASE).build()
+        requestedHubId = hubId
+        _requestedSsid.value = hubId?.let { HubBeacons.ssidFor(it) }
+        lastJoinRequestMs = System.currentTimeMillis()
+        diagInfo(if (choice != null) "Asking Android for ${HubBeacons.ssidFor(choice.first)} (${choice.second})"
+            else "Asking Android for any $HUB_SSID_PREFIX* network (no hub beacon heard)")
 
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -382,11 +500,13 @@ class LoRaHubTransportAdapter @Inject constructor(
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "Hub WiFi available")
+                diagInfo("Hub Wi-Fi found and joined")
                 boundNetwork = network // the reconnect loop picks this up and (re)connects
             }
 
             override fun onLost(network: Network) {
                 Log.w(TAG, "Hub WiFi lost")
+                diagWarn("Hub Wi-Fi lost")
                 boundNetwork = null // the loop will wait until the hub WiFi returns
                 _connectionState.value = if (wantConnection) MeshConnectionState.CONNECTING else MeshConnectionState.DISCONNECTED
                 runCatching { socket?.close() }
@@ -402,6 +522,12 @@ class LoRaHubTransportAdapter @Inject constructor(
             override fun onUnavailable() {
                 // The system gave up: no hub in range, or the user declined the join dialog.
                 Log.w(TAG, "Hub WiFi unavailable")
+                val asked = requestedHubId
+                diagWarn("Hub Wi-Fi unavailable: " + (asked?.let { "${HubBeacons.ssidFor(it)} not found" } ?: "no DTN-HUB-* network in range") +
+                    ", or the join was declined")
+                // Auto-join tries another hub (or any DTN-HUB-*) on the next retry; a hub picked
+                // with Join stays picked.
+                if (asked != null && pinnedHubId == null) failedHubs[asked] = System.currentTimeMillis() + FAILED_HUB_BACKOFF_MS
                 _connectionState.value = MeshConnectionState.DISCONNECTED
             }
         }
@@ -417,6 +543,7 @@ class LoRaHubTransportAdapter @Inject constructor(
             val len = (input.readUnsignedByte() shl 8) or input.readUnsignedByte()
             if (len < 0 || len > DtnMessage.LORA_MAX_FRAME_BYTES * 4) {
                 Log.w(TAG, "Bad frame length $len, closing")
+                diagWarn("Bad frame from the hub (length $len) — closing the link")
                 break
             }
             val payload = ByteArray(len)
@@ -428,6 +555,7 @@ class LoRaHubTransportAdapter @Inject constructor(
                     hubNodeId = hub
                     _hubId.value = hub.value
                     Log.i(TAG, "Hub HELLO: $hub")
+                    diagInfo("Hub HELLO: hub id ${hub.value.takeLast(8)} (${hubLabel(hub.value)})")
                     emitHubEncounter(hub, online = true)
                 }
                 FRAME_ROSTER -> parseRoster(payload)?.let { updateRoster(it) }
@@ -463,6 +591,7 @@ class LoRaHubTransportAdapter @Inject constructor(
             pktId
         } catch (e: Exception) {
             Log.e(TAG, "Send to hub failed", e)
+            diagWarn("Send to the hub failed: ${e.javaClass.simpleName}")
             null
         }
     }

@@ -87,8 +87,8 @@ class DiMaxPropStrategyTest {
 
     @Test
     fun theNearerOfTwoEqualRelaysWins_whenLambdaIsPositive() {
-        // No transitive seeding here, so the only paths to D are the two relays.
-        val s = DiMaxPropStrategy(DiMaxPropConfig(lambda = 0.5, transitivityDiscount = 0.0)).apply { selfId = me }
+        // The only paths to D are the two relays.
+        val s = DiMaxPropStrategy(DiMaxPropConfig(lambda = 0.5)).apply { selfId = me }
         meet(s, b, 2, distanceM = 40.0) // far: d_norm 0.8
         meet(s, c, 2, distanceM = 2.0)  // near: d_norm 0.04
         s.onRoutingSummaryReceived(NodeId(b), neighbourSummary(d to 1))
@@ -112,7 +112,7 @@ class DiMaxPropStrategyTest {
 
     @Test
     fun mixedPath_appliesTheDistanceTermOnlyWhereKnown() {
-        val s = DiMaxPropStrategy(DiMaxPropConfig(lambda = 0.5, transitivityDiscount = 0.0)).apply { selfId = me }
+        val s = DiMaxPropStrategy(DiMaxPropConfig(lambda = 0.5)).apply { selfId = me }
         meet(s, b, 1, distanceM = 25.0) // me → B has a distance (0.5)
         s.onRoutingSummaryReceived(NodeId(b), neighbourSummary(d to 1)) // B → D has none
         val p = s.costFromMe(d)
@@ -129,7 +129,8 @@ class DiMaxPropStrategyTest {
     @Test
     fun forwardsToACarrierThatIsCloserToTheDestination() {
         val s = DiMaxPropStrategy().apply { selfId = me }
-        meet(s, b, 1)
+        // Met over Bluetooth 10 m away: the hop to B costs λ·d > 0 (B is our only contact, f = 1).
+        meet(s, b, 1, distanceM = 10.0)
         s.onRoutingSummaryReceived(NodeId(b), neighbourSummary(d to 5))
         val decision = s.decide(d, b)
         assertEquals(DiMaxPropStrategy.Verdict.FORWARD, decision.verdict)

@@ -237,4 +237,11 @@ interface ContactDao {
     /** Contacts in the chat list (they get our direct announces while Discover is off). */
     @Query("SELECT * FROM contacts WHERE is_added = 1")
     suspend fun getAddedContacts(): List<ContactEntity>
+
+    /**
+     * Delete contact: take a peer out of the chat list. The row itself (keys, routing stats) stays,
+     * so relaying keeps working and a later DM from them still decrypts (and re-adds them).
+     */
+    @Query("UPDATE contacts SET is_added = 0 WHERE node_id = :nodeId")
+    suspend fun markNotAdded(nodeId: String): Int
 }

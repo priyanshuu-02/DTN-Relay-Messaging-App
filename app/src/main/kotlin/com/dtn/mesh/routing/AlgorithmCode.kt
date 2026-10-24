@@ -11,6 +11,9 @@ package com.dtn.mesh.routing
  */
 object AlgorithmCode {
 
+    /** Bytes the code adds in front of a DM's plaintext. */
+    const val PREFIX_BYTES = 1
+
     fun of(type: StrategySelector.StrategyType): Byte = when (type) {
         StrategySelector.StrategyType.PROPHET -> 0x01
         StrategySelector.StrategyType.STABLE -> 0x02

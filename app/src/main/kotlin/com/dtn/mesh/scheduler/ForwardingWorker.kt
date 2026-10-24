@@ -7,6 +7,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.dtn.mesh.database.dao.ForwardingDecisionDao
 import com.dtn.mesh.database.dao.SeenBundleDao
+import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.DtnMessageType
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.routing.StrategySelector
@@ -50,27 +51,31 @@ class ForwardingWorker @AssistedInject constructor(
         Log.d(TAG, "Housekeeping cycle starting")
 
         // Phase 1: TTL expiry. Log each message about to expire BEFORE the DB marks it, so the
-        // lifecycle feed / buffer-history show why it left the buffer (previously these were
-        // only Log.d and never surfaced in-app).
+        // lifecycle feed / buffer-history show why it left the buffer. Both steps use one clock, so
+        // exactly the journaled rows turn EXPIRED, and an EXPIRED row is never listed again: one
+        // journal entry per message. (This used to read getAllBuffered(), which already leaves
+        // expired rows out, so nothing was ever journaled and no expiry reward was ever set.)
+        val now = System.currentTimeMillis()
         runCatching {
-            queueManager.getAllBuffered()
-                .filter { it.remainingTtlMs() <= 0L }
+            queueManager.getExpiring(now)
                 .forEach { m ->
                     // Only user messages belong in the message journal; announces and receipts
-                    // expire constantly by design and would bury real events.
-                    if (m.messageType == DtnMessageType.DATA) {
+                    // (our own group receipts too, DATA on the wire) expire constantly by design
+                    // and would bury real events.
+                    if (m.messageType == DtnMessageType.DATA && m.portNum != DtnMessage.PORT_GROUP_RECEIPT) {
                         lifecycle.log(LifecycleEvent.EXPIRED, m.id,
                             origin = m.originNodeId.value, dest = m.destinationNodeId.value,
                             hopCount = m.hopCount, extra = "TTL reached before delivery")
                     } else {
-                        lifecycle.console("CTRL ${m.messageType.name} ${m.id.take(8)} expired")
+                        val kind = if (m.portNum == DtnMessage.PORT_GROUP_RECEIPT) "GROUP-RECEIPT" else m.messageType.name
+                        lifecycle.console("CTRL $kind ${m.id.take(8)} expired")
                     }
                     // Q-learning credit: decisions on a message that expired undelivered get a
                     // negative reward so the engine learns to avoid whatever led here.
                     runCatching { decisionDao.setRewardByMessageId(m.id, DtnOrchestrator.REWARD_EXPIRED) }
                 }
         }
-        val expired = queueManager.expireMessages()
+        val expired = queueManager.expireMessages(now)
         if (expired > 0) Log.d(TAG, "Expired $expired messages")
 
         // Phase 2: Revert timed-out forwards

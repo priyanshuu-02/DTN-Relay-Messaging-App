@@ -59,16 +59,39 @@ class QrPayloadsTest {
     }
 
     @Test
-    fun identityQr_roundTrips_andRejectsBadKeys() {
+    fun identityQr_roundTrips_withTheNodeId_andRejectsBadKeys() {
         val x = ByteArray(32) { it.toByte() }
         val ed = ByteArray(32) { (31 - it).toByte() }
-        val p = IdentityQr.parse(IdentityQr.build(x, ed, "Priya: phone 2"))
+        val text = IdentityQr.build(0x9a0b1c2d.toInt(), x, ed, "Priya: phone 2")
+        assertTrue(text.startsWith("dtnid:2:9a0b1c2d:"))
+        val p = IdentityQr.parse(text)
         assertNotNull(p)
-        assertArrayEquals(x, p!!.xPub)
+        assertEquals(0x9a0b1c2d.toInt(), p!!.nodeNum)
+        assertArrayEquals(x, p.xPub)
         assertArrayEquals(ed, p.edPub)
         assertEquals("Priya: phone 2", p.name)
 
         assertNull(IdentityQr.parse("dtnid:1:AAAA:BBBB:name"))
+        assertNull(IdentityQr.parse("dtnid:2:9a0b1c2d:AAAA:BBBB:name"))
         assertNull(IdentityQr.parse("dtngrp:1:x:y"))
+    }
+
+    @Test
+    fun identityQr_v1FromOlderBuilds_usesTheKeyDerivedId() {
+        val x = ByteArray(32) { (it * 3).toByte() }
+        val ed = ByteArray(32) { (it + 9).toByte() }
+        val enc = Base64.getEncoder().withoutPadding()
+        val p = IdentityQr.parse("dtnid:1:" + enc.encodeToString(x) + ":" + enc.encodeToString(ed) + ":Old phone")
+        assertNotNull(p)
+        assertEquals(DtnCrypto.deriveNodeNum(x, ed), p!!.nodeNum)
+        assertEquals("Old phone", p.name)
+    }
+
+    @Test
+    fun identityQr_neverAcceptsTheReservedIds() {
+        val x = ByteArray(32) { it.toByte() }
+        val ed = ByteArray(32) { it.toByte() }
+        assertNull(IdentityQr.parse(IdentityQr.build(0, x, ed, "zero")))
+        assertNull(IdentityQr.parse(IdentityQr.build(-1, x, ed, "broadcast")))
     }
 }

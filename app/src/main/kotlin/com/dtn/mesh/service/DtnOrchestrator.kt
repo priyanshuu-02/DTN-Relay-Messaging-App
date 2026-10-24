@@ -81,6 +81,8 @@ class DtnOrchestrator @Inject constructor(
     private val localIdentity: com.dtn.mesh.model.LocalNodeIdentity,
     private val settings: com.dtn.mesh.settings.SettingsRepository,
     private val qStore: QTableStore,
+    private val diagnostics: DiagnosticsLog,
+    private val contactKeys: ContactKeyManager,
 ) {
     companion object {
         private const val TAG = "DtnOrchestrator"
@@ -111,17 +113,17 @@ class DtnOrchestrator @Inject constructor(
          * Set to 1 (fully serial). On-device logs showed that opening multiple GATT client
          * connections at once — on top of our own GATT server + advertiser + scanner — overloads
          * the phone's BLE stack and produces `status=133` connect failures, which in turn dropped
-         * links and made peers appear to go offline. Serialising sends is the stable choice; the
-         * head-of-line latency it reintroduces is bounded by the per-peer connect timeout plus the
-         * [CONNECT_BACKOFF_MS] skip for peers that just failed. (Coalescing, backoff, and receipt
-         * de-duplication from the multi-phone pass are retained.)
+         * links and made peers appear to go offline. Serialising sends is the stable choice; since
+         * fix 3 BLE connects run in the background (a send only uses a link that is up), so the
+         * head-of-line latency is a few writes, not a connect timeout. (Coalescing, backoff, and
+         * receipt de-duplication from the multi-phone pass are retained.)
          */
         private const val MAX_CONCURRENT_SENDS = 1
 
         /**
-         * After a failed send to a peer, skip it for this long instead of paying the ~8s connect
-         * timeout again on every 4s flush. Cleared the moment any send to that peer succeeds or
-         * the peer re-announces online.
+         * After a slow failed send to a peer ([SLOW_SEND_FAILURE_MS]), skip it for this long instead
+         * of paying the timeout again on every 4s flush. Cleared the moment any send to that peer
+         * succeeds, a BLE link with it comes up, or it goes offline.
          */
         private const val CONNECT_BACKOFF_MS = 10_000L
 
@@ -130,14 +132,48 @@ class DtnOrchestrator @Inject constructor(
         private const val REWARD_FORWARD_DELIVERED = 1.0   // the FORWARD that reached the deliverer
         const val REWARD_EXPIRED = -0.3                    // message expired before delivery
 
-        /**
-         * In the DiMaxProp progress reward η·(C(A,D) − C(B,D)), a side that knows no path counts as
-         * this far away (a few hops of `1 + λ`), so moving a bundle to a relay that knows a path
-         * earns a bounded reward rather than an infinite one.
-         */
-        private const val UNREACHABLE_COST = 3.0
         /** Saved Q-tables are rewritten at most this often (and on stop). */
         private const val Q_SAVE_DELAY_MS = 5_000L
+        /**
+         * A flush pass slower than this is written to the diagnostics log (timing). Since fix 3 no
+         * send waits for a BLE connect, so a pass normally takes well under a second.
+         */
+        private const val SLOW_FLUSH_MS = 2_000L
+        /**
+         * A failed send that took at least this long backs its peer off ([CONNECT_BACKOFF_MS]). One
+         * that failed at once (no link up yet: BLE connects in the background) costs nothing to
+         * retry, and the link coming up flushes anyway.
+         */
+        private const val SLOW_SEND_FAILURE_MS = 1_000L
+        /** "Q-tables saved" goes to the diagnostics log at most this often. */
+        private const val Q_SAVE_LOG_INTERVAL_MS = 60_000L
+
+        /**
+         * The links a DATA DM takes in its peer's pass ([sendToSingle]): a phone a link of ours ends
+         * at gets it over that link only (BLE, then Wi-Fi Direct at once if the BLE write fails); a
+         * phone only on our hub through the hub; one only on the relay over the relay. Every other
+         * link is the 5 s fallback's ([fallbackPass]), paced there.
+         */
+        private val DIRECT_TIER = setOf(SendPath.BLE, SendPath.WIFI_DIRECT)
+        private val SAME_HUB_TIER = setOf(SendPath.HUB_LOCAL)
+        private val RELAY_TIER = setOf(SendPath.INTERNET)
+
+        /** A member's group receipts to one origin wait this long, so one DM carries several ids. */
+        private const val GROUP_RECEIPT_BATCH_MS = 3_000L
+    }
+
+    /** Per-peer "held because…" summaries, logged only when they change (see [sendToSingle]). */
+    private val heldTracker = HeldReasonTracker()
+    /** peer → link it came online over, so presence is logged on transitions only (not every scan hit). */
+    private val presenceLink = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var lastQSaveLogMs = 0L
+
+    private fun logQSave(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastQSaveLogMs < Q_SAVE_LOG_INTERVAL_MS) return
+        lastQSaveLogMs = now
+        diagnostics.d(DiagSource.QLEARN, "Q-tables saved ($reason) · ε=${"%.3f".format(qEngine.currentEpsilon)} · " +
+            "updates=${qEngine.totalUpdates}")
     }
 
     private sealed class OrchestratorEvent {
@@ -171,19 +207,48 @@ class DtnOrchestrator @Inject constructor(
     private val sentTo = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, Long>>()
 
     /**
-     * msgId → the immediate peer we received that bundle from (the real previous hop, as
-     * reported by the transport). Used to suppress the reverse-echo bug: in an A→B→C→D
-     * chain, C must not hand the bundle straight back to B just because B isn't the wire
-     * header's origin (A). Entries are cleared alongside [sentTo] when the message leaves
-     * our buffer.
+     * msgId → every peer that handed us that bundle (the real previous hops, as reported by the
+     * transport): the first copy and any later duplicate. Used to suppress the reverse-echo bug:
+     * in an A→B→C→D chain, C must not hand the bundle straight back to B just because B isn't the
+     * wire header's origin (A). One previous hop per message wasn't enough: a duplicate from
+     * another carrier replaced it, and the real previous hop became eligible again (the multi-hop
+     * simulation caught G sending a bundle back to B). Cleared alongside [sentTo] when the message
+     * leaves our buffer.
      */
-    private val receivedFrom = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val receivedFrom = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+
+    /**
+     * msgId → carriers that a BLE / Wi-Fi Direct write handed a mule copy to (acknowledged) this
+     * session: [CarrierRules] doesn't re-offer it to them until they go offline and come back.
+     * Cleared with [sentTo] (per message) and per peer when it goes offline.
+     */
+    private val handedOver = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
 
     /** Reassembles multi-fragment messages for THIS node, keyed by canonical parent id. */
     private val reassembler = FragmentReassembler()
 
     /** msgId8 → the sender's routing algorithm read from a DM we just decrypted (for its route record). */
     private val senderAlgorithm = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * msgId → (link → when this phone last handed the DM over it), for the relay publish and the
+     * same-hub hand-off: the 5 s fallback's 30 s retry windows ([DmFallback.Attempts]).
+     */
+    private val pathSentAt = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<SendPath, Long>>()
+
+    /** msgId → failed writes to its destination over the links in its peer's pass (the fallback's log line). */
+    private data class LinkFailures(val count: Int, val links: String)
+    private val dmFailures = java.util.concurrent.ConcurrentHashMap<String, LinkFailures>()
+
+    /** One pending flush for the 5 s fallback (the earliest one wins; see [scheduleFlushAt]). */
+    private val fallbackFlushLock = Any()
+    private var fallbackFlushAtMs = 0L
+    private var fallbackFlushJob: kotlinx.coroutines.Job? = null
+    /** One fallback pass at a time: the flush's own and the scheduled one ([runScheduledFallback]). */
+    private val fallbackMutex = Mutex()
+
+    /** Group receipts this phone owes origins, batched per (origin, channel) for [GROUP_RECEIPT_BATCH_MS]. */
+    private val groupReceipts = GroupReceiptBatcher(GROUP_RECEIPT_BATCH_MS)
 
     /**
      * "$msgId|$peer" → the Q-learning choice for that pair, kept for [SEND_RETRY_INTERVAL_MS]. The
@@ -227,6 +292,18 @@ class DtnOrchestrator @Inject constructor(
      */
     private fun isHubOnly(peer: NodeId): Boolean = transport.isHubPeer(peer) && !transport.reachesDirectly(peer)
 
+    /** What [CarrierRules.decide] asks about a bundle: receipts, send tracking, previous hops, links. */
+    private val carrierFacts = object : CarrierRules.Facts {
+        override fun delivered(msgId: String): Boolean = receiptStore.isDelivered(msgId)
+        override fun cameFrom(msgId: String, peer: String): Boolean = receivedFrom[msgId]?.contains(peer) == true
+        override fun sentThisSession(msgId: String, peer: String): Boolean = sentTo[msgId]?.containsKey(peer) == true
+        override fun sentRecently(msgId: String, peer: String): Boolean = recentlySentTo(msgId, peer)
+        override fun handedOverThisSession(msgId: String, peer: String): Boolean = handedOver[msgId]?.contains(peer) == true
+        override fun reachesDirectly(peer: NodeId): Boolean = transport.reachesDirectly(peer)
+        override fun reachableElsewhere(dest: NodeId): Boolean =
+            transport.isRadioReachable(dest) || dest.value in transport.internetPeers.value
+    }
+
     /** Signal a flush without blocking the caller (event loop stays responsive). Coalesced. */
     private fun requestFlush() {
         scope?.launch { flushToOnlinePeers() }
@@ -245,8 +322,69 @@ class DtnOrchestrator @Inject constructor(
     /** Drop tracking for a message that is no longer in our buffer (delivered / expired). */
     private fun forgetSentTo(msgId: String) {
         sentTo.remove(msgId)
+        handedOver.remove(msgId)
         receivedFrom.remove(msgId)
+        pathSentAt.remove(msgId)
+        dmFailures.remove(msgId)
     }
+
+    /** Remember a relay publish / same-hub hand-off of [msgId] for the fallback's retry windows. */
+    private fun markPathSent(msgId: String, path: SendPath) {
+        if (path == SendPath.INTERNET || path == SendPath.HUB_LOCAL) {
+            pathSentAt.getOrPut(msgId) { java.util.concurrent.ConcurrentHashMap() }[path] = System.currentTimeMillis()
+        }
+    }
+
+    private fun pathSentAtMs(msgId: String, path: SendPath): Long = pathSentAt[msgId]?.get(path) ?: 0L
+
+    /** When this phone buffered [msg] (the fallback counts from it). */
+    private fun queuedSince(msg: DtnMessage): Long = if (msg.bufferedAtMs > 0) msg.bufferedAtMs else msg.createdAtMs
+
+    /**
+     * Request the 5 s fallback at [atMs] (now if it's past), then a flush. Coalesced: one is pending
+     * at a time and the earliest wins; each fallback pass schedules the next due DM itself
+     * ([fallbackPass]).
+     */
+    private fun scheduleFlushAt(atMs: Long) {
+        val sc = scope ?: return
+        synchronized(fallbackFlushLock) {
+            val now = System.currentTimeMillis()
+            val at = maxOf(atMs, now)
+            if (fallbackFlushJob?.isActive == true && fallbackFlushAtMs in now..at) return
+            fallbackFlushJob?.cancel()
+            fallbackFlushAtMs = at
+            // A little past the due time, so the DM is surely "queued 5 s" when the pass looks. The
+            // work gets its own coroutine: the pass schedules the next one, which cancels this job.
+            fallbackFlushJob = sc.launch { delay(at - now + 50L); sc.launch { runScheduledFallback() } }
+        }
+    }
+
+    /**
+     * The scheduled 5 s fallback. It doesn't wait for a flush that is still busy: it only hands DMs
+     * to the hub and the relay, whose transports serialise their own writes. A flush follows for
+     * the direct links.
+     */
+    private suspend fun runScheduledFallback() {
+        runCatching {
+            val (radioPeers, relayPeers) = passTargets()
+            val snapshot = queueManager.getAllBuffered()
+            if (snapshot.isNotEmpty()) fallbackPass(snapshot, radioPeers, radioPeers.toSet() + relayPeers)
+        }.onFailure { Log.w(TAG, "scheduled fallback failed", it) }
+        requestFlush()
+    }
+
+    /**
+     * A write of [msg] to its own destination over its pass's links ([links], e.g. "BLE") failed:
+     * counted for the fallback's log line, and a flush is due when its 5 s are up.
+     */
+    private fun noteDmFailure(msg: DtnMessage, links: String) {
+        dmFailures.merge(msg.id, LinkFailures(1, links)) { old, _ -> LinkFailures(old.count + 1, links) }
+        scheduleFlushAt(DmFallback.dueAtMs(queuedSince(msg)))
+    }
+
+    /** "BLE", "BLE + Wi-Fi Direct": the links ending at [peer] now. */
+    private fun directLinkNames(peer: NodeId): List<String> =
+        transport.directLinks(peer).filter { it != SendPath.HUB }.map { it.label }
 
     /**
      * Drop tracking for every message we sent to [peer]. Called when a peer transitions
@@ -256,6 +394,7 @@ class DtnOrchestrator @Inject constructor(
      */
     private fun forgetSentToPeer(peer: String) {
         for ((_, peers) in sentTo) peers.remove(peer)
+        for ((_, peers) in handedOver) peers.remove(peer)
     }
 
     /**
@@ -290,6 +429,13 @@ class DtnOrchestrator @Inject constructor(
         sc.launch { transport.nodeEvents.collect { ch.trySend(OrchestratorEvent.Encounter(it)) } }
         sc.launch { transport.inboundMessages.collect { ch.trySend(OrchestratorEvent.Message(it)) } }
         sc.launch { transport.deliveryStatus.collect { ch.trySend(OrchestratorEvent.Status(it)) } }
+        // A BLE link just came up (fix 3: sends never wait for one): what waited for it goes now.
+        sc.launch {
+            transport.linkReady.collect { peer ->
+                connectBackoffUntil.remove(peer.value)
+                ch.trySend(OrchestratorEvent.FlushBuffer)
+            }
+        }
         // A buffered message that expired / was dropped / cleared is gone — drop its per-message
         // send-tracking so the sentTo map doesn't leak entries for messages we'll never resend.
         sc.launch {
@@ -329,9 +475,14 @@ class DtnOrchestrator @Inject constructor(
                         forgetSentToPeer(gone)
                         receiptsSentTo.remove(gone)
                         connectBackoffUntil.remove(gone)
+                        heldTracker.forget(gone)
                     }
                 }
-                if ((present - previous).isNotEmpty()) ch.trySend(OrchestratorEvent.FlushBuffer)
+                if ((present - previous).isNotEmpty()) {
+                    // A new relay session: the fallback may publish again right away.
+                    pathSentAt.values.forEach { it.remove(SendPath.INTERNET) }
+                    ch.trySend(OrchestratorEvent.FlushBuffer)
+                }
                 previous = present
             }
         }
@@ -343,8 +494,15 @@ class DtnOrchestrator @Inject constructor(
                 ch.trySend(OrchestratorEvent.FlushBuffer)
             }
         }
+        // Group receipts batched just before the last stop(): their send was cancelled with the old scope.
+        if (groupReceipts.waiting > 0) {
+            sc.launch {
+                delay(GROUP_RECEIPT_BATCH_MS)
+                runCatching { sendDueGroupReceipts() }.onFailure { Log.w(TAG, "group receipts failed", it) }
+            }
+        }
         // DiMaxProp λ and the Q-learning progress-reward η follow Settings.
-        strategySelector.diMaxProp.selfId = localIdentity.nodeId.value
+        strategySelector.setSelfId(localIdentity.nodeId.value)
         sc.launch { settings.diMaxPropLambda.collect { strategySelector.diMaxProp.lambda = it } }
         sc.launch { settings.qShapingEta.collect { shapingEta = it } }
         sc.launch {
@@ -395,7 +553,8 @@ class DtnOrchestrator @Inject constructor(
         runCatching { scope?.cancel() }
         eventChannel = null
         scope = null
-        if (qLoaded) persistScope.launch { qStore.save(qEngine) }
+        if (qLoaded) persistScope.launch { qStore.save(qEngine); lastQSaveLogMs = 0L; logQSave("on stop") }
+        presenceLink.clear()
         Log.i(TAG, "Stopped")
     }
 
@@ -405,6 +564,7 @@ class DtnOrchestrator @Inject constructor(
         qSaveJob = persistScope.launch {
             delay(Q_SAVE_DELAY_MS)
             qStore.save(qEngine)
+            logQSave("after training")
         }
     }
 
@@ -455,6 +615,11 @@ class DtnOrchestrator @Inject constructor(
             connectBackoffUntil.remove(peerId.value)
             receiptsSentTo.remove(peerId.value)
             peerLocks.remove(peerId.value)
+            heldTracker.forget(peerId.value)
+            presenceLink.remove(peerId.value)?.let { was ->
+                diagnostics.i(DiagSource.PRESENCE, "${peerId.value.takeLast(8)} offline · lost on " +
+                    "${event.transport.journalLabel()} (was online via $was) and no other link reaches it")
+            }
             Log.d(TAG, "OFFLINE: ${peerId.value.takeLast(8)}")
             return
         }
@@ -491,6 +656,11 @@ class DtnOrchestrator @Inject constructor(
         }
 
         Log.d(TAG, "ONLINE: ${peerId.value.takeLast(8)}")
+        val link = event.transport.journalLabel()
+        if (presenceLink.putIfAbsent(peerId.value, link) == null) {
+            diagnostics.i(DiagSource.PRESENCE, "${peerId.value.takeLast(8)} online via $link" +
+                if (event.rssi > -200) " · rssi ${event.rssi}" else "")
+        }
 
         // A phone we only see in our hub's roster was never met: it's two hops away through the
         // hub, like a contact present on the internet relay. It must not train the encounter-based
@@ -617,7 +787,9 @@ class DtnOrchestrator @Inject constructor(
             ttlMs = 300_000L, // 5 min — short-lived control traffic
             messageType = DtnMessageType.ROUTING_SUMMARY,
         )
-        runCatching { transport.sendMessage(bundle, peerId) }
+        // Direct links only (one hop): a BLE link that isn't up yet must not push it onto the relay
+        // or a LoRa flood instead. The next encounter (≤ 8 s) sends it again.
+        runCatching { transport.sendMessageVia(bundle, peerId, DIRECT_TIER) }
             .onFailure { Log.w(TAG, "routing-summary push to ${peerId.value.takeLast(8)} failed", it) }
     }
 
@@ -648,22 +820,33 @@ class DtnOrchestrator @Inject constructor(
     }
 
     /**
+     * The peers a flush runs a pass for: the radio-online contacts, and the contacts present on the
+     * internet relay that no local radio reaches. A radio link always wins (normal DTN semantics incl.
+     * custody); relay-only peers get relay semantics.
+     */
+    private suspend fun passTargets(): Pair<List<String>, List<String>> {
+        val radioPeers = contactDao.getOnlineContacts().map { it.nodeId }
+        val myId = transport.localNodeId?.value
+        val radioSet = radioPeers.toSet()
+        val relayPeers = transport.internetPeers.value
+            .filter { it != myId && it !in radioSet }
+            .filter { runCatching { contactDao.getByNodeId(it) }.getOrNull() != null }
+        return radioPeers to relayPeers
+    }
+
+    /**
      * One flush pass: transmit receipts + buffered messages to every online peer, running peers
      * CONCURRENTLY (bounded by [sendSemaphore]) so one slow/unreachable peer can't stall the
      * others. Each peer's transmissions are serialised by a per-peer lock so writes to a single
      * GATT link never interleave.
      */
     private suspend fun flushOnce() {
-        val radioPeers = contactDao.getOnlineContacts().map { it.nodeId }
-        // Contacts present on the internet relay and NOT reachable by a local radio. A radio link
-        // always wins (normal DTN semantics incl. custody); relay-only peers get relay semantics.
-        val myId = transport.localNodeId?.value
-        val radioSet = radioPeers.toSet()
-        val relayPeers = transport.internetPeers.value
-            .filter { it != myId && it !in radioSet }
-            .filter { runCatching { contactDao.getByNodeId(it) }.getOrNull() != null }
-        if (radioPeers.isEmpty() && relayPeers.isEmpty()) return
+        val (radioPeers, relayPeers) = passTargets()
+        // Nobody to run a pass for. Phones present on the relay that aren't contacts still count:
+        // the fallback publishes a DM carried for one of them to its own topic.
+        if (radioPeers.isEmpty() && relayPeers.isEmpty() && transport.internetPeers.value.isEmpty()) return
         val now = System.currentTimeMillis()
+        val radioSet = radioPeers.toSet()
         val onlineIds = radioSet + relayPeers
         val snapshot = queueManager.getAllBuffered()
         // msgId → set of peers we successfully fanned a broadcast to this pass (thread-safe).
@@ -692,6 +875,12 @@ class DtnOrchestrator @Inject constructor(
             }
         }
 
+        // The 5 s fallback: DMs still queued also go to the hub and the relay (after the peers'
+        // passes, so a DM delivered directly just now isn't sent again).
+        if (snapshot.isNotEmpty()) {
+            runCatching { fallbackPass(snapshot, radioPeers, onlineIds) }.onFailure { Log.w(TAG, "fallback pass failed", it) }
+        }
+
         // Broadcasts / group messages are epidemic: they are NOT cleared after fan-out. They keep
         // propagating to peers met later (store-carry-forward for broadcast) until their TTL
         // expires, bounded by per-peer send throttling (recentlySentTo) + receiver-side dedup, and
@@ -699,6 +888,11 @@ class DtnOrchestrator @Inject constructor(
         // online peer had it (the old behaviour) stranded peers that were offline at that instant.
         if (broadcastsSentTo.isNotEmpty()) {
             Log.d(TAG, "Broadcast fan-out this pass: ${broadcastsSentTo.size} msg(s) kept for epidemic spread")
+        }
+        val tookMs = System.currentTimeMillis() - now
+        if (tookMs > SLOW_FLUSH_MS) {
+            diagnostics.i(DiagSource.TIMING, "Slow flush pass: %.1f s · %d peer(s) · %d bundle(s)"
+                .format(tookMs / 1000.0, radioPeers.size + relayPeers.size, snapshot.size))
         }
     }
 
@@ -717,6 +911,10 @@ class DtnOrchestrator @Inject constructor(
      * published and kept until the end-to-end receipt returns (a broker PUBACK is not delivery),
      * broadcasts are pushed once per presence session as a catch-up, and no third-party custody is
      * handed over. Relay sends don't feed the routing benchmarks or Q-learning decisions.
+     *
+     * DATA DMs (and custody copies) only take this pass's own links (the companion's tiers): a
+     * failed BLE write tries Wi-Fi Direct at once, but no longer falls through to the hub or the
+     * relay. Those are the 5 s fallback's ([fallbackPass]), with their retry windows.
      */
     private suspend fun sendToSingle(
         peerId: NodeId,
@@ -735,26 +933,23 @@ class DtnOrchestrator @Inject constructor(
         // strategies have nothing to rank it by: it bypasses them (like a direct delivery).
         val peerIsHub = transport.isHub(peerId)
         val hubOnly = !peerIsHub && isHubOnly(peerId)
+        // The links a DATA DM takes in this pass (null = the transport's whole chain, for the hub).
+        val dmLinks: Set<SendPath>? = when {
+            peerIsHub -> null
+            relay -> RELAY_TIER
+            hubOnly -> SAME_HUB_TIER
+            else -> DIRECT_TIER
+        }
         // Q-learning's per-message reasoning, saved with each forward it approves (Message info).
         val qNotes = HashMap<String, String>()
         // The strategy that decides this pass: the one active NOW, captured once, so every
         // forward is attributed to (and explained by) the algorithm that actually made it.
         val active = strategySelector.active
         val relayApproved: Set<String> = if (relay || peerIsHub || hubOnly) emptySet() else try {
-            when (active) {
-                // Q-learning: the engine decides FORWARD vs STORE per (message, peer) from the
-                // live 12-feature state, and each decision is recorded for training.
-                is com.dtn.mesh.routing.QLearningStrategy ->
-                    qDecisionApproved(snapshot, peerId, onlinePeerIds, qNotes)
-                is com.dtn.mesh.routing.ProphetStrategy ->
-                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
-                is com.dtn.mesh.routing.MaxPropStrategy ->
-                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
-                is com.dtn.mesh.routing.DiMaxPropStrategy ->
-                    active.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds).map { it.message.id }.toSet()
-                else ->
-                    active.rankForForwarding(snapshot, peerId).map { it.message.id }.toSet()
-            }
+            // Q-learning: the engine decides FORWARD vs STORE per (message, peer) from the live
+            // 12-feature state, and each decision is recorded for training. The others rank.
+            if (active is com.dtn.mesh.routing.QLearningStrategy) qDecisionApproved(snapshot, peerId, onlinePeerIds, qNotes)
+            else CarrierRules.approvedByStrategy(active, snapshot, peerId, onlinePeerIds)
         } catch (e: Exception) {
             Log.e(TAG, "rankForForwarding threw, falling back to unfiltered", e)
             snapshot.map { it.id }.toSet()
@@ -778,79 +973,66 @@ class DtnOrchestrator @Inject constructor(
         }.getOrDefault("")
 
         var sentCount = 0
-        for (msg in snapshot) {
-            // If a receipt already confirmed delivery elsewhere, clear locally.
-            if (receiptStore.isDelivered(msg.id) && msg.destinationNodeId != NodeId.BROADCAST) {
-                queueManager.markDelivered(msg.id)
-                lifecycle.markRouteDelivered(msg.id) // route observation → RESOLVED, matches chat
-                if (msg.messageType == DtnMessageType.DATA && lifecycle.isTracked(msg.id)) {
-                    lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msg.id,
-                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
-                        extra = "buffer copy cleared — delivery already confirmed by a receipt")
+        // Why each bundle was or wasn't handed over this pass; logged only when it changes.
+        val summary = PeerFlushSummary().apply { offered = snapshot.size }
+        // The carrier rules (pure, [CarrierRules]): origin / previous hop never get a bundle back,
+        // relay peers carry no one else's DMs, hub-only phones only their own, the hub each DM once
+        // per hub session, broadcasts once per session, the 30 s re-send window, the strategy veto.
+        val carrier = CarrierRules.Peer(peerId, relay = relay, isHub = peerIsHub, hubOnly = hubOnly)
+        for ((index, msg) in snapshot.withIndex()) {
+            when (val verdict = CarrierRules.decide(msg, carrier, carrierFacts, relayApproved)) {
+                // A receipt already confirmed delivery elsewhere: clear locally.
+                CarrierRules.Verdict.Clear -> {
+                    queueManager.markDelivered(msg.id)
+                    lifecycle.markRouteDelivered(msg.id) // route observation → RESOLVED, matches chat
+                    if (msg.messageType == DtnMessageType.DATA && lifecycle.isTracked(msg.id)) {
+                        lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msg.id,
+                            origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                            extra = "buffer copy cleared — delivery already confirmed by a receipt")
+                    }
+                    forgetSentTo(msg.id)
+                    summary.cleared++
+                    continue
                 }
-                forgetSentTo(msg.id)
-                continue
+                is CarrierRules.Verdict.Hold -> { summary.hold(verdict.reason); continue }
+                CarrierRules.Verdict.Send -> Unit
             }
-            // Don't echo back to the original sender.
-            if (msg.originNodeId.value == peerId.value) continue
 
             val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
             val isDirectDelivery = msg.destinationNodeId.value == peerId.value
 
-            // Relay-only peers never take custody of someone else's DM over the internet.
-            if (relay && !isDirectDelivery && !isBroadcast) continue
-
-            // A phone reached only through our hub: just the DMs addressed to it ([isHubOnly]).
-            if (hubOnly && !isDirectDelivery) continue
-
-            // The hub: each DM once per hub session (it keeps a copy and replays it to the phone
-            // when it registers, so re-sending adds nothing), and never one whose destination we
-            // reach ourselves right now — that phone's own pass delivers it (directly, through the
-            // hub, or over the relay) without flooding it over LoRa.
-            if (peerIsHub && !isBroadcast && !isDirectDelivery) {
-                if (sentTo[msg.id]?.containsKey(peerId.value) == true) continue
-                val dest = msg.destinationNodeId
-                if (transport.isRadioReachable(dest) || dest.value in transport.internetPeers.value) continue
-            }
-
-            // Don't echo back to the immediate previous hop either. The wire header only
-            // carries the ORIGIN, so without this an A→B→C→D chain has C bounce the bundle
-            // straight back to B (B isn't the origin A), tying up the half-duplex BLE radio
-            // with a duplicate instead of advancing toward D. Direct delivery is exempt (the
-            // previous hop IS the destination).
-            if (!isDirectDelivery && receivedFrom[msg.id] == peerId.value) continue
-
-            // Broadcasts (incl. group messages and announces) go to each peer ONCE per encounter
-            // or presence session. Previously they were exempt from every throttle, so each
-            // buffered broadcast was re-sent to every online peer on every 4 s flush for its whole
-            // TTL — a GATT connect + write per bundle per peer, starving real traffic. The session
-            // ends when the peer goes offline (forgetSentToPeer), so a re-encounter re-syncs.
-            if (isBroadcast && sentTo[msg.id]?.containsKey(peerId.value) == true) continue
-
-            // Rate-limit: never for a direct delivery over a link that ends at the destination
-            // (it's RIGHT HERE — send it). Anything that has to wait for an end-to-end receipt
-            // (same-hub hand-off, relay, hub flood, mule) retries on the 30 s window instead.
-            val directOverRadio = isDirectDelivery && transport.reachesDirectly(peerId)
-            if (!directOverRadio && !isBroadcast && recentlySentTo(msg.id, peerId.value)) continue
-
-            // Strategy veto applies ONLY to relay (mule) traffic. Direct, broadcast and hub
-            // hand-offs bypass it.
-            if (!isDirectDelivery && !isBroadcast && !peerIsHub && msg.id !in relayApproved) {
-                continue
-            }
-
-            // Send with hop incremented.
-            val wireMsg = msg.copy(hopCount = (msg.hopCount + 1).coerceAtMost(255))
-            val outcome = transport.sendMessageVia(wireMsg, peerId)
+            // Send with hop incremented. A DATA DM only over this pass's links (see [dmLinks]).
+            val wireMsg = CarrierRules.onWire(msg)
+            val links = dmLinks?.takeIf { msg.messageType == DtnMessageType.DATA && !isBroadcast }
+            val sendStartedMs = System.currentTimeMillis()
+            val outcome = if (links != null) transport.sendMessageVia(wireMsg, peerId, links) else transport.sendMessageVia(wireMsg, peerId)
             if (outcome == null) {
                 Log.w(TAG, "FAIL: ${peerId.value.takeLast(8)} unreachable")
-                markSendFailed(peerId.value) // back off so we don't pay the 8s connect again next flush
+                // Back off only after a failure that cost time (a write that timed out), so the next
+                // flushes don't pay it again. No link up yet fails at once: retrying is free, and the
+                // BLE link coming up flushes right away ([MeshTransport.linkReady]).
+                if (System.currentTimeMillis() - sendStartedMs >= SLOW_SEND_FAILURE_MS) markSendFailed(peerId.value)
+                // A DM for this very peer: the 5 s fallback (hub / relay) takes over on time.
+                if (links != null && isDirectDelivery) {
+                    val names = if (links === DIRECT_TIER) directLinkNames(peerId) else links.map { it.label }
+                    if (names.isNotEmpty()) noteDmFailure(msg, names.joinToString(" + "))
+                }
+                summary.hold(HoldReason.SEND_FAILED, snapshot.size - index) // this one and the rest
                 break // transport failed — stop trying this peer for now
             }
             markSendOk(peerId.value) // reachable again — clear any backoff
 
             markSentTo(msg.id, peerId.value)
+            markPathSent(msg.id, outcome.path)
+            // A mule copy the link itself acknowledged (BLE write with response, Wi-Fi Direct TCP):
+            // the carrier has it for this session (no 30 s re-offers while it stays in range).
+            if (!isDirectDelivery && !isBroadcast &&
+                (outcome.path == SendPath.BLE || outcome.path == SendPath.WIFI_DIRECT)
+            ) {
+                handedOver.getOrPut(msg.id) { java.util.concurrent.ConcurrentHashMap.newKeySet() }.add(peerId.value)
+            }
             sentCount++
+            summary.sent++
 
             val myId = transport.localNodeId?.value ?: ""
             val path = outcome.path
@@ -866,6 +1048,18 @@ class DtnOrchestrator @Inject constructor(
                 if (msg.messageType == DtnMessageType.ANNOUNCE && isDirectDelivery &&
                     (path.reachesTargetDirectly || path == SendPath.HUB_LOCAL || path == SendPath.INTERNET)
                 ) {
+                    runCatching { queueManager.markDelivered(msg.id) }
+                    forgetSentTo(msg.id)
+                }
+                continue
+            }
+
+            // One of OUR group receipts: an ordinary DM on the wire (its own receipt clears it), but
+            // control traffic here — console only, no journal, no benchmark.
+            if (msg.portNum == DtnMessage.PORT_GROUP_RECEIPT) {
+                lifecycle.console("CTRL GROUP-RECEIPT ${msg.id.take(8)} → $peer8 via ${path.label}" +
+                    if (isDirectDelivery && path.reachesTargetDirectly) " ✓ delivered" else "")
+                if (isDirectDelivery && path.reachesTargetDirectly) {
                     runCatching { queueManager.markDelivered(msg.id) }
                     forgetSentTo(msg.id)
                 }
@@ -898,7 +1092,12 @@ class DtnOrchestrator @Inject constructor(
                 continue
             }
             runCatching { queueManager.incrementForwardCount(msg.id) }
-            benchmark.recordForward(strat)
+            // Benchmarks measure direct messages: a broadcast copy never leads to a delivery. A DM
+            // still buffered from before the app started counts as handled at its first forward.
+            if (!isBroadcast) {
+                benchmark.recordHandled(strat, msg.id, msg.createdAtMs)
+                benchmark.recordForward(strat)
+            }
 
             when {
                 // Only a link that reaches the destination itself proves delivery. A "direct"
@@ -911,7 +1110,11 @@ class DtnOrchestrator @Inject constructor(
                     // resolveRewardDelivered) — feeds the Q-state historicalSuccessRate feature.
                     runCatching { contactDao.incrementDeliveryAttempt(peerId.value) }
                     forgetSentTo(msg.id)
-                    benchmark.recordDelivery(strat, wireMsg.hopCount, System.currentTimeMillis() - msg.createdAtMs)
+                    benchmark.recordDelivery(strat, wireMsg.hopCount, System.currentTimeMillis() - msg.createdAtMs, msgId = msg.id)
+                    // Only the number goes through format(): a '%' in a label must never throw here.
+                    val tookS = "%.1f".format((System.currentTimeMillis() - msg.createdAtMs).coerceAtLeast(0L) / 1000.0)
+                    diagnostics.i(DiagSource.TIMING, "MSG ${msg.id.take(8)} delivered directly to $peer8 via " +
+                        "${path.label} $tookS s after it was sent · hop ${wireMsg.hopCount}")
                     // Q-learning credit: this forward delivered the message to its destination.
                     resolveRewardDelivered(msg.id, peerId.value)
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
@@ -989,6 +1192,7 @@ class DtnOrchestrator @Inject constructor(
             }
         }
         if (sentCount > 0) Log.d(TAG, "$sentCount msgs sent to ${peerId.value.takeLast(8)}")
+        heldTracker.lineFor(peerId.value, summary)?.let { diagnostics.i(DiagSource.ROUTING, it) }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1070,15 +1274,37 @@ class DtnOrchestrator @Inject constructor(
             val off = i * UUID_BYTES
             val bb = java.nio.ByteBuffer.wrap(payload, off, UUID_BYTES)
             val uuid = UUID(bb.long, bb.long).toString()
+            // News to this phone? The same receipt comes back later (a hub replays its buffer on
+            // REGISTER, carriers re-push after a reconnect): the journal records the first one only,
+            // also across restarts (the receipt store is in memory, the journal isn't).
+            val news = receiptStore.markDelivered(uuid) && !lifecycle.hasEvent(uuid, LifecycleEvent.ACK_RECEIVED)
+            // Our own group receipt (control traffic) never goes into the message journal.
+            val ownControl = !lifecycle.isTracked(uuid) && queueManager.isOwnGroupReceipt(uuid)
             // Receipts spread epidemically, so most are for other people's messages: only the ones
             // about a message we hold or track belong in the message journal.
-            if (lifecycle.isTracked(uuid) || queueManager.existsInBuffer(uuid)) {
-                lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
-                    origin = msg.originNodeId.value, extra = "delivery receipt from $from8 via ${via.journalLabel()}")
+            if (ownControl) {
+                lifecycle.console("RECEIPT ${uuid.take(8)} from $from8 via ${via.journalLabel()} (our group receipt arrived)")
+            } else if (lifecycle.isTracked(uuid) || queueManager.existsInBuffer(uuid)) {
+                if (news) {
+                    lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
+                        origin = msg.originNodeId.value, extra = "delivery receipt from $from8 via ${via.journalLabel()}")
+                } else {
+                    lifecycle.console("RECEIPT ${uuid.take(8)} from $from8 via ${via.journalLabel()} (already had it, not journaled again)")
+                }
             } else {
                 lifecycle.console("RECEIPT ${uuid.take(8)} from $from8 via ${via.journalLabel()} (not ours, relaying)")
             }
-            receiptStore.markDelivered(uuid)
+            // Benchmarks: a delivery if this phone handled that DM (most receipts are someone else's).
+            benchmark.recordReceipt(uuid)
+            // Timing: our own message, confirmed for the first time by this receipt.
+            val me8 = transport.localNodeId?.value?.takeLast(8)
+            lifecycle.routes.value.firstOrNull { it.msgId == uuid.take(8) }
+                ?.takeIf { !it.delivered && it.source == me8 && it.createdAtMs > 0 }
+                ?.let { r ->
+                    val tookS = "%.1f".format((System.currentTimeMillis() - r.createdAtMs).coerceAtLeast(0L) / 1000.0)
+                    diagnostics.i(DiagSource.TIMING, "MSG ${r.msgId} to ${r.destination} confirmed by receipt via " +
+                        "${via.journalLabel()} $tookS s after it was sent")
+                }
             // An end-to-end receipt confirms delivery — upgrade our route observation to RESOLVED
             // whether or not we still hold a buffer copy (no-op if we never tracked this route).
             lifecycle.markRouteDelivered(uuid, via = via?.journalLabel().orEmpty(), confirmedBy = msg.originNodeId.value)
@@ -1086,7 +1312,7 @@ class DtnOrchestrator @Inject constructor(
             runCatching { chatDao.markOutgoingDelivered(uuid) }
             if (queueManager.existsInBuffer(uuid)) {
                 queueManager.markDelivered(uuid)
-                lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid,
+                if (!ownControl) lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid,
                     extra = "delivered — confirmed by end-to-end receipt (via $from8)")
                 // A receipt confirms this message reached its destination — reward the
                 // Q-learning FORWARD decisions that carried it (credit the peer that acked).
@@ -1158,18 +1384,21 @@ class DtnOrchestrator @Inject constructor(
             // addressed to pins the keys; carriers just pass it on without learning who it is.
             val announceForMe = me != null && msg.destinationNodeId == me
             val announceForAll = msg.destinationNodeId == NodeId.BROADCAST
+            var outcome: ContactKeyManager.Outcome? = null
             if (announceForMe || announceForAll) {
-                if (!processAnnounce(msg)) return
+                outcome = processAnnounce(msg)
+                if (outcome?.relay == false) return
             }
             if (announceForMe) {
-                lifecycle.console("ANNOUNCE (direct) from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — keys pinned")
+                lifecycle.console("ANNOUNCE (direct) from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — ${describe(outcome)}")
                 return
             }
             val stored = queueManager.ingest(msg)
             // The peer that handed it to us already has it — don't push it straight back.
             packet.viaPeer?.let { markSentTo(msg.id, it.value) }
             if (stored) {
-                lifecycle.console("ANNOUNCE from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — keys pinned, relaying")
+                lifecycle.console("ANNOUNCE from ${msg.originNodeId.value.takeLast(8)} via ${packet.transport.journalLabel()} — " +
+                    (if (announceForAll) describe(outcome) + ", " else "") + "relaying")
                 requestFlush() // epidemic relay of the announce
             }
             return
@@ -1178,8 +1407,8 @@ class DtnOrchestrator @Inject constructor(
         if (!msg.messageType.isUserData) return // unknown control type — drop (never shown as chat)
 
         // Remember the real previous hop (from the transport, not the wire origin) so the
-        // relay logic never echoes this bundle straight back to whoever just gave it to us.
-        packet.viaPeer?.let { receivedFrom[msg.id] = it.value }
+        // relay logic never echoes this bundle back to anyone who gave it to us.
+        packet.viaPeer?.let { receivedFrom.getOrPut(msg.id) { java.util.concurrent.ConcurrentHashMap.newKeySet() }.add(it.value) }
 
         val myId = transport.localNodeId?.value
         val isForMe = myId != null && msg.destinationNodeId.value == myId
@@ -1201,7 +1430,24 @@ class DtnOrchestrator @Inject constructor(
             // UNICAST TO US — decrypt, show in chat, acknowledge end-to-end.
             val stored = queueManager.ingest(msg)
             if (stored) {
-                val opened = openAndPersistInbound(msg, convKey = msg.originNodeId.value, peer = msg.originNodeId.value)
+                val origin = msg.originNodeId.value
+                // Block (decision 13): a blocked sender's DM is still acknowledged — the receipt
+                // goes out, so they see Delivered and carriers drop their copies — but it is only
+                // decrypted to check it's genuine: never shown, stored, or used to re-add them.
+                val senderBlocked = origin in runCatching { settings.blockedNodesOnce() }.getOrDefault(emptySet())
+                val action = ContactRules.inboundDm(senderBlocked)
+                val content = when (action) {
+                    ContactRules.InboundDm.SHOW -> openAndPersistInbound(msg, convKey = origin, peer = origin, packet = packet)
+                    ContactRules.InboundDm.RECEIPT_ONLY -> when (val plain = envelope.openBytes(msg)) {
+                        null -> Opened.NO
+                        // A blocked member's group receipt: acknowledged like any DM, never recorded.
+                        else -> if (msg.fragmentTotal <= 1 && GroupReceiptCodec.isMarked(plain)) Opened.GROUP_RECEIPT else Opened.TEXT
+                    }
+                }
+                val opened = content != Opened.NO
+                // A member's group receipt: control traffic, acknowledged like any DM (so carriers
+                // drop it) but never a chat, never re-adding the sender, never in the journal.
+                val groupReceipt = content == Opened.GROUP_RECEIPT
                 if (!opened) {
                     // We can't decrypt it yet — typically the sender scanned OUR QR but we never
                     // received their keys. Acknowledging would make the sender drop a message the
@@ -1215,19 +1461,31 @@ class DtnOrchestrator @Inject constructor(
                 }
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // propagate an end-to-end receipt
-                // Someone who messages us is a contact from now on (e.g. they added us by QR).
-                runCatching { contactDao.markAdded(msg.originNodeId.value) }
+                if (action == ContactRules.InboundDm.SHOW && !groupReceipt) {
+                    // Someone who messages us is a contact from now on (e.g. they added us by QR),
+                    // also after a Delete: their DM brings them back to the chat list.
+                    runCatching { contactDao.markAdded(origin) }
+                    runCatching { if (settings.deletedAtOnce(origin) != null) settings.clearDeleted(origin) }
+                }
                 rememberTombstone(msg.id, msg.originNodeId.value, msg.destinationNodeId.value,
                     SeenBundleEntity.Status.DELIVERED, msg.createdAtMs + msg.ttlMs)
-                benchmark.recordDelivery(strategySelector.name, msg.hopCount,
-                    System.currentTimeMillis() - msg.createdAtMs)
+                // Not a benchmark delivery: the sender's and carriers' algorithms routed it, not ours.
                 resolveRewardDelivered(msg.id, packet.viaPeer?.value)
                 val via = packet.transport.journalLabel()
                 val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
+                if (groupReceipt) {
+                    lifecycle.console("RECEIPT group DM ${msg.id.take(8)} from ${origin.takeLast(8)} via $via " +
+                        "(handed over by $prev8) — its delivery receipt is queued")
+                    requestFlush()
+                    return
+                }
                 lifecycle.log(LifecycleEvent.DELIVERED, msg.id,
                     origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
-                    extra = "received from $prev8 via $via · decrypted")
+                    extra = "received from $prev8 via $via · " + when (action) {
+                        ContactRules.InboundDm.SHOW -> "decrypted"
+                        ContactRules.InboundDm.RECEIPT_ONLY -> "from a blocked contact: receipt sent, not shown or stored"
+                    })
                 lifecycle.recordIncoming(
                     msgId = msg.id, source = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                     prevHop = packet.viaPeer?.value ?: msg.originNodeId.value,
@@ -1264,7 +1522,10 @@ class DtnOrchestrator @Inject constructor(
                     msg,
                     convKey = if (msg.channel > 0) "grp:${msg.channel}" else NodeId.BROADCAST.value,
                     peer = msg.originNodeId.value,
-                )
+                    // A group message read here for the first time: its origin gets a group receipt
+                    // (a DM, batched). Never a ROUTING_ACK: the message must keep spreading.
+                    onWhole = { chatId -> if (msg.channel > 0) queueGroupReceipt(msg, chatId) },
+                ) != Opened.NO
                 val via = packet.transport.journalLabel()
                 val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
                 val kind = if (msg.channel > 0) "group message" else "broadcast"
@@ -1292,6 +1553,7 @@ class DtnOrchestrator @Inject constructor(
         }
         if (queueManager.ingest(msg)) {
             Log.d(TAG, "RX-MULE: ${msg.id.take(8)} → dest ${msg.destinationNodeId.value.takeLast(8)}")
+            benchmark.recordHandled(strategySelector.name, msg.id, msg.createdAtMs)
             val via = packet.transport.journalLabel()
             val prev8 = (packet.viaPeer ?: msg.originNodeId).value.takeLast(8)
             lifecycle.log(LifecycleEvent.BUFFERED, msg.id,
@@ -1308,36 +1570,59 @@ class DtnOrchestrator @Inject constructor(
     }
 
     /**
-     * Verify a signed ANNOUNCE and pin the peer's public keys (trust-on-first-use).
+     * Verify a signed ANNOUNCE and let [ContactKeyManager] pin / switch / hold the peer's keys
+     * (decision 14: a newer announce replaces old keys, stale copies are ignored, a QR-verified
+     * contact's new keys wait for the user).
      *
-     * @return false when the announce must be neither pinned nor relayed: it was issued before
-     *   this phone's identity existed. Clearing the app's data (or reinstalling) creates a new
-     *   identity while the old one's announces still circulate for their TTL — in other phones'
-     *   buffers and in hub replays — and pinning them showed this phone's former self as a
-     *   contact ("I can see myself"). Live peers re-announce every 5 minutes, so a genuine
-     *   announce is only delayed, never lost.
+     * @return what happened, or null for an announce that can't be trusted (bad signature, node id
+     *   not the origin), which is relayed as before but never pinned. `relay == false` = neither
+     *   pinned nor passed on.
      */
-    private suspend fun processAnnounce(msg: DtnMessage): Boolean {
+    private suspend fun processAnnounce(msg: DtnMessage): ContactKeyManager.Outcome? {
+        val from8 = msg.originNodeId.value.takeLast(8)
         val announce = Announce.parseAndVerify(msg.payloadBytes) ?: run {
-            Log.w(TAG, "ANNOUNCE failed signature verification from ${msg.originNodeId.value.takeLast(8)}")
-            return true
+            Log.w(TAG, "ANNOUNCE failed signature verification from $from8")
+            diagnostics.w(DiagSource.CRYPTO, "Announce ${msg.id.take(8)} from $from8: bad signature — ignored")
+            return null
         }
         if (NodeId.fromNodeNum(announce.nodeNum) != msg.originNodeId) {
-            Log.w(TAG, "ANNOUNCE node-id binding mismatch; rejecting ${msg.originNodeId.value.takeLast(8)}")
-            return true
+            Log.w(TAG, "ANNOUNCE node-id binding mismatch; rejecting $from8")
+            diagnostics.w(DiagSource.CRYPTO, "Announce ${msg.id.take(8)} from $from8: signed for another node id — ignored")
+            return null
         }
+        // Data-clear ghosts: with the id derived from ANDROID_ID, this phone's identity from before a
+        // data clear has OUR node id, so its circulating announces are dropped as echoes. Only a
+        // phone without a usable ANDROID_ID gets a new id after a clear; there an announce issued
+        // before its keys existed is still its former self, and is ignored.
         val bornAtSec = localIdentity.createdAtMs / 1000L
-        if (bornAtSec > 0 && announce.issuedAtSec.toLong() < bornAtSec) {
-            lifecycle.console("ANNOUNCE from ${msg.originNodeId.value.takeLast(8)} issued before this phone's " +
-                "identity was created — ignored (likely this phone's identity before its data was cleared)")
-            return false
+        if (!localIdentity.idIsStable && bornAtSec > 0 && announce.issuedAtSec.toLong() < bornAtSec) {
+            lifecycle.console("ANNOUNCE from $from8 issued before this phone's keys were created — ignored " +
+                "(likely this phone's identity before its data was cleared)")
+            return ContactKeyManager.Outcome.STALE
         }
-        runCatching {
-            contactDao.insertIfNew(ContactEntity(nodeId = msg.originNodeId.value))
-            contactDao.updateKeys(msg.originNodeId.value, announce.xPub, announce.edPub, announce.name, System.currentTimeMillis())
-        }.onFailure { Log.w(TAG, "pinning announce keys failed", it) }
-        Log.i(TAG, "ANNOUNCE pinned keys for ${msg.originNodeId.value.takeLast(8)} (${announce.name})")
-        return true
+        val outcome = runCatching { contactKeys.onAnnounce(msg.originNodeId.value, announce) }
+            .onFailure { Log.w(TAG, "processing announce keys failed", it) }
+            .getOrNull() ?: return null
+        when (outcome) {
+            ContactKeyManager.Outcome.OWN_KEYS ->
+                lifecycle.console("ANNOUNCE $from8 carries this phone's own keys (its id before the switch) — ignored")
+            ContactKeyManager.Outcome.STALE ->
+                lifecycle.console("ANNOUNCE from $from8 is older than the keys pinned here — ignored, not relayed")
+            else -> Log.i(TAG, "ANNOUNCE ${outcome.name.lowercase()} for $from8")
+        }
+        return outcome
+    }
+
+    /** Engine-console wording for an announce outcome. */
+    private fun describe(outcome: ContactKeyManager.Outcome?): String = when (outcome) {
+        null -> "not trusted (bad signature or node id), not pinned"
+        ContactKeyManager.Outcome.PINNED -> "keys pinned"
+        ContactKeyManager.Outcome.REFRESHED -> "keys unchanged"
+        ContactKeyManager.Outcome.REPLACED -> "safety number changed, new keys in use"
+        ContactKeyManager.Outcome.HELD -> "new keys held until you accept them (verified contact)"
+        ContactKeyManager.Outcome.STALE -> "stale, ignored"
+        ContactKeyManager.Outcome.OWN_KEYS -> "our own keys, ignored"
+        ContactKeyManager.Outcome.BLOCKED -> "blocked contact, ignored"
     }
 
     /**
@@ -1346,20 +1631,262 @@ class DtnOrchestrator @Inject constructor(
      * reassembly (decode to text only after joining all chunks) keeps multi-byte UTF-8 chars intact
      * when a character straddles a fragment boundary.
      */
-    /** @return true if the bundle decrypted (a fragment counts even before reassembly completes). */
-    private suspend fun openAndPersistInbound(msg: DtnMessage, convKey: String, peer: String?): Boolean {
+    /** What an inbound DATA bundle turned out to be. */
+    private enum class Opened {
+        /** Didn't decrypt (no key for the sender / group, or a bad tag). */
+        NO,
+        /** A chat message (or a fragment of one; the chat row is written once it's whole). */
+        TEXT,
+        /** A DM carrying a member's group receipt ([GroupReceiptCodec]): recorded, never a chat. */
+        GROUP_RECEIPT,
+    }
+
+    /**
+     * [packet] is the inbound packet of a DM for us: needed to record a group receipt's link.
+     * [onWhole] runs with the chat row's id once the whole message is stored (at once for a single
+     * frame, on the last fragment otherwise).
+     */
+    private suspend fun openAndPersistInbound(
+        msg: DtnMessage,
+        convKey: String,
+        peer: String?,
+        packet: InboundPacket? = null,
+        onWhole: (suspend (String) -> Unit)? = null,
+    ): Opened {
         val bytes = envelope.openBytes(msg) ?: run {
             Log.w(TAG, "RX undecryptable ${msg.id.take(8)} (no key / not a group member?)")
-            return false
+            diagnostics.w(DiagSource.CRYPTO, "MSG ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}" +
+                (if (msg.channel > 0) " on channel ${msg.channel}" else "") +
+                ": could not decrypt (${msg.payloadBytes.size} B) — no key for the sender / group, or a bad tag")
+            return Opened.NO
         }
         if (msg.fragmentTotal <= 1) {
+            // A DM whose first byte is the group-receipt marker is control data, never text. Only
+            // unfragmented DMs: a later fragment of a long text can start with any byte.
+            if (msg.destinationNodeId != NodeId.BROADCAST && GroupReceiptCodec.isMarked(bytes)) {
+                onGroupReceipt(msg, bytes, packet)
+                return Opened.GROUP_RECEIPT
+            }
             persistInboundChat(msg.id, msg.channel, convKey, peer, text(msg, bytes))
-            return true
+            onWhole?.invoke(msg.id)
+            return Opened.TEXT
         }
         val parentKey = com.dtn.mesh.crypto.Fragmenter.canonicalParent(msg.id)
-        val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return true
+        val full = reassembler.add(parentKey, msg.fragmentIndex, msg.fragmentTotal, bytes) ?: return Opened.TEXT
         persistInboundChat(parentKey, msg.channel, convKey, peer, text(msg, full))
-        return true
+        onWhole?.invoke(parentKey)
+        return Opened.TEXT
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // GROUP RECEIPTS: which members got our group message
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Member side: we just read [msg] (a group message) for the first time. Unless its origin is
+     * blocked, the origin gets a group receipt for [chatId] — batched for [GROUP_RECEIPT_BATCH_MS]
+     * per (origin, channel), then sent as an ordinary end-to-end encrypted DM.
+     */
+    private suspend fun queueGroupReceipt(msg: DtnMessage, chatId: String) {
+        val origin = msg.originNodeId.value
+        if (origin in runCatching { settings.blockedNodesOnce() }.getOrDefault(emptySet())) return
+        val now = System.currentTimeMillis()
+        val dueAt = groupReceipts.add(origin, msg.channel, chatId, msg.remainingTtlMs(now), now) ?: return
+        scope?.launch {
+            delay((dueAt - now).coerceAtLeast(0L))
+            runCatching { sendDueGroupReceipts() }.onFailure { Log.w(TAG, "group receipts failed", it) }
+        }
+    }
+
+    /** Seal and buffer the group receipts that are due (one DM per batch, each fits one frame). */
+    private suspend fun sendDueGroupReceipts() {
+        val me = transport.localNodeId ?: return
+        val due = groupReceipts.takeDue(System.currentTimeMillis())
+        if (due.isEmpty()) return
+        var queued = 0
+        for (b in due) {
+            val origin8 = b.origin.takeLast(8)
+            val id = UUID.randomUUID().toString()
+            val dest = NodeId(b.origin)
+            val sealed = envelope.sealBytes(GroupReceiptCodec.encode(b.channel, b.ids), id, me, dest, 0, 0, 1)
+            if (sealed !is EnvelopeService.Sealed.Ok) {
+                diagnostics.w(DiagSource.RECEIPTS, "Group receipt for ${b.ids.size} message(s) on channel ${b.channel} " +
+                    "to $origin8 not sent: " + if (sealed is EnvelopeService.Sealed.NoKey) "no keys for them on this phone" else "too long")
+                continue
+            }
+            val now = System.currentTimeMillis()
+            val ttl = GroupReceiptCodec.ttlFor(b.ttlLeftMs)
+            val dm = DtnMessage(
+                id = id, originNodeId = me, destinationNodeId = dest, payloadBytes = sealed.payload,
+                portNum = DtnMessage.PORT_GROUP_RECEIPT, createdAtMs = now, ttlMs = ttl,
+                messageType = DtnMessageType.DATA, flags = sealed.flags,
+            )
+            if (queueManager.ingest(dm)) {
+                queued++
+                lifecycle.console("RECEIPT group ${id.take(8)} → $origin8 queued: ${b.ids.size} message(s) on " +
+                    "channel ${b.channel}, TTL ${ttl / 60_000L} min")
+            }
+        }
+        if (queued > 0) {
+            diagnostics.i(DiagSource.RECEIPTS, "Group receipts: $queued DM(s) queued for ${due.map { it.origin }.distinct().size} origin(s)")
+            requestFlush()
+        }
+    }
+
+    /**
+     * Origin side: a member's group receipt arrived (the DM from [msg]'s origin decrypted, so it's
+     * really from that member). Each id that is one of our group messages on that channel records
+     * the member, the time and the link it came over; the message itself keeps spreading.
+     */
+    private fun onGroupReceipt(msg: DtnMessage, plain: ByteArray, packet: InboundPacket?) {
+        val member = msg.originNodeId.value
+        val member8 = member.takeLast(8)
+        val receipt = GroupReceiptCodec.decode(plain) ?: run {
+            diagnostics.w(DiagSource.RECEIPTS, "Group receipt ${msg.id.take(8)} from $member8: unreadable (${plain.size} B) — ignored")
+            return
+        }
+        val via = packet?.transport.journalLabel()
+        val hop = packet?.viaPeer?.value.orEmpty()
+        val hub = if (packet?.transport == com.dtn.mesh.receiver.TransportKind.HUB && hop.isNotBlank()) " (${com.dtn.mesh.receiver.hubLabel(hop)})" else ""
+        var recorded = 0
+        for (gid in receipt.ids) {
+            if (lifecycle.recordGroupReceipt(gid, receipt.channel, member, via, hop)) {
+                recorded++
+                lifecycle.log(LifecycleEvent.ACK_RECEIVED, gid, origin = member, dest = "BROADCAST",
+                    extra = "group receipt from $member8 via $via$hub")
+            }
+        }
+        diagnostics.i(DiagSource.RECEIPTS, "Group receipt from $member8 via $via$hub: $recorded of ${receipt.ids.size} " +
+            "message(s) recorded (channel ${receipt.channel})")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // FALLBACK: a DM still queued after 5 s takes every other path that's up
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * The 5 s fallback ([DmFallback]): a DM queued 5 s on this phone without being delivered keeps
+     * trying its direct links (its peer's pass) and is also handed to every other path that's up —
+     * our LoRa hub (the same-hub hand-off when the destination is on it, else a flood, once per hub
+     * session) and the internet relay (destination present; it stays buffered until the end-to-end
+     * receipt, 30 s window). Own DMs and carried ones alike: publishing a carried DM to its own
+     * destination is a direct delivery, not custody. Fallback sends don't train the routing tables
+     * or Q-learning and aren't benchmark forwards. Also schedules the next fallback for DMs whose 5 s
+     * aren't up yet.
+     *
+     * @param passPeers the peers a flush runs a pass for ([passTargets]): a destination present on the
+     *   relay that isn't one of them (a carried DM for a phone that isn't a contact here) gets the
+     *   relay from the fallback only.
+     */
+    private suspend fun fallbackPass(snapshot: List<DtnMessage>, radioPeers: List<String>, passPeers: Set<String>) {
+        val me = transport.localNodeId?.value ?: return
+        val hub = radioPeers.firstOrNull { transport.isHub(NodeId(it)) }
+        var nextDueAt = Long.MAX_VALUE
+        fallbackMutex.withLock {
+            val present = transport.internetPeers.value
+            for (msg in snapshot) {
+                if (msg.messageType != DtnMessageType.DATA) continue
+                val dest = msg.destinationNodeId
+                if (dest == NodeId.BROADCAST || dest.value == me || msg.originNodeId == dest) continue
+                val now = System.currentTimeMillis()
+                val links = DmFallback.Links(
+                    direct = transport.reachesDirectly(dest),
+                    hub = hub != null,
+                    onOurHub = transport.isHubPeer(dest),
+                    relay = dest.value in present,
+                    relayContact = dest.value in passPeers,
+                )
+                val since = queuedSince(msg)
+                if (since <= 0L) continue // no buffering time known: never "late", nothing to schedule
+                if (!DmFallback.isLate(since, now)) {
+                    if (DmFallback.opensLater(links)) nextDueAt = minOf(nextDueAt, DmFallback.dueAtMs(since))
+                    continue
+                }
+                val plan = DmFallback.plan(
+                    broadcast = false,
+                    delivered = receiptStore.isDelivered(msg.id),
+                    queuedSinceMs = since, nowMs = now, links = links,
+                    attempts = DmFallback.Attempts(
+                        relayAtMs = pathSentAtMs(msg.id, SendPath.INTERNET),
+                        hubLocalAtMs = pathSentAtMs(msg.id, SendPath.HUB_LOCAL),
+                        hubThisSession = hub != null && sentTo[msg.id]?.containsKey(hub) == true,
+                    ),
+                )
+                if (plan.fallback.isEmpty()) continue
+                // Delivered meanwhile (straight over BLE in this flush, or a receipt)?
+                if (!queueManager.existsInBuffer(msg.id)) continue
+                for (p in plan.fallback) sendFallback(msg, p, hub, links, since, me)
+            }
+        }
+        if (nextDueAt != Long.MAX_VALUE) scheduleFlushAt(nextDueAt)
+    }
+
+    /** One fallback hand-off of [msg] over [p] (journal + route + the diagnostics line). */
+    private suspend fun sendFallback(
+        msg: DtnMessage, p: DmFallback.Path, hub: String?, links: DmFallback.Links, since: Long, me: String,
+    ) {
+        val dest = msg.destinationNodeId
+        val (target, only) = when (p) {
+            DmFallback.Path.RELAY -> dest to RELAY_TIER
+            DmFallback.Path.HUB_LOCAL -> dest to SAME_HUB_TIER
+            DmFallback.Path.HUB_FLOOD -> NodeId(hub ?: return) to setOf(SendPath.HUB)
+            DmFallback.Path.DIRECT -> return
+        }
+        // The hub it came from already holds it (and hands it to the destination when it registers).
+        if (p != DmFallback.Path.RELAY && hub != null && receivedFrom[msg.id]?.contains(hub) == true) return
+        val wireMsg = msg.copy(hopCount = (msg.hopCount + 1).coerceAtMost(255))
+        val outcome = transport.sendMessageVia(wireMsg, target, only) ?: run {
+            Log.d(TAG, "FALLBACK ${msg.id.take(8)} over ${p.label} failed")
+            return
+        }
+        // The relay / same-hub retry windows; the hub's "once per hub session" is the usual sentTo.
+        markPathSent(msg.id, outcome.path)
+        if (p == DmFallback.Path.HUB_FLOOD) markSentTo(msg.id, target.value)
+
+        val dest8 = dest.value.takeLast(8)
+        // What it waited on: the links whose writes failed, else the links that reach it now.
+        val failed = dmFailures[msg.id]
+        val after = failed?.links ?: DmFallback.waitingOn(directLinkNames(dest), links)
+        val failures = failed?.count ?: 0
+        val via = when (p) {
+            DmFallback.Path.HUB_FLOOD -> "LoRa hub (${com.dtn.mesh.receiver.hubLabel(target.value)})"
+            DmFallback.Path.HUB_LOCAL -> "LoRa hub (same hub)"
+            else -> outcome.path.label
+        }
+        diagnostics.i(DiagSource.ROUTING, DmFallback.logLine(msg.id.take(8), via, System.currentTimeMillis() - since, after, failures))
+        if (msg.portNum == DtnMessage.PORT_GROUP_RECEIPT) {
+            lifecycle.console("CTRL GROUP-RECEIPT ${msg.id.take(8)} → $dest8 via $via (fallback after $after)")
+            return
+        }
+        val link = if (p == DmFallback.Path.RELAY) "Internet relay" else "LoRa hub"
+        when (p) {
+            DmFallback.Path.RELAY -> {
+                lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                    origin = msg.originNodeId.value, dest = dest.value,
+                    hopCount = wireMsg.hopCount, ttlRemainingMs = msg.remainingTtlMs(),
+                    extra = "fallback after $after: DM → $dest8 via Internet relay · awaiting receipt")
+                // Not a hand-off (the relay stores nothing): it stays Queued until the receipt.
+                lifecycle.recordFallback(msg.id, via = link, after = after)
+            }
+            DmFallback.Path.HUB_LOCAL, DmFallback.Path.HUB_FLOOD -> {
+                val next = target.value
+                val how = if (p == DmFallback.Path.HUB_LOCAL) "handed to our LoRa hub for $dest8 (on the same hub)"
+                else "handed to LoRa hub ${next.takeLast(8)} (floods it over LoRa)"
+                lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                    origin = msg.originNodeId.value, dest = dest.value,
+                    hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1, ttlRemainingMs = msg.remainingTtlMs(),
+                    extra = "fallback after $after: $how · awaiting receipt")
+                val queuedS = (System.currentTimeMillis() - since).coerceAtLeast(0L) / 1000L
+                lifecycle.recordFallback(msg.id, via = link, after = after, nextHop = next,
+                    decision = "Fallback, not an algorithm decision: still queued $queuedS s after this phone buffered it " +
+                        "(waiting on $after${if (failures > 0) ", $failures failed write(s)" else ""}), so it went to " +
+                        (if (p == DmFallback.Path.HUB_LOCAL) "our LoRa hub, which hands it to $dest8 on the same hub"
+                        else "LoRa hub ${next.takeLast(8)}, which floods it over LoRa") +
+                        " as well. Delivered only by $dest8's end-to-end receipt.")
+            }
+            DmFallback.Path.DIRECT -> Unit
+        }
+        if (msg.originNodeId.value == me) Log.d(TAG, "FALLBACK ${msg.id.take(8)} → $dest8 via $via")
     }
 
     /**
@@ -1523,53 +2050,33 @@ class DtnOrchestrator @Inject constructor(
         onlinePeerIds: Set<String>,
         notes: MutableMap<String, String>,
     ): Set<String> {
-        val approved = mutableSetOf<String>()
         val now = System.currentTimeMillis()
         val toRecord = mutableListOf<ForwardingDecisionEntity>()
         val shaping = mutableListOf<Pair<ForwardingState, Double>>()
-        val dmp = strategySelector.diMaxProp
         val peer = peerId.value
         if (qChoice.size > 4_000) qChoice.entries.removeAll { now - it.value.atMs > 2 * SEND_RETRY_INTERVAL_MS }
-        for (msg in snapshot) {
-            if (msg.hopCount >= 10) continue
-            if (msg.destinationNodeId == NodeId.BROADCAST || msg.destinationNodeId.value == peer) {
-                approved.add(msg.id) // handled as broadcast/direct by the send loop
-                continue
-            }
-            // Bundles the send loop never hands to this carrier anyway (its own, or the one it gave
-            // us): deciding on them would only record decisions that never take effect.
-            if (msg.originNodeId.value == peer || receivedFrom[msg.id] == peer) continue
-            // Control traffic (a direct announce for someone else) never gets a delivery receipt,
-            // so learning from it would only ever teach "expired". The DiMaxProp rule carries it.
-            if (msg.messageType != DtnMessageType.DATA) {
-                val v = strategySelector.diMaxProp.decide(msg.destinationNodeId.value, peer, onlinePeerIds).verdict
-                if (v != DiMaxPropStrategy.Verdict.HOLD) approved.add(msg.id)
-                continue
-            }
-
-            val key = "${msg.id}|$peer"
-            val kept = qChoice[key]?.takeIf { now - it.atMs < SEND_RETRY_INTERVAL_MS }
-            if (kept != null) {
-                if (kept.action == ForwardingAction.FORWARD) approved.add(msg.id)
-                notes[msg.id] = kept.note
-                continue
-            }
-
-            val dest = msg.destinationNodeId.value
-            val dm = dmp.decide(dest, peer, onlinePeerIds)
-            val state = buildForwardingState(msg, peerId, dm.theirs.cost)
-            val prior = if (dm.verdict == DiMaxPropStrategy.Verdict.HOLD) ForwardingAction.STORE else ForwardingAction.FORWARD
-            val (qf, qs) = qEngine.qValues(state)
-            val (action, exploratory) = qEngine.selectActionEpsilonGreedy(state, tieBreak = prior)
-            val reward = if (action == ForwardingAction.FORWARD) progressReward(dm.mine, dm.theirs) else null
-            val note = qNote(state, qf, qs, action, exploratory, dm, reward, dest)
-            qChoice[key] = QChoice(action, exploratory, now, note)
-            notes[msg.id] = note
-            if (action == ForwardingAction.FORWARD) approved.add(msg.id)
-            if (reward != null) shaping += state to reward
+        // The decisions themselves are pure ([CarrierRules.qLearningPass]); recording them is here.
+        val pass = CarrierRules.qLearningPass(
+            snapshot, peerId, onlinePeerIds, strategySelector.diMaxProp, qEngine, shapingEta,
+            // The peer already has it: it handed us a copy, or took ours this session (no new
+            // decision, and no second progress reward, for a hand-over that already happened).
+            cameFrom = { id, p -> receivedFrom[id]?.contains(p) == true || handedOver[id]?.contains(p) == true },
+            kept = { id ->
+                qChoice["$id|$peer"]?.takeIf { now - it.atMs < SEND_RETRY_INTERVAL_MS }
+                    ?.let { CarrierRules.QKept(it.action, it.note) }
+            },
+            stateFor = { msg, carrierCost -> buildForwardingState(msg, peerId, carrierCost) },
+        )
+        notes.putAll(pass.keptNotes)
+        for (d in pass.fresh) {
+            val state = d.state
+            val note = qNote(state, d.qForward, d.qStore, d.action, d.exploratory, d.diMaxProp, d.reward, d.msg.destinationNodeId.value)
+            qChoice["${d.msg.id}|$peer"] = QChoice(d.action, d.exploratory, now, note)
+            notes[d.msg.id] = note
+            if (d.reward != null) shaping += state to d.reward
 
             toRecord.add(ForwardingDecisionEntity(
-                timestampMs = now, messageId = msg.id, peerNodeId = peer,
+                timestampMs = now, messageId = d.msg.id, peerNodeId = peer,
                 stateRssiNorm = state.rssiNorm, stateSnrNorm = state.snrNorm,
                 stateEncounterFrequency = state.encounterFrequency,
                 stateEncounterDuration = state.encounterDuration,
@@ -1581,26 +2088,14 @@ class DtnOrchestrator @Inject constructor(
                 stateDiMaxPropCost = state.diMaxPropCost,
                 stateHopCountNorm = state.hopCountNorm,
                 stateRelayBuffer = state.relayBufferOccupancy,
-                action = action.name, qValueSelected = qEngine.computeUtility(state),
-                epsilon = qEngine.currentEpsilon, wasExploratory = exploratory,
-                routingStrategy = "Q-LEARNING", shapingReward = reward,
+                action = d.action.name, qValueSelected = qEngine.computeUtility(state),
+                epsilon = qEngine.currentEpsilon, wasExploratory = d.exploratory,
+                routingStrategy = "Q-LEARNING", shapingReward = d.reward,
             ))
         }
         if (toRecord.isNotEmpty()) runCatching { decisionDao.insertAll(toRecord) }
         if (shaping.isNotEmpty()) eventChannel?.trySend(OrchestratorEvent.QShaping(shaping))
-        return approved
-    }
-
-    /**
-     * DiMaxProp progress reward η·(C(A,D) − C(B,D)) (paper eq. 13): positive when the bundle moves
-     * to a relay that is closer, in DiMaxProp cost, to its destination. A side that knows no path
-     * counts as [UNREACHABLE_COST] away; null when neither knows one (nothing to measure).
-     */
-    private fun progressReward(mine: DiMaxPropStrategy.Path, theirs: DiMaxPropStrategy.Path): Double? {
-        if (!mine.reachable && !theirs.reachable) return null
-        val a = if (mine.reachable) mine.cost.coerceAtMost(UNREACHABLE_COST) else UNREACHABLE_COST
-        val b = if (theirs.reachable) theirs.cost.coerceAtMost(UNREACHABLE_COST) else UNREACHABLE_COST
-        return shapingEta * (a - b)
+        return pass.approved
     }
 
     /** Q-learning's reasoning for one decision, saved with the forward for Message info. */

@@ -25,11 +25,13 @@ import kotlin.math.max
  * - **Complementary to PRoPHET:** MaxProp reasons about path costs while
  *   PRoPHET reasons about encounter probability.
  *
- * ## Simplification for LoRa DTN
- * Full MaxProp uses Dijkstra over the entire network graph. We simplify to
- * direct-delivery likelihood (single-hop cost) since LoRa mesh encounters
- * are typically 1-2 hops deep in practice. This makes the strategy tractable
- * for resource-constrained Android devices.
+ * ## Differences from the paper
+ * - The paper floods every node's f-vector, so each node runs Dijkstra over the whole graph. A
+ *   summary here is one frame to a direct neighbour, so it carries the neighbour's f-vector plus its
+ *   own cheapest path cost to nodes further away (distance vectors): the graph is learnt hop by hop.
+ * - The paper hands every bundle to every peer, ordered by cost; here the cost is a forwarding
+ *   filter: a peer gets a mule copy when it is the first hop of the cheapest path among the phones
+ *   in range ([rankForForwardingWithTopology]), one copy per contact instead of a flood.
  *
  * Zero Android dependencies. Pure Kotlin.
  */
@@ -42,6 +44,8 @@ class MaxPropStrategy(
     private companion object {
         /** Synthetic source node key for the Dijkstra cost graph. */
         const val ME = "__self__"
+        /** An encoded summary stays below the 223 B single-frame payload (as PRoPHET's). */
+        const val SUMMARY_BYTE_BUDGET = 200
     }
 
     /**
@@ -63,6 +67,16 @@ class MaxPropStrategy(
      */
     private val peerFTables: MutableMap<String, MutableMap<String, Double>> = java.util.concurrent.ConcurrentHashMap()
 
+    /**
+     * Per-neighbour path costs: `peerCosts[j][k]` = j's own cheapest cost to k, for nodes j doesn't meet
+     * itself (the second part of its summary). Distance vectors: they carry multi-hop reach one summary
+     * at a time, where the MaxProp paper floods every node's f-vector (too big for one LoRa frame).
+     */
+    private val peerCosts: MutableMap<String, Map<String, Double>> = java.util.concurrent.ConcurrentHashMap()
+
+    /** This phone's node id: never a node of its own cost graph. */
+    @Volatile var selfId: String? = null
+
     // ──────────────────────────────────────────────────────────────────────
     // Encounter handling
     // ──────────────────────────────────────────────────────────────────────
@@ -77,27 +91,25 @@ class MaxPropStrategy(
     override fun onRoutingSummaryReceived(peerId: NodeId, summary: RoutingSummary) {
         if (summary.strategyTag != "MAXPROP") return
 
-        // Integrate peer's likelihood vector to improve our cost estimates.
-        // MaxProp propagation: augment our view with peer's encounter distribution.
-        val peerLikelihoods = decodeLikelihoodVector(summary.payload)
-        if (peerLikelihoods.isEmpty()) return
-        // Cache the neighbour's full f-vector for the minimum-cost path search.
+        val (peerLikelihoods, costs) = decodeSummary(summary.payload)
+        if (peerLikelihoods.isEmpty() && costs.isEmpty()) return
+        // Cache the neighbour's f-vector and path costs for the minimum-cost path search. Nothing is
+        // copied into our own f-table: f(me, k) is only ever a meeting this phone saw. (A neighbour's
+        // f used to be "seeded" in, discounted, which made every node look one hop away at a cost of
+        // about 1 and hid the real multi-hop paths.)
         peerFTables[peerId.value] = peerLikelihoods.toMutableMap()
-        for ((destKey, peerF) in peerLikelihoods) {
-            if (destKey == peerId.value) continue
-            // If we have no data on this destination, seed from peer's estimate (discounted)
-            if (destKey !in fTable) {
-                fTable[destKey] = peerF * config.transitivityDiscount
-            }
-        }
-        // Re-normalise after integration
-        normalise()
+        peerCosts[peerId.value] = costs
     }
 
     override fun buildRoutingSummary(): RoutingSummary {
+        val me = selfId
+        // Our own cheapest cost to the nodes further away (or cheaper than our direct link to them).
+        val far = costsFromMe().filter { (node, cost) ->
+            node != me && cost.isFinite() && cost < (fTable[node]?.takeIf { it > 0.0 }?.let { 1.0 - it } ?: Double.POSITIVE_INFINITY)
+        }
         return RoutingSummary(
             strategyTag = "MAXPROP",
-            payload = encodeLikelihoodVector(fTable),
+            payload = encodeSummary(fTable, far),
         )
     }
 
@@ -160,7 +172,7 @@ class MaxPropStrategy(
      * likelihood), and the cost of a path as the sum of its edge costs. The best route is the
      * minimum-total-cost path, found here with Dijkstra. Nodes: `ME` + every node any cached
      * f-vector mentions; `ME`'s neighbours are the currently-online peers, deeper edges come
-     * from neighbours' reported f-vectors.
+     * from neighbours' reported f-vectors and their reported path costs to nodes further away.
      *
      * @return (firstHop, pathCost). firstHop is null when no path to [dest] exists; pathCost is
      *   [Double.MAX_VALUE] in that case.
@@ -168,13 +180,29 @@ class MaxPropStrategy(
     fun findMinCostNextHop(dest: String, onlinePeers: Set<String>): Pair<String?, Double> {
         if (dest in onlinePeers) return dest to (1.0 - (fTable[dest] ?: 0.0)).coerceIn(0.0, 1.0)
 
-        fun edgeCost(from: String, to: String): Double? {
-            val f = if (from == ME) fTable[to] else peerFTables[from]?.get(to)
-            return if (f != null && f > 0.0) (1.0 - f).coerceIn(0.0, 1.0) else null
-        }
-        fun neighbours(node: String): Set<String> =
-            if (node == ME) onlinePeers else (peerFTables[node]?.keys ?: emptySet())
+        val (dist, prev) = dijkstra(dest, onlinePeers)
+        val cost = dist[dest] ?: return null to Double.MAX_VALUE
+        // Walk back to the hop whose predecessor is ME — that's the first hop to forward to.
+        var node = dest
+        while (prev[node] != null && prev[node] != ME) node = prev[node]!!
+        val firstHop = if (prev[node] == ME) node else return null to Double.MAX_VALUE
+        return (if (firstHop in onlinePeers) firstHop else null) to cost
+    }
 
+    /** One step of the cost graph: the link's `1 − f`, or [from]'s reported path cost to [to] when cheaper. */
+    private fun stepCost(from: String, to: String): Double? {
+        val f = if (from == ME) fTable[to] else peerFTables[from]?.get(to)
+        val link = if (f != null && f > 0.0) (1.0 - f).coerceIn(0.0, 1.0) else null
+        val reported = if (from == ME) null else peerCosts[from]?.get(to)
+        return if (link == null) reported else if (reported == null) link else minOf(link, reported)
+    }
+
+    /**
+     * Dijkstra from this phone, whose first hops are [meNeighbours]; stops early at [dest] (null = every
+     * node). Deeper steps come from the neighbours' reported vectors and path costs.
+     */
+    private fun dijkstra(dest: String?, meNeighbours: Collection<String>): Pair<Map<String, Double>, Map<String, String>> {
+        val me = selfId
         val dist = mutableMapOf(ME to 0.0)
         val prev = mutableMapOf<String, String>()
         val visited = mutableSetOf<String>()
@@ -184,22 +212,21 @@ class MaxPropStrategy(
             val (u, du) = pq.poll() ?: break
             if (!visited.add(u)) continue
             if (u == dest) break
-            for (v in neighbours(u)) {
-                if (v == ME || v in visited) continue
-                val w = edgeCost(u, v) ?: continue
+            val next = if (u == ME) meNeighbours else (peerFTables[u]?.keys.orEmpty() + peerCosts[u]?.keys.orEmpty())
+            for (v in next) {
+                if (v == ME || v == me || v in visited) continue
+                val w = stepCost(u, v) ?: continue
                 val nd = du + w
                 if (nd < (dist[v] ?: Double.MAX_VALUE)) {
                     dist[v] = nd; prev[v] = u; pq.add(v to nd)
                 }
             }
         }
-        val cost = dist[dest] ?: return null to Double.MAX_VALUE
-        // Walk back to the hop whose predecessor is ME — that's the first hop to forward to.
-        var node = dest
-        while (prev[node] != null && prev[node] != ME) node = prev[node]!!
-        val firstHop = if (prev[node] == ME) node else return null to Double.MAX_VALUE
-        return (if (firstHop in onlinePeers) firstHop else null) to cost
+        return dist to prev
     }
+
+    /** This phone's cheapest cost to every node it can reach, through any of its contacts. */
+    private fun costsFromMe(): Map<String, Double> = dijkstra(null, fTable.keys).first - ME
 
     /**
      * Topology-aware ranking used by the orchestrator: forward to [peerId] only if it lies on
@@ -359,29 +386,52 @@ class MaxPropStrategy(
     // Serialisation helpers for routing summary exchange
     // ──────────────────────────────────────────────────────────────────────
 
-    private fun encodeLikelihoodVector(table: Map<String, Double>): ByteArray {
+    /**
+     * `[count][count × (UTF id, f)]` (the likeliest contacts first) then `[count][count × (UTF id, cost)]`
+     * (our path costs to nodes further away, cheapest first), within [SUMMARY_BYTE_BUDGET] so it always
+     * fits one frame (the whole f-table overflowed the 223 B budget past ~11 known nodes, and an
+     * oversized summary is never sent). Readers that predate the cost part stop after the f entries.
+     */
+    private fun encodeSummary(f: Map<String, Double>, costs: Map<String, Double>): ByteArray {
+        var bytes = 8 // the two counts
+        fun fits(key: String): Boolean {
+            val size = 2 + key.toByteArray(Charsets.UTF_8).size + 8
+            if (bytes + size > SUMMARY_BYTE_BUDGET) return false
+            bytes += size
+            return true
+        }
+        val contacts = f.entries.filter { it.value > 0.0 }.sortedByDescending { it.value }.filter { fits(it.key) }
+        val far = costs.entries.sortedBy { it.value }.filter { fits(it.key) }
         val bos = ByteArrayOutputStream()
         val dos = DataOutputStream(bos)
-        dos.writeInt(table.size)
-        for ((key, value) in table) {
-            dos.writeUTF(key)
-            dos.writeDouble(value)
+        for (part in listOf(contacts, far)) {
+            dos.writeInt(part.size)
+            for ((key, value) in part) {
+                dos.writeUTF(key)
+                dos.writeDouble(value)
+            }
         }
         dos.flush()
         return bos.toByteArray()
     }
 
-    private fun decodeLikelihoodVector(data: ByteArray): Map<String, Double> {
-        if (data.isEmpty()) return emptyMap()
+    /** A neighbour's summary: its f-vector, and its path costs (empty from older builds). */
+    private fun decodeSummary(data: ByteArray): Pair<Map<String, Double>, Map<String, Double>> {
+        if (data.isEmpty()) return emptyMap<String, Double>() to emptyMap()
         val dis = DataInputStream(ByteArrayInputStream(data))
-        val count = dis.readInt()
-        val map = mutableMapOf<String, Double>()
-        repeat(count) {
-            val key = dis.readUTF()
-            val value = dis.readDouble()
-            map[key] = value
+        fun part(): Map<String, Double> {
+            val count = dis.readInt()
+            val map = mutableMapOf<String, Double>()
+            repeat(count) {
+                val key = dis.readUTF()
+                val value = dis.readDouble()
+                map[key] = value
+            }
+            return map
         }
-        return map
+        val f = part()
+        val costs = if (dis.available() >= 4) part().filterValues { it.isFinite() && it >= 0.0 } else emptyMap()
+        return f to costs
     }
 }
 
@@ -389,8 +439,6 @@ class MaxPropStrategy(
  * MaxProp tunable parameters.
  */
 data class MaxPropConfig(
-    /** Discount factor applied when integrating peer's likelihood estimates. */
-    val transitivityDiscount: Double = 0.5,
     /** Whether to enable recency-weighted decay of encounter counts. */
     val enableRecencyDecay: Boolean = true,
     /** Multiplicative factor for decaying old encounter counts each aging cycle. */

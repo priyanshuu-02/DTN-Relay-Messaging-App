@@ -5,12 +5,12 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Stable [NodeId] for this install, shared across every transport (LoRa hub, BLE, WiFi Direct).
+ * Stable [NodeId] for this phone, shared across every transport (LoRa hub, BLE, WiFi Direct).
  *
- * The id is now **cryptographically derived** from this device's X25519 + Ed25519 public keys
- * (see [DtnIdentity]) instead of a spoofable ANDROID_ID hash, so a node id is bound to the keys
- * that can actually decrypt traffic for it. This is a thin delegate kept for the transports and
- * orchestrator that already depend on `identity.nodeId` / `identity.nodeNum32`.
+ * The id is derived from Android's app-scoped device id (decision 14, see [DtnIdentity]), so it
+ * stays the same across data clears and reinstalls; the keys that decrypt traffic for it are
+ * announced (signed) and pinned by the receivers. This is a thin delegate kept for the transports
+ * and orchestrator that already depend on `identity.nodeId` / `identity.nodeNum32`.
  */
 @Singleton
 class LocalNodeIdentity @Inject constructor(
@@ -22,6 +22,9 @@ class LocalNodeIdentity @Inject constructor(
     /** The 32-bit numeric form written on the wire. */
     val nodeNum32: Int get() = identity.nodeNum32
 
-    /** When this identity was generated (epoch ms, 0 = unknown); see [DtnIdentity.createdAtMs]. */
+    /** When this phone's keys were generated (epoch ms, 0 = unknown); see [DtnIdentity.createdAtMs]. */
     val createdAtMs: Long get() = identity.createdAtMs
+
+    /** True when the id is derived from ANDROID_ID (it survives a data clear). */
+    val idIsStable: Boolean get() = identity.idIsStable
 }

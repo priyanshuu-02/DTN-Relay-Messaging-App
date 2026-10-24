@@ -36,7 +36,9 @@ class WifiDirectGroupPolicyTest {
 
     @Test
     fun searching_higherIdWaitsForTheLowestToCreate() {
-        assertEquals(Action.None, decide("30000000", phones = listOf("10000000"), waitingSince = now - 5_000L))
+        // Still waiting just before CREATE_WAIT_MS (5 s since fix 2, was 8 s).
+        assertEquals(Action.None, decide("30000000", phones = listOf("10000000"),
+            waitingSince = now - WifiDirectGroupPolicy.CREATE_WAIT_MS + 1_000L))
     }
 
     @Test

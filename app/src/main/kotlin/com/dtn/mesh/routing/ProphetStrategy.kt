@@ -26,8 +26,8 @@ import kotlin.math.pow
  * 2. **Aging** (when time passes with no encounter):
  *    P(a,b) = P(a,b)_old · γ^k    where k = intervals elapsed
  *
- * 3. **Transitivity** (learned via routing-summary exchange):
- *    P(a,c) = P(a,c)_old + (1 − P(a,c)_old) · P(a,b) · P(b,c) · β
+ * 3. **Transitivity** (learned via routing-summary exchange, RFC 6693 eq. 3):
+ *    P(a,c) = max(P(a,c)_old, P(a,b) · P(b,c) · β)
  *
  * 4. **Two-stage routing** (Page 3 §4):
  *    - Stage 1 (Epidemic) while `forwardCount ≤ N_m` AND `hopCount ≤ H_m`: copy to any
@@ -73,6 +73,9 @@ class ProphetStrategy(
 
     /** Timestamp of last aging pass (epoch ms). */
     private var lastAgedAtMs: Long = System.currentTimeMillis()
+
+    /** This phone's node id, so a neighbour's vector never gives us a predictability for ourselves. */
+    @Volatile var selfId: String? = null
 
     // ══════════════════════════════════════════════════════════════════════
     // Encounter handling
@@ -165,13 +168,16 @@ class ProphetStrategy(
         // Cache peer's reported P-values for Stage 2 forwarding decisions.
         peerPTables[peerId.value] = peerVector.toMutableMap()
 
-        // Transitivity: P(a,c) = P(a,c)_old + (1 − P(a,c)_old) · P(a,b) · P(b,c) · β
+        // Transitivity, RFC 6693 eq. 3: P(a,c) = max(P(a,c)_old, P(a,b) · P(b,c) · β). The 2003 paper's
+        // additive form (P += (1 − P)·P(a,b)·P(b,c)·β) grew on every exchange: phones in range trade
+        // summaries every 8 s, so P(a,c) climbed toward 1 for nodes never met, until every phone had
+        // about the same P for every destination (seen in the multi-hop simulation).
         val pAB = pTable.getOrDefault(peerId.value, 0.0)
+        val me = selfId
         for ((destKey, pBC) in peerVector) {
-            if (destKey == peerId.value) continue // ignore self-reference
-            val oldPAC = pTable.getOrDefault(destKey, 0.0)
-            val newPAC = oldPAC + (1.0 - oldPAC) * pAB * pBC * config.betaTransitivity
-            pTable[destKey] = newPAC.coerceIn(0.0, 1.0)
+            if (destKey == peerId.value || destKey == me) continue // the peer itself, or this phone
+            val transitive = (pAB * pBC * config.betaTransitivity).coerceIn(0.0, 1.0)
+            if (transitive > pTable.getOrDefault(destKey, 0.0)) pTable[destKey] = transitive
         }
     }
 
@@ -208,8 +214,10 @@ class ProphetStrategy(
     // Aging
     // ══════════════════════════════════════════════════════════════════════
 
-    override fun onPeriodicAge() {
-        val now = System.currentTimeMillis()
+    override fun onPeriodicAge() = ageTo(System.currentTimeMillis())
+
+    /** [onPeriodicAge] at [now] (the multi-hop simulation tests pass a simulated clock). */
+    fun ageTo(now: Long) {
         val elapsed = now - lastAgedAtMs
         if (elapsed < config.agingIntervalMs) return
 
@@ -304,7 +312,8 @@ class ProphetStrategy(
      *
      * Tier 1: Direct delivery (dest == peer) → always forward, top priority.
      * Tier 2: Multi-hop path exists through online peers → forward only if [peerId] is
-     *         the next hop on that path.
+     *         the next hop on that path, or a better carrier than us (RFC 6693 GRTR,
+     *         P(peer,D) > P(me,D)) while the destination itself isn't in range.
      * Tier 3: No live path → probability-based relay (PROPHET Stage 1/2).
      *
      * [onlinePeers] is the set of all currently-online peer node IDs (passed in by the
@@ -339,9 +348,15 @@ class ProphetStrategy(
                     if (nextHop != null && nextHop == peerId.value) {
                         // This peer IS the next hop on the live path — high priority
                         ForwardCandidate(msg, priority = 0.95 * ttlFraction)
-                    } else if (nextHop != null && nextHop != peerId.value) {
-                        // A live path exists but through a DIFFERENT peer — skip this one
-                        null
+                    } else if (nextHop != null) {
+                        // A live path exists through a DIFFERENT peer. The destination itself in range
+                        // gets it directly (no detour). Otherwise this peer still gets a copy when it is
+                        // the better carrier by RFC 6693's GRTR rule, P(peer,D) > P(me,D): the path search
+                        // takes the first online peer it reaches, not the most likely one, so a far
+                        // better carrier was turned away just because another one was found first.
+                        val peerP = peerPToDest(destKey)
+                        if (nextHop != destKey && peerP > myPToDest(destKey)) ForwardCandidate(msg, priority = peerP * ttlFraction)
+                        else null
                     } else {
                         // Tier 3: No live path → probability relay
                         if (msg.forwardCount <= config.maxForwards) {
@@ -430,6 +445,8 @@ class ProphetStrategy(
         val f3 = { v: Double -> "%.3f".format(v) }
         val why = when {
             nextHop == peer -> "${peer.takeLast(8)} is the next hop of a live path to ${dest.takeLast(8)}"
+            nextHop != null && nextHop != dest && peerP > myP ->
+                "a live path goes through ${nextHop.takeLast(8)}, and ${peer.takeLast(8)} is a better carrier too (${f3(peerP)} > ${f3(myP)})"
             nextHop != null -> "a live path goes through ${nextHop.takeLast(8)} (not this carrier)"
             msg.forwardCount <= config.maxForwards ->
                 "stage 1 spread: copy ${msg.forwardCount + 1} of up to ${config.maxForwards}"
@@ -494,19 +511,21 @@ class ProphetStrategy(
 }
 
 /**
- * Tunable parameters. Defaults follow RFC 6693 where applicable; the new fields
- * (`epsilonDistance`, `maxForwards`, `maxHops`) come from the design notes.
+ * Tunable parameters. P_init, γ and β are the 2003 paper's values (Lindgren et al.); RFC 6693 §3.3
+ * recommends P_encounter_max 0.7, γ 0.999 and β 0.9 as starting points and stresses there is no
+ * one-size-fits-all choice. δ and the adaptive I_typ follow RFC 6693; `maxForwards` and `maxHops`
+ * come from the design notes.
  */
 data class ProphetConfig(
     /**
      * `P_init` in the notes — additive predictability boost on direct encounter.
      * Named `pEncounter` here for backwards compatibility with existing call sites.
-     * RFC 6693 default is 0.75.
+     * 0.75 as in the 2003 paper (RFC 6693 recommends P_encounter_max 0.7).
      */
     val pEncounter: Double = 0.75,
-    /** Aging factor per interval (`γ`). RFC 6693 default: 0.98. */
+    /** Aging factor per [agingIntervalMs] (`γ`): 0.98, the 2003 paper's value (RFC 6693: 0.999 per its time unit). */
     val gammaAging: Double = 0.98,
-    /** Transitivity scaling factor (`β`). RFC 6693 default: 0.25. */
+    /** Transitivity scaling factor (`β`): 0.25, the 2003 paper's value (RFC 6693 recommends 0.9). */
     val betaTransitivity: Double = 0.25,
     /**
      * `δ` — the RFC 6693 predictability cap. The encounter update asymptotes to `1 − δ`, so P

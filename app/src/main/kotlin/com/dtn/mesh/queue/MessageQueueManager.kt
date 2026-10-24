@@ -140,6 +140,9 @@ class MessageQueueManager @Inject constructor(
         ids.forEach { id -> runCatching { chatDao.markOutgoingEnded(id, status) } }
     }
 
+    /** Bytes buffered now and the buffer's limit (Settings › Data & storage). */
+    suspend fun bufferUse(): Pair<Long, Long> = messageDao.getTotalBufferedBytes() to config.maxBufferBytes
+
     /**
      * Get current buffer occupancy as a fraction [0.0, 1.0].
      */
@@ -152,9 +155,15 @@ class MessageQueueManager @Inject constructor(
     // TTL management
     // ──────────────────────────────────────────────────────────────────────
 
+    /**
+     * The buffered bundles whose TTL has run out at [nowMs]: the ones [expireMessages] (with the same
+     * [nowMs]) marks EXPIRED next, so each is seen here exactly once.
+     */
+    suspend fun getExpiring(nowMs: Long = System.currentTimeMillis()): List<DtnMessage> =
+        messageDao.getExpiringMessages(nowMs).map { fromEntity(it) }
+
     /** Mark all expired messages and return how many were expired. */
-    suspend fun expireMessages(): Int {
-        val now = System.currentTimeMillis()
+    suspend fun expireMessages(now: Long = System.currentTimeMillis()): Int {
         // Capture the ids BEFORE the bulk UPDATE so we can tell the UI/orchestrator which
         // messages just expired (Room UPDATE can't return the affected rows).
         val expiringIds = messageDao.getExpiringMessageIds(now)
@@ -254,6 +263,10 @@ class MessageQueueManager @Inject constructor(
         return entity.status == MessageStatus.BUFFERED
     }
 
+    /** One of OUR group-receipt DMs (control traffic: no journal lines for it), see [DtnMessage.PORT_GROUP_RECEIPT]. */
+    suspend fun isOwnGroupReceipt(messageId: String): Boolean =
+        messageDao.getById(messageId)?.portNum == DtnMessage.PORT_GROUP_RECEIPT
+
     /** Mark a message as delivered (direct delivery, or an end-to-end receipt arrived). */
     suspend fun markDelivered(messageId: String) {
         messageDao.markDelivered(messageId)
@@ -285,22 +298,30 @@ class MessageQueueManager @Inject constructor(
     fun observeBufferedCount(): kotlinx.coroutines.flow.Flow<Int> =
         messageDao.observeBufferedCount()
 
-    /** Reactive list of currently buffered messages for the Network dashboard. */
-    fun observeBufferedMessages(): kotlinx.coroutines.flow.Flow<List<com.dtn.mesh.ui.BufferedMsgInfo>> =
-        messageDao.observeBufferedMessages().map { entities ->
-            entities.map { e ->
-                com.dtn.mesh.ui.BufferedMsgInfo(
-                    msgId = e.id.take(8),
-                    origin = e.originNodeId.takeLast(8),
-                    dest = if (e.destinationNodeId == "^all") "BROADCAST" else e.destinationNodeId.takeLast(8),
-                    hopCount = e.hopCount,
-                    forwardCount = e.forwardCount,
-                    ttlMin = ((e.expiresAtMs - System.currentTimeMillis()) / 60_000L).coerceAtLeast(0),
-                    bufferedFor = ((System.currentTimeMillis() - e.receivedAtMs) / 1000L).coerceAtLeast(0),
-                    status = e.status,
-                )
-            }
+    /** Every DATA bundle in the buffer — DMs and broadcast / group messages — for the Queue tab. */
+    fun observeBufferedData(): kotlinx.coroutines.flow.Flow<List<com.dtn.mesh.ui.BufferedMsgInfo>> =
+        messageDao.observeBufferedData().map { entities ->
+            val now = System.currentTimeMillis()
+            entities.map { toInfo(it, now) }
         }
+
+    private fun toInfo(e: MessageEntity, now: Long) = com.dtn.mesh.ui.BufferedMsgInfo(
+        msgId = e.id.take(8),
+        origin = e.originNodeId.takeLast(8),
+        dest = if (e.destinationNodeId == "^all") "BROADCAST" else e.destinationNodeId.takeLast(8),
+        hopCount = e.hopCount,
+        forwardCount = e.forwardCount,
+        ttlMin = ((e.expiresAtMs - now) / 60_000L).coerceAtLeast(0),
+        bufferedFor = ((now - e.receivedAtMs) / 1000L).coerceAtLeast(0),
+        status = e.status,
+        fullId = e.id,
+        messageType = e.messageType,
+        channel = e.channel,
+        receivedAtMs = e.receivedAtMs,
+        expiresAtMs = e.expiresAtMs,
+        createdAtMs = e.createdAtMs,
+        ttlMs = e.ttlMs,
+    )
 
     // ──────────────────────────────────────────────────────────────────────
     // Entity ↔ DTO conversion
@@ -344,6 +365,7 @@ class MessageQueueManager @Inject constructor(
         messageType = runCatching { com.dtn.mesh.model.DtnMessageType.valueOf(entity.messageType) }
             .getOrDefault(com.dtn.mesh.model.DtnMessageType.DATA),
         flags = entity.flags,
+        bufferedAtMs = entity.receivedAtMs,
     )
 
     companion object {

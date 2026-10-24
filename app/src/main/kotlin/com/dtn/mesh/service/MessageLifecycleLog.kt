@@ -36,6 +36,7 @@ import javax.inject.Singleton
 @Singleton
 class MessageLifecycleLog @Inject constructor(
     @ApplicationContext private val context: Context,
+    private val diagnostics: DiagnosticsLog,
 ) {
 
     companion object {
@@ -43,7 +44,8 @@ class MessageLifecycleLog @Inject constructor(
         private const val MAX_ENTRIES = 1_000
         private const val MAX_ROUTES = 300
         private const val MAX_CONSOLE = 400
-        private const val JOURNAL_FILE = "message_journal_v1.log"
+        /** In `filesDir` (Settings › Data & storage shows its size). */
+        const val JOURNAL_FILE = "message_journal_v1.log"
         /** Rewrite the journal from memory once it holds this many lines. */
         private const val COMPACT_AFTER_LINES = 6_000
         /**
@@ -74,7 +76,30 @@ class MessageLifecycleLog @Inject constructor(
         synchronized(lock) {
             _console.value = (listOf(stamped) + _console.value).take(MAX_CONSOLE)
         }
+        diagnostics.log(DiagLevel.INFO, consoleSource(line), line.trim())
         Log.d(TAG, line)
+    }
+
+    /** Diagnostics source of an engine-console line, from its prefix. */
+    private fun consoleSource(line: String): String {
+        val t = line.trimStart()
+        return when {
+            t.startsWith("RECEIPT") -> DiagSource.RECEIPTS
+            t.startsWith("ANNOUNCE") || t.startsWith("ECHO") -> DiagSource.CRYPTO
+            t.startsWith("Q-LEARNING") -> DiagSource.QLEARN
+            t.startsWith("ON HUB") -> DiagSource.HUB
+            t.startsWith("ENCOUNTER") || t.startsWith("CTRL") || line.startsWith("  ") -> DiagSource.ROUTING
+            else -> DiagSource.ENGINE
+        }
+    }
+
+    /** Diagnostics level + source of a journal event (the journal itself stays user DATA only). */
+    private fun diagFor(event: LifecycleEvent): Pair<DiagLevel, String> = when (event) {
+        LifecycleEvent.CREATED, LifecycleEvent.BUFFERED, LifecycleEvent.BUFFER_CLEARED -> DiagLevel.INFO to DiagSource.BUFFER
+        LifecycleEvent.DUPLICATE -> DiagLevel.DEBUG to DiagSource.BUFFER
+        LifecycleEvent.EXPIRED, LifecycleEvent.HOP_LIMIT, LifecycleEvent.DROPPED -> DiagLevel.WARN to DiagSource.BUFFER
+        LifecycleEvent.FORWARDED, LifecycleEvent.DELIVERED, LifecycleEvent.IGNORED -> DiagLevel.INFO to DiagSource.ROUTING
+        LifecycleEvent.ACK_GENERATED, LifecycleEvent.ACK_RECEIVED -> DiagLevel.INFO to DiagSource.RECEIPTS
     }
 
     /**
@@ -114,8 +139,19 @@ class MessageLifecycleLog @Inject constructor(
         val decisionAtMs: Long = 0L,
         /** For a message we received: the routing algorithm the sender's phone used (from the DM). */
         val senderStrategy: String = "",
+        /** Our own group message: the members whose phones sent a group receipt (first one each). */
+        val groupReceipts: List<GroupReceipt> = emptyList(),
+        /**
+         * The 5 s fallback ([DmFallback]) also used these links ("Internet relay", "LoRa hub",
+         * comma-separated) after the DM waited on [fallbackAfter] ("BLE"). "" = no fallback.
+         */
+        val fallbackVia: String = "",
+        val fallbackAfter: String = "",
     ) {
         val isBroadcast: Boolean get() = destination == "BROADCAST"
+
+        /** The links the fallback used, in order. */
+        val fallbackLinks: List<String> get() = fallbackVia.split(',').filter { it.isNotBlank() }
 
         /** Human-readable view: `source → prevHop → me → nextHop`, omitting nulls. */
         fun asPath(): String = buildString {
@@ -131,6 +167,13 @@ class MessageLifecycleLog @Inject constructor(
             }
         }
     }
+
+    /**
+     * One member's group receipt for our group message: [member] (8 characters), when it arrived,
+     * the link it came over ("BLE", "LoRa hub", …) and the hop that handed it over (the hub's id
+     * for the LoRa hub; "" when unknown).
+     */
+    data class GroupReceipt(val member: String, val atMs: Long, val path: String, val hop: String = "")
 
     private val _routes = MutableStateFlow<List<RouteRecord>>(emptyList())
     val routes: StateFlow<List<RouteRecord>> = _routes.asStateFlow()
@@ -235,6 +278,9 @@ class MessageLifecycleLog @Inject constructor(
             _entries.value = (listOf(entry) + _entries.value).take(MAX_ENTRIES)
         }
         persist(entry)
+        // Ids, hops, TTL and the event's detail only: journal extras never carry message text.
+        val (level, source) = diagFor(event)
+        diagnostics.log(level, source, entry.toLogLine().substringAfter("] "))
         Log.d(TAG, entry.toLogLine())
     }
 
@@ -242,6 +288,12 @@ class MessageLifecycleLog @Inject constructor(
     fun eventsFor(msgId: String): List<LifecycleEntry> {
         val key = msgId.take(8)
         return _entries.value.filter { it.msgId == key }.asReversed()
+    }
+
+    /** True if [msgId]'s journal already has an [event] (matches on the 8-char id). */
+    fun hasEvent(msgId: String, event: LifecycleEvent): Boolean {
+        val key = msgId.take(8)
+        return _entries.value.any { it.msgId == key && it.event == event }
     }
 
     /** True if we keep a route record for this message (we sent, carried or received it). */
@@ -355,6 +407,47 @@ class MessageLifecycleLog @Inject constructor(
     fun recordRelayPublish(msgId: String, path: String) {
         updateExisting(msgId) {
             if (it.lastPath == path) null else it.copy(lastPath = path, strategy = it.strategy.ifBlank { "INTERNET RELAY" })
+        }
+    }
+
+    /**
+     * A member's group receipt for one of our group messages ([GroupReceiptRules.accepts]: our own
+     * group message on [channel], first receipt per member). The message keeps spreading: nothing
+     * here marks it delivered. @return true when it was recorded.
+     */
+    fun recordGroupReceipt(
+        msgId: String, channel: Int, member: String, path: String, hop: String = "",
+        atMs: Long = System.currentTimeMillis(),
+    ): Boolean {
+        var added = false
+        updateExisting(msgId) { r ->
+            if (!GroupReceiptRules.accepts(r, channel, member)) return@updateExisting null
+            added = true
+            r.copy(groupReceipts = r.groupReceipts + GroupReceipt(member.takeLast(8), atMs, path, hop.takeLast(8)))
+        }
+        return added
+    }
+
+    /**
+     * The 5 s fallback handed the DM to [via] ("Internet relay" / "LoRa hub") after it waited on
+     * [after] ("BLE"). A hub hand-off ([nextHop] set) becomes the route's hop when nothing took it
+     * yet (with [decision] as its saved "why"); a relay publish isn't a hand-off (the relay stores
+     * nothing), so the DM stays Queued until its receipt.
+     */
+    fun recordFallback(msgId: String, via: String, after: String, nextHop: String? = null, decision: String = "") {
+        updateExisting(msgId) { r ->
+            if (r.delivered) return@updateExisting null
+            val takeHop = nextHop != null && r.nextHop == null
+            val keepDecision = !takeHop || r.decision.isNotBlank() || decision.isBlank()
+            val changed = r.copy(
+                fallbackVia = (r.fallbackLinks + via).distinct().joinToString(","),
+                fallbackAfter = r.fallbackAfter.ifBlank { after },
+                nextHop = if (takeHop) nextHop?.takeLast(8) else r.nextHop,
+                lastPath = if (takeHop) via else r.lastPath,
+                decision = if (keepDecision) r.decision else decision,
+                decisionAtMs = if (keepDecision) r.decisionAtMs else System.currentTimeMillis(),
+            )
+            if (changed == r) null else changed
         }
     }
 

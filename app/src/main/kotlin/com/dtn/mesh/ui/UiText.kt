@@ -91,3 +91,16 @@ object UiText {
         }
     }
 }
+
+/** Compact relative "time since" label for a last-seen timestamp. */
+internal fun relativeSince(ms: Long): String {
+    if (ms <= 0L) return "never"
+    val delta = System.currentTimeMillis() - ms
+    return when {
+        delta < 10_000L -> "just now"
+        delta < 60_000L -> "${delta / 1000}s ago"
+        delta < 3_600_000L -> "${delta / 60_000}m ago"
+        delta < 86_400_000L -> "${delta / 3_600_000}h ago"
+        else -> "${delta / 86_400_000}d ago"
+    }
+}
